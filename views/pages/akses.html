@@ -1,0 +1,21 @@
+{{define "content"}}
+<section class="page-heading">
+  <div><p class="eyebrow">Administrasi sistem</p><h1>Akses & pengguna</h1><p class="page-subtitle">Cakupan role dan izin yang divalidasi backend.</p></div>
+</section>
+<section class="access-cards">
+  <article class="access-card"><div class="access-card-top"><strong>Administrator</strong><span class="role-label">Akses tertinggi</span></div><p>Mengelola roster mahasiswa, kelas, enrollment wajah, dan konfigurasi.</p><div class="scope"><i data-lucide="globe-2"></i>Semua kelas dan data</div></article>
+  <article class="access-card"><div class="access-card-top"><strong>Dosen</strong><span class="role-label blue">Pengajar</span></div><p>Melihat roster dan absensi kelas yang ditugaskan.</p><div class="scope"><i data-lucide="book-open-check"></i>{{.RoleClasses}}</div></article>
+  <article class="access-card"><div class="access-card-top"><strong>Mahasiswa</strong><span class="role-label orange">Tanpa login</span></div><p>Terdaftar sebagai data akademik dan melakukan absensi melalui scan wajah.</p><div class="scope"><i data-lucide="scan-face"></i>Tidak memiliki akses aplikasi</div></article>
+</section>
+<section class="panel">
+  <div class="panel-header" style="padding-bottom:14px"><div><h2 class="panel-title">Matriks hak akses</h2><p class="panel-caption">Mahasiswa tidak memiliki kredensial atau akses langsung ke aplikasi.</p></div><span class="connection-state">Session staf aktif</span></div>
+  <div class="table-scroll"><table><thead><tr><th>Fitur</th><th>Administrator</th><th>Dosen</th><th>Mahasiswa tanpa akun</th></tr></thead><tbody>
+    <tr><td>Lihat ringkasan institusi</td><td><span class="permission yes"><i data-lucide="check"></i>Penuh</span></td><td><span class="permission yes"><i data-lucide="check"></i>Kelas tugas</span></td><td><span class="permission no"><i data-lucide="minus"></i>Tidak ada akses</span></td></tr>
+    <tr><td>Lihat roster mahasiswa</td><td><span class="permission yes"><i data-lucide="check"></i>Semua kelas</span></td><td><span class="permission yes"><i data-lucide="check"></i>Kelas tugas</span></td><td><span class="permission no"><i data-lucide="minus"></i>Tidak ada akses</span></td></tr>
+    <tr><td>Daftarkan mahasiswa</td><td><span class="permission yes"><i data-lucide="check"></i>Diizinkan</span></td><td><span class="permission no"><i data-lucide="minus"></i>Tidak</span></td><td><span class="permission no"><i data-lucide="minus"></i>Tidak</span></td></tr>
+    <tr><td>Enrollment template wajah</td><td><span class="permission yes"><i data-lucide="check"></i>Diizinkan</span></td><td><span class="permission no"><i data-lucide="minus"></i>Tidak</span></td><td><span class="permission no"><i data-lucide="minus"></i>Tidak</span></td></tr>
+    <tr><td>Absensi melalui perangkat</td><td><span class="permission no"><i data-lucide="minus"></i>Scan ESP32</span></td><td><span class="permission no"><i data-lucide="minus"></i>Scan ESP32</span></td><td><span class="permission yes"><i data-lucide="check"></i>Scan wajah</span></td></tr>
+  </tbody></table></div>
+  <div class="table-foot"><span>Role aktif berasal dari session staf.</span><span>API `/api/v1`</span></div>
+</section>
+{{end}}

@@ -1,0 +1,42 @@
+{{define "login"}}<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{.CSRFToken}}">
+  <meta name="theme-color" content="#f7f8f6">
+  <title>{{.Title}}</title>
+  <link rel="icon" type="image/png" href="https://proxy-assets.etherthink.xyz/algorithmics/anthropic-dark.png">
+  <link rel="apple-touch-icon" href="https://proxy-assets.etherthink.xyz/algorithmics/anthropic-dark.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body class="login-page">
+  <main class="login-shell">
+    <section class="login-visual" aria-label="Institut Teknologi Bacharuddin Jusuf Habibie">
+      <img class="login-campus" src="https://proxy-assets.etherthink.xyz/algorithmics/proxy-assets-ith-front-1.png" alt="Gedung Institut Teknologi Bacharuddin Jusuf Habibie">
+      <div class="login-visual-overlay"></div>
+      <a class="login-brand" href="/login"><img src="https://proxy-assets.etherthink.xyz/etherthink/logo.png" alt=""><span>Institut Teknologi Bacharuddin Jusuf Habibie</span></a>
+      <p class="login-visual-caption">Sistem Absensi Mahasiswa<br><span>Institut Teknologi Bacharuddin Jusuf Habibie</span></p>
+    </section>
+    <section class="login-panel" aria-labelledby="loginTitle">
+      <div class="login-panel-content">
+        <p class="eyebrow">Sistem administrasi absensi</p>
+        <h1 id="loginTitle">Masuk ke dashboard</h1>
+        <p class="login-subtitle">Akses khusus administrator dan dosen.</p>
+        {{if .LoginError}}<p class="login-error" role="alert">{{.LoginError}}</p>{{end}}
+        <form method="post" action="/login" class="login-form">
+          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+          <input type="hidden" name="next" value="{{.NextURL}}">
+          <label class="field">Username<input name="username" required maxlength="120" autocomplete="username" autofocus></label>
+          <label class="field">Password<input name="password" type="password" required autocomplete="current-password"></label>
+          <button class="button primary" type="submit">Masuk</button>
+        </form>
+        <p class="login-foot">Mahasiswa tercatat sebagai peserta absensi dan tidak memerlukan akun aplikasi.</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>{{end}}

@@ -1,0 +1,29 @@
+{{define "layout"}}<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7f8fa">
+  <meta name="csrf-token" content="{{.CSRFToken}}">
+  <title>{{.Title}}</title>
+  <link rel="icon" type="image/png" href="https://proxy-assets.etherthink.xyz/algorithmics/anthropic-dark.png">
+  <link rel="apple-touch-icon" href="https://proxy-assets.etherthink.xyz/algorithmics/anthropic-dark.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="/static/js/vendor/lucide.min.js" defer></script>
+  <script src="/static/js/vendor/htmx.min.js" defer></script>
+  <script type="module" src="/static/js/app.js"></script>
+</head>
+<body data-page="{{.Page}}" data-role="{{.Role}}" data-api-base="/api/v1" data-user-name="{{.UserName}}" data-teacher-name="{{.TeacherName}}" data-role-classes="{{.RoleClasses}}">
+  <div class="app">
+    {{template "sidebar" .}}
+    <main class="main" id="main-content" data-page="{{.Page}}">
+      {{template "topbar" .}}
+      <div class="content">{{template "content" .}}</div>
+    </main>
+  </div>
+  {{template "toast" .}}
+</body>
+</html>{{end}}

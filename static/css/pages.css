@@ -1,0 +1,465 @@
+.page-heading {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 18px;
+    padding: 28px 0 22px;
+}
+
+.eyebrow {
+    margin: 0 0 5px;
+    color: var(--green);
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+h1 {
+    margin-bottom: 5px;
+    font: 600 27px/1.2 "Space Grotesk", sans-serif;
+    letter-spacing: 0;
+}
+
+.page-subtitle {
+    margin: 0;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.heading-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.metrics {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 13px;
+}
+
+.metric {
+    min-height: 129px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--surface);
+    padding: 16px 17px;
+    box-shadow: var(--shadow);
+}
+
+.metric-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: #65716b;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+.metric-icon {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    place-items: center;
+    border-radius: 7px;
+    background: var(--green-soft);
+    color: var(--green);
+}
+
+.metric-icon i {
+    width: 16px;
+    height: 16px;
+}
+
+.metric-icon.orange {
+    background: var(--orange-soft);
+    color: var(--orange);
+}
+
+.metric-icon.blue {
+    background: var(--blue-soft);
+    color: var(--blue);
+}
+
+.metric-icon.red {
+    background: var(--red-soft);
+    color: var(--red);
+}
+
+.metric-value {
+    margin: 12px 0 5px;
+    font: 600 25px/1 "Space Grotesk", sans-serif;
+    letter-spacing: 0;
+}
+
+.metric-foot {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.trend {
+    color: var(--green);
+    font-weight: 700;
+}
+
+.trend.down {
+    color: var(--red);
+}
+
+.dashboard-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.65fr) minmax(265px, .85fr);
+    gap: 14px;
+    margin-top: 15px;
+}
+
+.panel {
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: white;
+    box-shadow: var(--shadow);
+}
+
+.panel-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 17px 18px 0;
+}
+
+.panel-title {
+    margin: 0;
+    font: 600 15px/1.3 "Space Grotesk", sans-serif;
+    letter-spacing: 0;
+}
+
+.panel-caption {
+    margin: 4px 0 0;
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.chart-wrap {
+    padding: 15px 18px 12px;
+}
+
+.chart {
+    position: relative;
+    display: grid;
+    height: 178px;
+    grid-template-columns: 29px 1fr;
+}
+
+.y-labels {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 0 0 22px;
+    color: #9aa39f;
+    font-size: 9px;
+}
+
+.plot {
+    position: relative;
+    display: grid;
+    grid-template-rows: repeat(4, 1fr);
+    background: repeating-linear-gradient(to bottom, transparent 0, transparent calc(25% - 1px), #edf0ed calc(25% - 1px), #edf0ed 25%);
+}
+
+.plot svg {
+    position: absolute;
+    inset: 0 0 21px;
+    width: 100%;
+    height: calc(100% - 21px);
+    overflow: visible;
+}
+
+.x-labels {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    display: flex;
+    justify-content: space-between;
+    color: #9aa39f;
+    font-size: 9px;
+}
+
+.legend {
+    display: flex;
+    justify-content: center;
+    gap: 19px;
+    margin-top: 7px;
+    color: #77817d;
+    font-size: 10px;
+}
+
+.legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.legend-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--green);
+}
+
+.legend-dot.orange {
+    background: #df9b68;
+}
+
+.dept-list {
+    display: grid;
+    gap: 16px;
+    padding: 21px 18px 16px;
+}
+
+.dept-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 6px 10px;
+}
+
+.dept-name {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: #4f5a55;
+    font-size: 11px;
+}
+
+.dept-name i {
+    width: 14px;
+    height: 14px;
+    color: #89938e;
+}
+
+.dept-value {
+    color: #47534d;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.dept-track {
+    grid-column: 1 / -1;
+    height: 6px;
+    border-radius: 8px;
+    background: #eff1ef;
+}
+
+.dept-track span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--green);
+}
+
+.dept-row:nth-child(2) .dept-track span {
+    background: #709d83;
+}
+
+.dept-row:nth-child(3) .dept-track span {
+    background: #8da8a0;
+}
+
+.dept-row:nth-child(4) .dept-track span {
+    background: #d6a078;
+}
+
+.dept-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-top: 1px solid var(--line);
+    padding: 12px 18px;
+    color: var(--muted);
+    font-size: 10px;
+}
+
+.dept-footer strong {
+    color: var(--ink);
+    font-size: 11px;
+}
+
+.activity {
+    margin-top: 15px;
+}
+
+.activity .panel-header {
+    align-items: center;
+    padding-bottom: 15px;
+}
+
+.activity-tools {
+    display: flex;
+    gap: 8px;
+}
+
+.student-summary {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin-bottom: 15px;
+}
+
+.student-summary.wide {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.access-cards {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin-bottom: 15px;
+}
+
+.login-page {
+    min-height: 100vh;
+    padding: 0;
+    background: #f4f6f4;
+}
+
+.login-shell {
+    position: relative;
+    display: grid;
+    width: 100%;
+    min-height: 100vh;
+    min-height: 100svh;
+    grid-template-columns: minmax(0, 1fr) minmax(410px, 44%);
+    overflow: hidden;
+}
+
+.login-visual {
+    position: relative;
+    min-height: 100vh;
+    min-height: 100svh;
+    overflow: hidden;
+    background: #25392e;
+}
+
+.login-campus,
+.login-visual-overlay {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+}
+
+.login-campus {
+    object-fit: cover;
+    object-position: center;
+}
+
+.login-visual-overlay {
+    background: linear-gradient(180deg, rgb(18 37 28 / 25%) 0%, transparent 34%, rgb(18 37 28 / 64%) 100%);
+}
+
+.login-brand {
+    position: absolute;
+    z-index: 1;
+    top: 34px;
+    left: 42px;
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    color: #fff;
+    font: 600 13px/1.35 "Space Grotesk", sans-serif;
+    text-decoration: none;
+    text-shadow: 0 1px 8px rgb(0 0 0 / 24%);
+}
+
+.login-brand img {
+    width: 42px;
+    height: 42px;
+    object-fit: contain;
+    border-radius: 8px;
+    background: transparent;
+}
+
+.login-visual-caption {
+    position: absolute;
+    z-index: 1;
+    right: 40px;
+    bottom: 42px;
+    left: 42px;
+    margin: 0;
+    color: #fff;
+    font: 600 clamp(22px, 3vw, 38px)/1.2 "Space Grotesk", sans-serif;
+    text-shadow: 0 2px 18px rgb(0 0 0 / 30%);
+}
+
+.login-visual-caption span {
+    display: inline-block;
+    margin-top: 9px;
+    font: 400 14px/1.5 "DM Sans", sans-serif;
+    opacity: .86;
+}
+
+.login-panel {
+    position: relative;
+    z-index: 2;
+    display: grid;
+    align-items: center;
+    margin: 0 0 0 -48px;
+    border: 1px solid rgb(255 255 255 / 60%);
+    border-radius: 20px 0 0 20px;
+    background: rgb(255 255 255 / 78%);
+    padding: 48px clamp(32px, 5vw, 76px);
+    box-shadow: -18px 0 60px rgb(13 35 23 / 12%);
+    -webkit-backdrop-filter: blur(22px);
+    backdrop-filter: blur(22px);
+}
+
+.login-panel-content {
+    width: min(100%, 400px);
+    margin: 0 auto;
+}
+
+.login-panel h1 {
+    margin: 0 0 6px;
+    font: 600 30px/1.2 "Space Grotesk", sans-serif;
+}
+
+.login-subtitle,
+.login-foot {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.login-subtitle {
+    margin: 0 0 25px;
+}
+
+.login-form {
+    display: grid;
+    gap: 15px;
+}
+
+.login-form .button {
+    width: 100%;
+    min-height: 42px;
+    margin-top: 5px;
+}
+
+.login-error {
+    border: 1px solid #f1c9c5;
+    border-radius: 6px;
+    background: var(--red-soft);
+    padding: 9px 11px;
+    color: #a33e39;
+    font-size: 11px;
+}
+
+.login-foot {
+    margin: 24px 2px 0;
+    text-align: center;
+    line-height: 1.6;
+}

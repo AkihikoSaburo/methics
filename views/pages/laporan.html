@@ -1,0 +1,13 @@
+{{define "content"}}
+<section class="page-heading">
+  <div><p class="eyebrow">Pelaporan</p><h1>Laporan absensi</h1><p class="page-subtitle">Rekap hasil scan wajah, status kehadiran, dan scan yang perlu ditinjau.</p></div>
+  <div class="heading-actions"><button class="button" id="printReport" type="button"><i data-lucide="printer"></i>Cetak</button></div>
+</section>
+<div id="laporanContent"
+     hx-get="/partials/laporan"
+     hx-trigger="load, every 15s"
+     hx-swap="innerHTML"
+     aria-live="polite">
+  <div class="role-note" style="padding:18px 4px">Memuat data laporan...</div>
+</div>
+{{end}}

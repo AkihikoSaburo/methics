@@ -1,0 +1,13 @@
+{{define "content"}}
+<section class="page-heading">
+  <div><p class="eyebrow">Semester ganjil 2026/2027</p><h1>Ringkasan absensi</h1><p class="page-subtitle">Pantau kehadiran mahasiswa dan hasil scan wajah hari ini.</p></div>
+  <div class="heading-actions"><a class="button" href="/mahasiswa"><i data-lucide="users-round"></i>Lihat mahasiswa</a></div>
+</section>
+<div id="dashboardContent"
+     hx-get="/partials/dashboard"
+     hx-trigger="load, every 15s"
+     hx-swap="innerHTML"
+     aria-live="polite">
+  <div class="role-note" style="padding:18px 4px">Memuat ringkasan...</div>
+</div>
+{{end}}

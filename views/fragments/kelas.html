@@ -1,0 +1,53 @@
+{{define "kelas_fragment"}}
+<section class="student-summary wide" aria-label="Ringkasan kelas">
+  <div class="summary-line"><span class="metric-icon"><i data-lucide="library-big"></i></span><span><strong
+        id="classCount">{{.Summary.Classes}}</strong><small>Kelas dalam cakupan</small></span></div>
+  <div class="summary-line"><span class="metric-icon blue"><i data-lucide="graduation-cap"></i></span><span><strong
+        id="classStudents">{{.Summary.Students}}</strong><small>Mahasiswa terdaftar</small></span></div>
+  <div class="summary-line"><span class="metric-icon"><i data-lucide="scan-face"></i></span><span><strong
+        id="classEnrolled">{{.Summary.Enrolled}}</strong><small>Template wajah aktif</small></span></div>
+  <div class="summary-line"><span class="metric-icon orange"><i data-lucide="user-check"></i></span><span><strong
+        id="classPresent">{{.Summary.Present}}</strong><small>Hadir hari ini</small></span></div>
+</section>
+<section class="panel">
+  <div class="panel-header" style="align-items:center;padding-bottom:15px">
+    <div>
+      <h2 class="panel-title">Daftar kelas</h2>
+      <p class="panel-caption">Cakupan kelas mengikuti role session aktif.</p>
+    </div>
+    <span class="connection-state">Data hari ini</span>
+  </div>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Kelas</th>
+          <th>Mahasiswa</th>
+          <th>Template wajah</th>
+          <th>Hadir hari ini</th>
+          <th>Tingkat kehadiran</th>
+        </tr>
+      </thead>
+      <tbody id="classTable">
+        {{range .Classes}}
+        <tr>
+          <td>{{.Name}} ({{.ID}})</td>
+          <td>{{.StudentCount}}</td>
+          <td>{{.Enrolled}} / {{.StudentCount}}</td>
+          <td>{{.Present}} / {{.StudentCount}}</td>
+          <td>
+            <div class="progress"><span style="width:{{.AttendanceRate}}%"></span></div> {{.AttendanceRate}}%
+          </td>
+        </tr>
+        {{else}}
+        <tr>
+          <td colspan="5">Belum ada kelas dalam cakupan.</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  <div class="table-foot"><span id="classResultCount">Menampilkan {{len .Classes}} kelas</span><span>Diperbarui otomatis
+      setiap 15 detik.</span></div>
+</section>
+{{end}}

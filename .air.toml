@@ -1,0 +1,53 @@
+# Konfigurasi hot reload (air, github.com/air-verse/air).
+#
+# Tanpa file ini, air memakai default `go build -o ./tmp/main .` yang GAGAL
+# karena package main proyek ini ada di ./cmd/server (lihat tmp/build-errors.log).
+#
+# Jalankan: air
+
+root = "."
+tmp_dir = "tmp"
+
+# Muat variabel dari .env sebelum build/run (lihat README).
+# Catatan: nilai yang sudah ada di environment shell TIDAK ditimpa oleh .env.
+env_files = [".env"]
+
+[build]
+  # Package main ada di ./cmd/server. Windows butuh akhiran .exe pada -o dan entrypoint.
+  cmd = "go build -o ./tmp/main.exe ./cmd/server"
+
+  # `entrypoint` menggantikan `bin` yang deprecated sejak air 1.67.
+  # Elemen pertama = executable (relatif ke root); sisanya jadi argumen default.
+  entrypoint = ["./tmp/main.exe"]
+
+  # Debounce 500 ms agar penyimpanan bertahap dari editor tidak memicu rebuild ganda.
+  delay = 500
+
+  # Jangan jalankan binary lama bila build gagal; tampilkan error saja.
+  stop_on_error = true
+
+  send_interrupt = false
+  kill_delay = "1s"
+
+  # Template di-parse sekali saat startup (internal/controller/web.go), jadi
+  # perubahan .html WAJIB memicu restart. Perubahan .go juga.
+  # static/css dan static/js sengaja tidak didaftarkan: aset disajikan langsung
+  # dari disk, jadi cukup refresh browser tanpa restart server.
+  include_ext = ["go", "html", "tmpl", "tpl"]
+
+  # data/ (SQLite) dan tmp/ tidak perlu dipantau; docs/ dan services/ (Python)
+  # tidak memengaruhi build Go.
+  exclude_dir = ["tmp", "data", "docs", "services", ".venv", "__pycache__", "node_modules"]
+
+  # Menyimpan file _test.go tidak mengubah binary server, jadi tidak perlu restart.
+  exclude_regex = ['_test\.go$']
+
+  exclude_unchanged = true
+  follow_symlink = false
+
+[log]
+  time = false
+  main_only = false
+
+[misc]
+  clean_on_exit = true

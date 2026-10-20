@@ -1,0 +1,18 @@
+:root {
+  color-scheme: light;
+  --radius: 0px;
+  --ink: #18211f;
+  --muted: #77817d;
+  --line: #e8ebe8;
+  --paper: #f7f8f6;
+  --surface: #fff;
+  --green: #247b5a;
+  --green-soft: #e8f3ed;
+  --orange: #db7d45;
+  --orange-soft: #fff1e7;
+  --blue: #5586a6;
+  --blue-soft: #edf4f8;
+  --red: #c85b57;
+  --red-soft: #fbeceb;
+  --shadow: 0 1px 2px rgb(25 38 31 / 4%), 0 9px 24px rgb(25 38 31 / 3%);
+}

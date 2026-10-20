@@ -1,0 +1,6 @@
+* { box-sizing: border-box; }
+*, *::before, *::after { border-radius: var(--radius) !important; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 14px/1.45 "DM Sans", sans-serif; }
+button, input, select { font: inherit; }
+button { color: inherit; }
+h1, h2, p { margin-top: 0; }

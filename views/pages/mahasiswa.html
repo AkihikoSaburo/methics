@@ -1,0 +1,30 @@
+{{define "content"}}
+<section class="page-heading">
+  <div><p class="eyebrow">Data akademik</p><h1>Mahasiswa</h1><p class="page-subtitle">Kelola roster kelas dan status enrollment template wajah.</p></div>
+  {{if eq .Role "administrator"}}<button class="button primary" id="openStudentDialog" type="button"><i data-lucide="user-plus"></i>Daftarkan mahasiswa</button>{{end}}
+</section>
+<section class="student-summary" id="rosterSummary">
+  <div class="summary-line"><span class="metric-icon"><i data-lucide="graduation-cap"></i></span><span><strong id="rosterTotal">-</strong><small>Mahasiswa dalam cakupan</small></span></div>
+  <div class="summary-line"><span class="metric-icon blue"><i data-lucide="scan-face"></i></span><span><strong id="enrolledTotal">-</strong><small>Template wajah aktif</small></span></div>
+  <div class="summary-line"><span class="metric-icon orange"><i data-lucide="library-big"></i></span><span><strong id="classTotal">-</strong><small>Kelas dalam cakupan</small></span></div>
+</section>
+<section class="panel">
+  <div class="panel-header" style="align-items:center;padding-bottom:15px">
+    <div><h2 class="panel-title">Roster mahasiswa</h2><p class="panel-caption">Cakupan data diberikan oleh backend sesuai role.</p></div>
+    <form class="view-tools" id="studentFilters"
+          hx-get="/partials/mahasiswa" hx-target="#rosterRegion" hx-swap="innerHTML"
+          hx-trigger="load, every 15s, keyup changed delay:300ms, change, roster-changed from:body">
+      <label class="search"><i data-lucide="search"></i><input id="studentSearch" name="q" type="search" placeholder="Cari nama atau NIM..." aria-label="Cari mahasiswa"></label>
+      <label class="select-wrap"><select id="studentClassFilter" name="class" aria-label="Filter kelas"><option value="all">Semua kelas</option><option value="IK24-A">IK24-A</option><option value="IK24-B">IK24-B</option><option value="IK24-C">IK24-C</option></select><i data-lucide="chevron-down"></i></label>
+    </form>
+  </div>
+  <div id="rosterRegion">
+    <div class="role-note" style="padding:18px 4px">Memuat roster...</div>
+  </div>
+</section>
+{{if eq .Role "administrator"}}
+<dialog id="studentDialog" aria-labelledby="studentDialogTitle">
+  <div id="studentFormShell" hx-get="/partials/mahasiswa/form" hx-trigger="load"></div>
+</dialog>
+{{end}}
+{{end}}

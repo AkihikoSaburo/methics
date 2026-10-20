@@ -1,0 +1,40 @@
+{{define "sidebar"}}
+<aside class="sidebar" id="sidebar" aria-label="Navigasi utama">
+  <div class="brand"><span class="brand-mark"><img src="https://proxy-assets.etherthink.xyz/algorithmics/anthropic.png"
+        alt="Logo Algorithmics Face Recognation"></span><span>Algorithmics Face Recognation</span></div>
+  <div class="workspace-label">Institusi</div>
+  <div class="workspace-switch" aria-label="Institusi aktif">
+    <span class="workspace-icon"><img src="https://proxy-assets.etherthink.xyz/etherthink/logo.png" alt=""
+        style="width:22px;height:22px;object-fit:contain"></span>
+    <span class="workspace-copy"><strong>Institut Teknologi Bacharuddin Jusuf Habibie</strong><small>Sistem Absensi
+        Mahasiswa</small></span>
+  </div>
+  <p class="nav-caption">Akademik</p>
+  <nav class="nav-list" hx-boost="true" hx-target="#main-content" hx-select="#main-content" hx-swap="outerHTML">
+    <a class="nav-link {{if eq .Active " dashboard"}}active{{end}}" href="/"><i
+        data-lucide="layout-dashboard"></i>Ringkasan</a>
+    <a class="nav-link {{if eq .Active " mahasiswa"}}active{{end}}" href="/mahasiswa"><i
+        data-lucide="graduation-cap"></i>Mahasiswa</a>
+    <a class="nav-link {{if eq .Active " kelas"}}active{{end}}" href="/kelas"><i data-lucide="library-big"></i>Kelas</a>
+    <a class="nav-link {{if eq .Active " laporan"}}active{{end}}" href="/laporan"><i
+        data-lucide="chart-no-axes-column-increasing"></i>Laporan</a>
+    <a class="nav-link" href="/#attendance"><i data-lucide="scan-face"></i>Log pemindaian</a>
+    {{if eq .Role "administrator"}}<a class="nav-link {{if eq .Active " akses"}}active{{end}}" href="/akses"><i
+        data-lucide="shield-check"></i>Akses & pengguna</a>{{end}}
+  </nav>
+  <div class="sidebar-bottom">
+    <p class="nav-caption">Preferensi</p>
+    <nav class="nav-list">
+      {{if eq .Role "administrator"}}<a class="nav-link" href="/akses"><i data-lucide="settings-2"></i>Konfigurasi
+        akses</a>{{end}}
+      <a class="nav-link" href="/#help"><i data-lucide="circle-help"></i>Pusat bantuan</a>
+    </nav>
+    <div class="profile">
+      <span class="avatar">{{if eq .Role "dosen"}}RW{{else}}AY{{end}}</span>
+      <span class="profile-copy"><strong>{{.UserName}}</strong><small>{{.RoleName}}</small></span>
+      <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{.CSRFToken}}"><button
+          class="icon-button" type="submit" aria-label="Keluar"><i data-lucide="log-out"></i></button></form>
+    </div>
+  </div>
+</aside>
+{{end}}

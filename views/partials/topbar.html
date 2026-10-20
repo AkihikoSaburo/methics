@@ -1,0 +1,10 @@
+{{define "topbar"}}
+<header class="topbar">
+  <button class="icon-button mobile-menu" id="menuToggle" type="button" aria-label="Buka menu"><i data-lucide="menu"></i></button>
+  <div class="crumb"><span>Akademik</span><i data-lucide="chevron-right"></i><strong>{{.PageLabel}}</strong></div>
+  <div class="top-actions">
+    <div class="date-pill"><i data-lucide="calendar-days"></i><span>{{.Today}}</span></div>
+    <button class="icon-button notification" type="button" aria-label="Notifikasi"><i data-lucide="bell"></i></button>
+  </div>
+</header>
+{{end}}

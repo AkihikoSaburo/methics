@@ -1,0 +1,13 @@
+{{define "content"}}
+<section class="page-heading">
+  <div><p class="eyebrow">Data akademik</p><h1>Kelas</h1><p class="page-subtitle">Ringkasan kehadiran dan enrollment template wajah per kelas.</p></div>
+  <div class="heading-actions"><a class="button" href="/mahasiswa"><i data-lucide="users-round"></i>Kelola mahasiswa</a></div>
+</section>
+<div id="kelasContent"
+     hx-get="/partials/kelas"
+     hx-trigger="load, every 15s"
+     hx-swap="innerHTML"
+     aria-live="polite">
+  <div class="role-note" style="padding:18px 4px">Memuat data kelas...</div>
+</div>
+{{end}}

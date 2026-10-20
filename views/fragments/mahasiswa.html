@@ -1,0 +1,55 @@
+{{define "mahasiswa_fragment"}}
+<section class="student-summary" id="rosterSummary" hx-swap-oob="true">
+  <div class="summary-line"><span class="metric-icon"><i data-lucide="graduation-cap"></i></span><span><strong
+        id="rosterTotal">{{.Total}}</strong><small>Mahasiswa dalam cakupan</small></span></div>
+  <div class="summary-line"><span class="metric-icon blue"><i data-lucide="scan-face"></i></span><span><strong
+        id="enrolledTotal">{{.Enrolled}}</strong><small>Template wajah aktif</small></span></div>
+  <div class="summary-line"><span class="metric-icon orange"><i data-lucide="library-big"></i></span><span><strong
+        id="classTotal">{{.ClassCount}}</strong><small>Kelas dalam cakupan</small></span></div>
+</section>
+{{if .Notice}}<div class="role-note" style="margin-bottom:12px">{{.Notice}}</div>{{end}}
+{{if .Error}}<div class="role-note error" style="margin-bottom:12px">{{.Error}}</div>{{end}}
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th>Mahasiswa</th>
+        <th>Kelas</th>
+        <th>Enrollment wajah</th>
+        <th>Status hari ini</th>
+        <th>Aksi</th>
+      </tr>
+    </thead>
+    <tbody id="studentRoster">
+      {{range .Rows}}
+      <tr>
+        <td>
+          <div class="employee"><span class="avatar">{{initials .StudentName}}</span><span><span
+                class="employee-name">{{.StudentName}}</span><span class="employee-mail">NIM
+                {{.StudentNIM}}</span></span></div>
+        </td>
+        <td>{{.ClassName}} ({{.ClassID}})</td>
+        <td>{{if .FaceEnrolled}}Template aktif{{else}}Belum dienrollment{{end}}</td>
+        <td>{{.Status}}</td>
+        <td>
+          {{if and (eq $.Role "administrator") (not .FaceEnrolled)}}
+          <label class="button face-enroll-button">
+            <i data-lucide="scan-face"></i>Enroll wajah
+            <input type="file" name="image" accept="image/jpeg,image/png" hidden
+              hx-post="/partials/mahasiswa/{{.StudentNIM}}/face-template" hx-encoding="multipart/form-data"
+              hx-include="#studentFilters" hx-target="#rosterRegion" hx-swap="innerHTML" hx-trigger="change">
+          </label>
+          {{else if .FaceEnrolled}}Terdaftar{{else}}-{{end}}
+        </td>
+      </tr>
+      {{else}}
+      <tr>
+        <td colspan="5">{{.EmptyText}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</div>
+<div class="table-foot"><span id="studentResultCount">Menampilkan {{len .Rows}} dari {{.Total}}
+    mahasiswa</span><span>Gambar diproses melalui layanan verifikasi internal.</span></div>
+{{end}}

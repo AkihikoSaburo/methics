@@ -1,0 +1,117 @@
+{{define "dashboard_fragment"}}
+<section class="metrics" aria-label="Ringkasan kehadiran">
+  <article class="metric">
+    <div class="metric-top"><span>Mahasiswa terdaftar</span><span class="metric-icon"><i
+          data-lucide="graduation-cap"></i></span></div>
+    <div class="metric-value" id="totalStudents">{{.Students}}</div>
+    <div class="metric-foot"><span id="faceTemplateNote">{{.FaceTemplates}} template wajah aktif</span></div>
+  </article>
+  <article class="metric">
+    <div class="metric-top"><span>Kelas aktif</span><span class="metric-icon blue"><i
+          data-lucide="library-big"></i></span></div>
+    <div class="metric-value" id="totalClasses">{{.Classes}}</div>
+    <div class="metric-foot"><span>{{if .ClassCodes}}{{.ClassCodes}}{{else}}Belum ada kelas{{end}}</span></div>
+  </article>
+  <article class="metric">
+    <div class="metric-top"><span>Scan terverifikasi</span><span class="metric-icon"><i
+          data-lucide="scan-face"></i></span></div>
+    <div class="metric-value" id="verifiedScans">{{.Verified}}</div>
+    <div class="metric-foot"><span class="trend">Hari ini</span></div>
+  </article>
+  <article class="metric">
+    <div class="metric-top"><span>Perlu ditinjau</span><span class="metric-icon orange"><i
+          data-lucide="scan-search"></i></span></div>
+    <div class="metric-value" id="reviewScans">{{.Review}}</div>
+    <div class="metric-foot"><span>Scan yang perlu pemeriksaan</span></div>
+  </article>
+</section>
+<section class="dashboard-grid" aria-label="Kehadiran per kelas">
+  <article class="panel">
+    <div class="panel-header">
+      <div>
+        <h2 class="panel-title">Kehadiran per kelas</h2>
+        <p class="panel-caption">Jumlah mahasiswa hadir hari ini</p>
+      </div>
+    </div>
+    <div class="dept-list" id="classAttendance">
+      {{range .ClassRows}}
+      <div class="dept-row">
+        <div class="dept-name"><i data-lucide="book-open-check"></i>{{.Name}} ({{.ID}})</div>
+        <div class="dept-value">{{.Present}} / {{.StudentCount}}</div>
+        <div class="dept-track"><span style="width:{{.AttendanceRate}}%"></span></div>
+      </div>
+      {{else}}
+      <div class="role-note">Belum ada kelas dalam cakupan.</div>
+      {{end}}
+    </div>
+    <div class="dept-footer"><span>Total hadir</span><strong id="attendanceTotal">{{.PresentTotal}} /
+        {{.StudentTotal}}</strong></div>
+  </article>
+  <article class="panel">
+    <div class="panel-header">
+      <div>
+        <h2 class="panel-title">Koneksi perangkat</h2>
+        <p class="panel-caption">Status penerimaan dan layanan verifikasi</p>
+      </div>
+    </div>
+    <div class="dept-list">
+      <div class="dept-row">
+        <div class="dept-name"><i data-lucide="cpu"></i>Perangkat ESP32</div>
+        <div class="connection-state {{if .DeviceOnline}}online{{else}}offline{{end}}" id="deviceState">{{if
+          .DeviceOnline}}Terhubung{{else}}Tidak terhubung{{end}}</div>
+        <div class="role-note" id="deviceDetail">{{if .DeviceLastSeen}}Terakhir aktif {{.DeviceLastSeen}}{{else}}POST
+          /api/v1/scans{{end}}</div>
+      </div>
+      <div class="dept-row">
+        <div class="dept-name"><i data-lucide="brain-circuit"></i>Verifikasi Python</div>
+        <div class="connection-state {{if .FaceOnline}}online{{else}}offline{{end}}" id="faceState">{{if
+          .FaceOnline}}Terhubung{{else}}Tidak terhubung{{end}}</div>
+        <div class="role-note" id="faceDetail">{{if .FaceProvider}}{{.FaceProvider}}{{else}}Service internal{{end}}
+        </div>
+      </div>
+    </div>
+  </article>
+</section>
+<section class="panel activity" id="attendance">
+  <div class="panel-header">
+    <div>
+      <h2 class="panel-title">Scan terbaru</h2>
+      <p class="panel-caption">Data dibatasi sesuai role session aktif.</p>
+    </div><a class="button" href="/mahasiswa">Roster mahasiswa<i data-lucide="arrow-right"></i></a>
+  </div>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Mahasiswa</th>
+          <th>Kelas</th>
+          <th>Waktu scan</th>
+          <th>Verifikasi wajah</th>
+          <th>Status</th>
+          <th>Perangkat</th>
+        </tr>
+      </thead>
+      <tbody id="dashboardAttendance">
+        {{range .Rows}}
+        <tr>
+          <td>
+            <div class="employee"><span class="avatar">{{initials .StudentName}}</span><span><span
+                  class="employee-name">{{if .StudentName}}{{.StudentName}}{{else}}Mahasiswa{{end}}</span><span
+                  class="employee-mail">NIM {{if .StudentNIM}}{{.StudentNIM}}{{else}}-{{end}}</span></span></div>
+          </td>
+          <td>{{if .ClassID}}{{.ClassID}}{{else}}-{{end}}</td>
+          <td>{{.ScannedAt}}</td>
+          <td>{{.Verification}}</td>
+          <td>{{if .Status}}{{.Status}}{{else}}-{{end}}</td>
+          <td>{{if .DeviceID}}{{.DeviceID}}{{else}}-{{end}}</td>
+        </tr>
+        {{else}}
+        <tr>
+          <td colspan="6">Belum ada data absensi.</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</section>
+{{end}}

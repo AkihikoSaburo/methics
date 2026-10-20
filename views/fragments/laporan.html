@@ -1,0 +1,96 @@
+{{define "laporan_fragment"}}
+<section class="student-summary wide" aria-label="Ringkasan laporan">
+  <div class="summary-line"><span class="metric-icon"><i data-lucide="scan-face"></i></span><span><strong
+        id="reportVerified">{{.Summary.Verified}}</strong><small>Scan terverifikasi</small></span></div>
+  <div class="summary-line"><span class="metric-icon orange"><i data-lucide="scan-search"></i></span><span><strong
+        id="reportReview">{{.Summary.Review}}</strong><small>Perlu ditinjau</small></span></div>
+  <div class="summary-line"><span class="metric-icon red"><i data-lucide="shield-x"></i></span><span><strong
+        id="reportRejected">{{.Summary.Rejected}}</strong><small>Ditolak</small></span></div>
+  <div class="summary-line"><span class="metric-icon blue"><i data-lucide="percent"></i></span><span><strong
+        id="reportRate">{{.Summary.AttendanceRate}}%</strong><small>Tingkat kehadiran</small></span></div>
+</section>
+<section class="dashboard-grid" aria-label="Rekap laporan">
+  <article class="panel">
+    <div class="panel-header">
+      <div>
+        <h2 class="panel-title">Komposisi status scan</h2>
+        <p class="panel-caption">Distribusi hasil verifikasi wajah hari ini.</p>
+      </div>
+    </div>
+    <div class="dept-list" id="reportBreakdown">
+      {{range .Breakdown}}
+      <div class="dept-row">
+        <div class="dept-name">{{.Status}}</div>
+        <div class="dept-value">{{.Count}} ({{.Percent}}%)</div>
+        <div class="dept-track"><span style="width:{{.Percent}}%"></span></div>
+      </div>
+      {{else}}
+      <div class="role-note">Belum ada scan hari ini.</div>
+      {{end}}
+    </div>
+  </article>
+  <article class="panel">
+    <div class="panel-header">
+      <div>
+        <h2 class="panel-title">Kehadiran per kelas</h2>
+        <p class="panel-caption">Persentase kehadiran hari ini.</p>
+      </div>
+    </div>
+    <div class="dept-list" id="reportClasses">
+      {{range .Classes}}
+      <div class="dept-row">
+        <div class="dept-name">{{.Name}} ({{.ID}})</div>
+        <div class="dept-value">{{.Present}} / {{.StudentCount}}</div>
+        <div class="dept-track"><span style="width:{{.AttendanceRate}}%"></span></div>
+      </div>
+      {{else}}
+      <div class="role-note">Belum ada kelas dalam cakupan.</div>
+      {{end}}
+    </div>
+  </article>
+</section>
+<section class="panel activity">
+  <div class="panel-header">
+    <div>
+      <h2 class="panel-title">Riwayat scan terbaru</h2>
+      <p class="panel-caption">50 event terakhir dalam cakupan role.</p>
+    </div>
+  </div>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Mahasiswa</th>
+          <th>Kelas</th>
+          <th>Waktu</th>
+          <th>Status</th>
+          <th>Keyakinan</th>
+          <th>Perangkat</th>
+          <th>Catatan</th>
+        </tr>
+      </thead>
+      <tbody id="reportEvents">
+        {{range .Events}}
+        <tr>
+          <td>
+            <div class="employee"><span class="avatar">{{initials .StudentName}}</span><span><span
+                  class="employee-name">{{if .StudentName}}{{.StudentName}}{{else}}Mahasiswa{{end}}</span><span
+                  class="employee-mail">NIM {{if .StudentNIM}}{{.StudentNIM}}{{else}}-{{end}}</span></span></div>
+          </td>
+          <td>{{if .ClassID}}{{.ClassID}}{{else}}-{{end}}</td>
+          <td>{{if .ScannedAt}}{{.ScannedAt}}{{else}}-{{end}}</td>
+          <td><span class="status {{statusClass .Status}}">{{if .Status}}{{.Status}}{{else}}-{{end}}</span></td>
+          <td>{{confidence .Confidence}}</td>
+          <td>{{if .DeviceID}}{{.DeviceID}}{{else}}-{{end}}</td>
+          <td>{{if .ReviewReason}}{{.ReviewReason}}{{else}}-{{end}}</td>
+        </tr>
+        {{else}}
+        <tr>
+          <td colspan="7">Belum ada riwayat scan.</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</section>
+{{end}}

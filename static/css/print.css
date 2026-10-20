@@ -1,0 +1,5 @@
+@media print {
+  .sidebar, .topbar, .heading-actions, .toast { display: none !important; }
+  .main { margin-left: 0; padding: 0; }
+  .panel, .student-summary { box-shadow: none; }
+}

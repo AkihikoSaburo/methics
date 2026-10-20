@@ -1,0 +1,25 @@
+{{define "student_form"}}
+<form id="studentForm" hx-post="/partials/mahasiswa/students" hx-target="#studentFormShell" hx-swap="innerHTML">
+  <div class="dialog-head">
+    <div>
+      <h2 id="studentDialogTitle">Daftarkan mahasiswa</h2>
+      <p>Identitas tidak otomatis memiliki template wajah.</p>
+    </div><button class="icon-button" type="button" id="closeStudentDialog" aria-label="Tutup"><i
+        data-lucide="x"></i></button>
+  </div>
+  <div class="dialog-body">
+    {{if .Error}}<p class="field-error" role="alert">{{.Error}}</p>{{end}}
+    <label class="field">Nama lengkap<input name="name" required maxlength="120" autocomplete="name"
+        placeholder="Nama mahasiswa" value="{{.Name}}"></label>
+    <label class="field">NIM<input name="nim" required maxlength="32" pattern="[A-Za-z0-9\-]+" placeholder="IK24006"
+        value="{{.NIM}}"></label>
+    <label class="field">Kelas<select name="classId" required>
+        <option value="">Pilih kelas</option>
+        {{range .Classes}}<option value="{{.ID}}" {{if eq .ID $.ClassID}}selected{{end}}>{{.Name}} ({{.ID}})</option>
+        {{end}}
+      </select></label>
+  </div>
+  <div class="dialog-foot"><button class="button" type="button" id="cancelStudentDialog">Batal</button><button
+      class="button primary" type="submit"><i data-lucide="user-plus"></i>Simpan mahasiswa</button></div>
+</form>
+{{end}}
