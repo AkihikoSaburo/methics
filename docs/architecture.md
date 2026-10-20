@@ -1,6 +1,7 @@
 # Arsitektur Algorithmics Face Recognation
 
-> Status: **arsitektur yang berlaku saat ini** (Go SSR + htmx, satu binary).
+> Status: **arsitektur yang berlaku saat ini** (Go SSR + htmx, satu binary,
+> MongoDB). Terakhir diselaraskan dengan kode: 21 Oktober 2026.
 > Dokumen ini menggantikan draf rencana pemisahan frontend/Nuxt yang ditolak —
 > lihat §9 untuk catatannya.
 
@@ -10,11 +11,12 @@ Satu aplikasi Go yang merender HTML dan sekaligus melayani API. Tidak ada
 runtime kedua, tidak ada build frontend terpisah, tidak ada langkah deploy
 kedua.
 
-- **Bahasa/runtime**: Go (satu binary) + SQLite.
+- **Bahasa/runtime**: Go (satu binary) + MongoDB.
 - **Frontend**: `html/template` server-rendered + htmx untuk navigasi/aksi
   tanpa reload penuh.
 - **Layanan pendukung**: face service Python (internal, tidak diekspos).
-- **Klien**: browser staf (admin/dosen) dan perangkat ESP32-CAM.
+- **Klien**: browser staf (admin/dosen), perangkat ESP32-CAM (scan wajah —
+  firmware belum ada), dan ESP8266 (heartbeat — firmware ada di `devices/`).
 
 Konsekuensi yang disengaja: halaman dan API berbagi satu sumber query/validasi
 (`internal/api`), sehingga aturan role tidak bisa berbeda antara tampilan dan
@@ -28,10 +30,11 @@ API.
 | HTTP API & domain | `internal/api/server.go` | endpoint staf + perangkat, query ber-scope role, error sentinel |
 | Halaman & fragment | `internal/controller/` | render `views/pages` (shell) dan `views/fragments` (htmx) |
 | Keamanan | `internal/security/middleware.go` | `RequireSession`, `RequireRole`, `Principal`, security headers/CSP |
-| Penyimpanan | `internal/store/database.go` | schema, seed, migrasi SQLite |
+| Penyimpanan | `internal/store/database.go`, `users.go` | koneksi, index, seed MongoDB; akun staf (bcrypt) |
 | Tampilan | `views/` | `layouts/base.html`, `pages/*`, `fragments/*` |
 | Aset statis | `static/` | `css/`, `js/app.js`, `js/lib/ui.js`, vendor lokal |
-| Face service | `services/face/` | Python: `/enroll`, `/verify` (embedding, bukan gambar) |
+| Face service | `services/face/` | Python: `/health`, `/enroll`, `/verify` (embedding, bukan gambar) — **belum ada di repo**, kontrak di `face-service.md` |
+| Firmware | `devices/esp8266/` | heartbeat ESP8266 ke `/api/v1/devices/ping` |
 
 Vendor frontend di-host lokal dan versi-terpin: htmx 2.0.11, Lucide 1.59.0,
 dengan `htmx.config.allowEval = false`.
@@ -43,7 +46,7 @@ dengan `htmx.config.allowEval = false`.
 ```text
 Browser ──GET /,/mahasiswa,/kelas,/laporan,/akses──► Go (shell htmx)
         ──GET /partials/...──────────────────────► Go (fragment HTML)
-        ──POST /partials/... (+ X-CSRF-Token)────► Go → internal/api → SQLite
+        ──POST /partials/... (+ X-CSRF-Token)────► Go → internal/api → MongoDB
                                                     └── HX-Trigger: toast / roster-changed / ...
 ```
 
@@ -53,25 +56,35 @@ dan ikon navigasi tetap di DOM, sehingga tidak ikut dimuat ulang. Aksi dan
 pembaruan data memakai fragment HTML di `/partials/*` (bukan JSON + perakitan
 DOM); ikon Lucide disegarkan setelah swap fragment.
 
-### Perangkat (ESP32-CAM)
+### Perangkat (ESP32-CAM) — scan
 
 ```text
 ESP32 ──POST /api/v1/scans (bearer DEVICE_TOKEN + HMAC + timestamp)──► Go
                                                                        ├── Python /verify
-                                                                       └── SQLite: scan_events
+                                                                       ├── MongoDB: scan_events
+                                                                       └── MongoDB: devices.last_seen
 ```
+
+### Perangkat (ESP8266) — heartbeat
+
+```text
+ESP8266 ──POST /api/v1/devices/ping (bearer DEVICE_TOKEN, wajib hanya di production)──► Go
+                                                                                       └── MongoDB: devices.last_seen (upsert)
+```
+
+Dashboard menganggap perangkat online bila `last_seen` < 2 menit.
 
 ### Enrollment wajah (admin)
 
 ```text
-Admin ──POST /partials/mahasiswa/students/{nim}/face-template (multipart)──► Go
-                                                                             └── Python /enroll
+Admin ──POST /partials/mahasiswa/{nim}/face-template (multipart)──► Go
+                                                                   └── Python /enroll → MongoDB: face_templates
 ```
 
 ### API staf (integrasi)
 
-`GET /api/v1/*` tetap tersedia sebagai API JSON publik/integrasi (dipakai
-perangkat). Sejak migrasi htmx, halaman **tidak** lagi membaca
+`/api/v1/*` tetap tersedia sebagai API JSON untuk integrasi, pengujian, dan
+perangkat. Sejak migrasi htmx, halaman **tidak** lagi membaca
 `/api/v1`; sumber data halaman adalah `/partials/*`. Detail payload dan skema
 HMAC ada di `API.md`.
 
@@ -124,13 +137,31 @@ HMAC ada di `API.md`.
 - **Konsekuensi**: tidak ada permukaan skrip eksternal; kebijakan bisa
   dikencangkan tanpa menyesuaikan kode halaman.
 
+### ADR-6 — MongoDB sebagai basis data (Diterima)
+
+- **Konteks**: versi awal memakai SQLite berkas lokal (`data/attendance.db`)
+  yang dibagi Go dan Python.
+- **Keputusan**: pindah ke MongoDB di server terpisah (default
+  `mongodb://10.100.1.11:27017`, database `attendance`).
+- **Dasar** (disimpulkan dari kode — koreksi bila alasan sebenarnya berbeda):
+  Go dan face service Python dapat berjalan di mesin berbeda dan mengakses
+  data yang sama lewat jaringan, tanpa berbagi berkas SQLite.
+- **Konsekuensi**: penugasan kelas dosen pindah ke `users.class_ids`; waktu
+  disimpan sebagai string RFC3339 UTC dan "hari ini" dihitung di Go
+  (`todayRangeUTC`); MongoDB wajib di-hardening (auth, bindIp, TLS, backup).
+  Detail di `database.md`.
+
 ## 5. Batas kepercayaan
 
 1. **Internet → Go (browser)**: session + CSRF; role & kelas diambil dari DB
    tiap request, bukan dari klien.
-2. **Internet → Go (perangkat)**: device token + HMAC + timestamp.
+2. **Internet → Go (perangkat)**: scan memakai device token + HMAC +
+   timestamp. Heartbeat ping hanya memakai token (dan hanya di production);
+   `GET /api/v1/health` publik.
 3. **Go → Face service**: jaringan internal, bearer `FACE_SERVICE_TOKEN`;
    port Python tidak diekspos.
+4. **Go/Python → MongoDB**: jaringan internal; di production wajib user
+   aplikasi + `authorization: enabled` (panduan di `README.md`).
 
 ## 6. Ringkasan kontrak API
 
@@ -138,15 +169,12 @@ Acuan payload/skema ada di `API.md`.
 
 | Kelompok | Contoh | Auth |
 | --- | --- | --- |
-| Staf baca | `GET /api/v1/dashboard`, `/classes`, `/reports`, `/students` | session + (tulis) CSRF |
+| Staf baca | `GET /api/v1/dashboard`, `/classes`, `/reports` | session |
 | Staf tulis | `POST /api/v1/students`, `POST /api/v1/students/{nim}/face-template` | session + CSRF (admin) |
-| Perangkat | `POST /api/v1/scans`, `GET /api/v1/health` | device token + HMAC + timestamp |
+| Perangkat — scan | `POST /api/v1/scans` | device token + HMAC + timestamp |
+| Perangkat — heartbeat | `GET\|POST /api/v1/devices/ping` | device token (hanya production) |
+| Publik | `GET /api/v1/health` | — |
 | Fragment (staf) | `GET/POST /partials/*` | session (+ CSRF untuk POST) |
-
-Catatan: `API.md` §3 masih menyebut halaman server-rendered membaca
-`/api/v1`. Itu tidak lagi akurat sejak migrasi htmx — halaman membaca
-`/partials/*`. (Perlu diselaraskan; belum diubah agar tidak mencampur
-pekerjaan.)
 
 ## 7. Konfigurasi & deployment
 
@@ -158,14 +186,18 @@ Variabel lingkungan (dari `cmd/server/main.go`):
 | Variabel | Keterangan |
 | --- | --- |
 | `HTTP_ADDR` | alamat listen (default `:8080`) |
-| `DATABASE_PATH` | lokasi SQLite (default `data/attendance.db`) |
+| `MONGODB_URI` | URI koneksi MongoDB (default `mongodb://10.100.1.11:27017`) |
+| `MONGODB_DATABASE` | nama database MongoDB (default `attendance`) |
 | `STATIC_DIR`, `VIEW_DIR` | lokasi aset & template |
-| `APP_ENV` | `development` / `production` |
-| `CSRF_SECRET` | wajib ≥32 karakter di production |
-| `DEVICE_TOKEN` | wajib ≥32 karakter di production |
+| `APP_ENV` | `development` / `production` (cookie Secure, token face service & ping wajib) |
+| `CSRF_SECRET` | wajib ≥32 karakter (semua mode) |
+| `DEVICE_TOKEN` | wajib ≥32 karakter (semua mode) |
 | `FACE_SERVICE_URL`, `FACE_SERVICE_TOKEN` | koneksi ke Python (token ≥32 di production) |
-| `FACE_DISTANCE_THRESHOLD` | ambang pencocokan (default `0.50`) |
 | `BOOTSTRAP_ADMIN_*`, `BOOTSTRAP_LECTURER_*` | pembuatan akun awal |
+
+`FACE_DISTANCE_THRESHOLD` (default `0.50`) dibaca oleh face service Python,
+bukan oleh Go. Templat lengkap: `.env.example`. Zona waktu server menentukan
+batas "hari ini" pada ringkasan dan laporan.
 
 Catatan hardening: HSTS **belum** dipasang (lihat §10). Header yang sudah ada:
 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy:
@@ -198,7 +230,7 @@ Dicatat agar tidak diusulkan ulang tanpa alasan baru yang konkret.
 
 ## 10. Risiko terbuka & TODO backend
 
-Ini adalah pekerjaan backend yang masih outstanding (dari `HANDOFF.md` §187):
+Ini adalah pekerjaan backend yang masih outstanding (lihat juga `HANDOFF.md` §Batasan dan Risiko):
 
 1. **Session & rate limit in-memory** → belum aman untuk multi-instance; butuh
    store bersama (Redis/DB) bila di-scale.
@@ -212,6 +244,15 @@ Ini adalah pekerjaan backend yang masih outstanding (dari `HANDOFF.md` §187):
 6. **Audit & privasi**: belum ada consent/retention workflow, audit enrollment
    memadai, atau enkripsi backup.
 7. **Hardening HTTP**: HSTS dan audit logging belum ada.
+8. **Bug scoping** di `AllScanEvents`: filter `class` menimpa pembatasan kelas
+   dosen pada halaman log.
+9. **Ping/health melakukan upsert perangkat** tanpa token (ping di
+   non-production, health di semua mode) → ID perangkat baru bisa dibuat
+   dari luar.
+10. **Kredensial di firmware ESP8266** (Wi-Fi + `DEVICE_TOKEN`) tertulis di
+   sketch; pindahkan ke `secrets.h` dan rotasi token.
+11. **Face service belum ada di repo** → enrollment & scan berakhir `502`
+    sampai service dibangun.
 
 ## 11. Berkas acuan
 
@@ -222,5 +263,7 @@ Ini adalah pekerjaan backend yang masih outstanding (dari `HANDOFF.md` §187):
 - `internal/api/server.go` — endpoint + query ber-scope role.
 - `internal/security/middleware.go` — session, CSRF, principal, CSP.
 - `internal/controller/` — handler halaman & fragment.
-- `internal/store/database.go` — schema, seed, migrasi.
-- `services/face/main.py` — enroll/verify.
+- `internal/store/database.go` — koneksi, index, seed MongoDB.
+- `database.md` — skema koleksi & operasi.
+- `devices.md` — firmware & protokol perangkat.
+- `face-service.md` — kontrak face service.

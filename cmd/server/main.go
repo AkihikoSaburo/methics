@@ -37,11 +37,14 @@ func main() {
 		log.Fatal("FACE_SERVICE_TOKEN must contain at least 32 characters in production")
 	}
 
-	database, err := store.Open(env("DATABASE_PATH", "data/attendance.db"))
+	mongoURI := env("MONGODB_URI", "mongodb://10.100.1.11:27017")
+	mongoDB := env("MONGODB_DATABASE", "attendance")
+	database, err := store.Open(mongoURI, mongoDB)
 	if err != nil {
-		log.Fatalf("initialize database: %v", err)
+		log.Fatalf("initialize database (%s): %v", mongoURI, err)
 	}
 	defer database.Close()
+	log.Printf("connected to MongoDB at %s (database: %s)", mongoURI, mongoDB)
 	bootstrapStaff(database)
 
 	staticDir := env("STATIC_DIR", "static")
@@ -66,6 +69,7 @@ func main() {
 	protected.Handle("GET /mahasiswa", security.RequireSession(sessions, database, false)(http.HandlerFunc(web.Students)))
 	protected.Handle("GET /kelas", security.RequireSession(sessions, database, false)(http.HandlerFunc(web.Classes)))
 	protected.Handle("GET /laporan", security.RequireSession(sessions, database, false)(http.HandlerFunc(web.Reports)))
+	protected.Handle("GET /logs", security.RequireSession(sessions, database, false)(http.HandlerFunc(web.Logs)))
 	protected.Handle("GET /akses", security.RequireSession(sessions, database, false)(security.RequireRole("administrator")(http.HandlerFunc(web.Access))))
 	protected.Handle("/static/", apiServer.StaticHandler(staticDir))
 	protected.Handle("/api/v1/", security.RequireSession(sessions, database, true)(apiServer.StaffHandler()))
@@ -84,6 +88,8 @@ func main() {
 	router := http.NewServeMux()
 	router.Handle("POST /api/v1/scans", apiServer.DeviceHandler())
 	router.Handle("GET /api/v1/health", apiServer.DeviceHandler())
+	router.Handle("GET /api/v1/devices/ping", apiServer.DeviceHandler())
+	router.Handle("POST /api/v1/devices/ping", apiServer.DeviceHandler())
 	router.Handle("/", sessions.LoadAndSave(csrfHandler))
 	address := env("HTTP_ADDR", ":8080")
 	server := &http.Server{

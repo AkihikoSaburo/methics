@@ -1,0 +1,53 @@
+{{define "logs_fragment"}}
+<section class="student-summary wide" id="logsSummary" hx-swap-oob="true" aria-label="Ringkasan log pemindaian">
+  <div class="summary-line"><span class="metric-icon"><i data-lucide="scan-face"></i></span><span><strong
+        id="logTotal">{{.Summary.Total}}</strong><small>Total pemindaian</small></span></div>
+  <div class="summary-line"><span class="metric-icon"><i data-lucide="circle-check-big"></i></span><span><strong
+        id="logVerified">{{.Summary.Verified}}</strong><small>Terverifikasi</small></span></div>
+  <div class="summary-line"><span class="metric-icon orange"><i data-lucide="scan-search"></i></span><span><strong
+        id="logReview">{{.Summary.Review}}</strong><small>Perlu ditinjau</small></span></div>
+  <div class="summary-line"><span class="metric-icon red"><i data-lucide="shield-x"></i></span><span><strong
+        id="logRejected">{{.Summary.Rejected}}</strong><small>Ditolak</small></span></div>
+</section>
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th>Mahasiswa</th>
+        <th>Kelas</th>
+        <th>Tanggal &amp; waktu</th>
+        <th>Status</th>
+        <th>Keyakinan</th>
+        <th>Perangkat</th>
+        <th>Catatan</th>
+      </tr>
+    </thead>
+    <tbody id="logEvents">
+      {{range .Events}}
+      <tr>
+        <td>
+          <div class="employee"><span class="avatar">{{initials .StudentName}}</span><span><span
+                class="employee-name">{{if .StudentName}}{{.StudentName}}{{else}}Tidak dikenali{{end}}</span><span
+                class="employee-mail">NIM {{if .StudentNIM}}{{.StudentNIM}}{{else}}-{{end}}</span></span></div>
+        </td>
+        <td>{{if .ClassID}}{{.ClassID}}{{else}}-{{end}}</td>
+        <td>{{if .ScannedAt}}{{.ScannedAt}}{{else}}-{{end}}</td>
+        <td><span class="status {{statusClass .Status}}">{{if .Status}}{{.Status}}{{else}}-{{end}}</span></td>
+        <td>{{confidence .Confidence}}</td>
+        <td>{{if .DeviceID}}{{.DeviceID}}{{else}}-{{end}}</td>
+        <td>{{if .ReviewReason}}{{.ReviewReason}}{{else}}-{{end}}</td>
+      </tr>
+      {{else}}
+      <tr>
+        <td colspan="7">{{if $.EmptyText}}{{$.EmptyText}}{{else}}Belum ada log pemindaian.{{end}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</div>
+{{if gt .EventCount 0}}
+<div class="table-foot">
+  <span>Menampilkan {{.EventCount}} dari {{.Summary.Total}} pemindaian</span>
+</div>
+{{end}}
+{{end}}

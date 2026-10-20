@@ -3,12 +3,15 @@ package store
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
+	"time"
 
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -18,6 +21,17 @@ type User struct {
 	DisplayName string
 	Role        string
 	ClassIDs    []string
+}
+
+type userDoc struct {
+	ID           string    `bson:"_id"`
+	Username     string    `bson:"username"`
+	DisplayName  string    `bson:"display_name"`
+	Role         string    `bson:"role"`
+	PasswordHash []byte    `bson:"password_hash"`
+	Active       bool      `bson:"active"`
+	ClassIDs     []string  `bson:"class_ids"`
+	CreatedAt    time.Time `bson:"created_at"`
 }
 
 var ErrInvalidCredentials = errors.New("invalid username or password")
@@ -40,92 +54,95 @@ func (db *Database) CreateUser(ctx context.Context, username, password, displayN
 	if err != nil {
 		return fmt.Errorf("generate user id: %w", err)
 	}
-	tx, err := db.SQL.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+
+	doc := userDoc{
+		ID:           id,
+		Username:     username,
+		DisplayName:  displayName,
+		Role:         role,
+		PasswordHash: hash,
+		Active:       true,
+		ClassIDs:     classIDs,
+		CreatedAt:    time.Now().UTC(),
 	}
-	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO users(id, username, display_name, role, password_hash) VALUES(?, ?, ?, ?, ?)`, id, username, displayName, role, hash); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+
+	_, err = db.Collection("users").InsertOne(ctx, doc)
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
 			return ErrUserExists
 		}
 		return err
 	}
-	for _, classID := range classIDs {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO user_classes(user_id, class_id) VALUES(?, ?)`, id, classID); err != nil {
-			return fmt.Errorf("assign class %s: %w", classID, err)
-		}
-	}
-	return tx.Commit()
+	return nil
 }
 
 func (db *Database) EnsureUser(ctx context.Context, username, password, displayName, role string, classIDs []string) error {
-	var exists int
-	err := db.SQL.QueryRowContext(ctx, `SELECT 1 FROM users WHERE username = ?`, strings.TrimSpace(username)).Scan(&exists)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	username = strings.TrimSpace(username)
+	filter := bson.M{"username": bson.M{"$regex": "^" + regexp.QuoteMeta(username) + "$", "$options": "i"}}
+	count, err := db.Collection("users").CountDocuments(ctx, filter)
+	if err != nil {
 		return err
+	}
+	if count > 0 {
+		return nil
 	}
 	return db.CreateUser(ctx, username, password, displayName, role, classIDs)
 }
 
 func (db *Database) AuthenticateUser(ctx context.Context, username, password string) (User, error) {
-	var user User
-	var hash []byte
-	var active bool
-	err := db.SQL.QueryRowContext(ctx, `SELECT id, username, display_name, role, password_hash, active FROM users WHERE username = ?`, strings.TrimSpace(username)).Scan(
-		&user.ID, &user.Username, &user.DisplayName, &user.Role, &hash, &active,
-	)
+	username = strings.TrimSpace(username)
+	filter := bson.M{"username": bson.M{"$regex": "^" + regexp.QuoteMeta(username) + "$", "$options": "i"}}
+	var doc userDoc
+	err := db.Collection("users").FindOne(ctx, filter).Decode(&doc)
 	if err != nil {
 		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(password))
 		return User{}, ErrInvalidCredentials
 	}
-	if !active || bcrypt.CompareHashAndPassword(hash, []byte(password)) != nil {
+	if !doc.Active || bcrypt.CompareHashAndPassword(doc.PasswordHash, []byte(password)) != nil {
 		return User{}, ErrInvalidCredentials
 	}
-	user.ClassIDs, err = db.UserClassIDs(ctx, user.ID)
-	return user, err
+	return User{
+		ID:          doc.ID,
+		Username:    doc.Username,
+		DisplayName: doc.DisplayName,
+		Role:        doc.Role,
+		ClassIDs:    doc.ClassIDs,
+	}, nil
 }
 
 func (db *Database) UserByID(ctx context.Context, id string) (User, error) {
-	var user User
-	var active bool
-	err := db.SQL.QueryRowContext(ctx, `SELECT id, username, display_name, role, active FROM users WHERE id = ?`, id).Scan(
-		&user.ID, &user.Username, &user.DisplayName, &user.Role, &active,
-	)
+	var doc userDoc
+	err := db.Collection("users").FindOne(ctx, bson.M{"_id": id}).Decode(&doc)
 	if err != nil {
 		return User{}, err
 	}
-	if !active {
-		return User{}, sql.ErrNoRows
+	if !doc.Active {
+		return User{}, mongo.ErrNoDocuments
 	}
-	user.ClassIDs, err = db.UserClassIDs(ctx, user.ID)
-	return user, err
+	return User{
+		ID:          doc.ID,
+		Username:    doc.Username,
+		DisplayName: doc.DisplayName,
+		Role:        doc.Role,
+		ClassIDs:    doc.ClassIDs,
+	}, nil
 }
 
 func (db *Database) UserClassIDs(ctx context.Context, userID string) ([]string, error) {
-	rows, err := db.SQL.QueryContext(ctx, `SELECT class_id FROM user_classes WHERE user_id = ? ORDER BY class_id`, userID)
+	var doc userDoc
+	err := db.Collection("users").FindOne(ctx, bson.M{"_id": userID}).Decode(&doc)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	classes := make([]string, 0)
-	for rows.Next() {
-		var classID string
-		if err := rows.Scan(&classID); err != nil {
-			return nil, err
-		}
-		classes = append(classes, classID)
-	}
-	return classes, rows.Err()
+	return doc.ClassIDs, nil
 }
 
 func (db *Database) CountUsersByRole(ctx context.Context, role string) (int, error) {
-	var count int
-	err := db.SQL.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE role = ? AND active = 1`, role).Scan(&count)
-	return count, err
+	count, err := db.Collection("users").CountDocuments(ctx, bson.M{
+		"role":   role,
+		"active": true,
+	})
+	return int(count), err
 }
 
 func newID() (string, error) {

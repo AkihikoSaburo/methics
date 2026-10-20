@@ -16,7 +16,7 @@ type Web struct {
 }
 
 func NewWeb(viewDir string) (*Web, error) {
-	pages := []string{"dashboard", "mahasiswa", "kelas", "laporan", "akses"}
+	pages := []string{"dashboard", "mahasiswa", "kelas", "laporan", "logs", "akses"}
 	views := make(map[string]*template.Template, len(pages))
 	layoutPath := filepath.Join(viewDir, "layouts", "base.html")
 	sidebarPath := filepath.Join(viewDir, "partials", "sidebar.html")
@@ -57,6 +57,10 @@ func (web *Web) Classes(w http.ResponseWriter, r *http.Request) {
 
 func (web *Web) Reports(w http.ResponseWriter, r *http.Request) {
 	web.render(w, r, "laporan")
+}
+
+func (web *Web) Logs(w http.ResponseWriter, r *http.Request) {
+	web.render(w, r, "logs")
 }
 
 func (web *Web) Access(w http.ResponseWriter, r *http.Request) {

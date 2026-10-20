@@ -6,11 +6,15 @@ mulai dari **[HANDOFF.md](../HANDOFF.md)**, lalu kembali ke sini untuk detail.
 | Dokumen | Isi | Untuk siapa |
 | --- | --- | --- |
 | [HANDOFF.md](../HANDOFF.md) | Titik masuk: status, keputusan, risiko, langkah lanjutan | Engineer/AI yang melanjutkan pekerjaan |
-| [README.md](../README.md) | Cara menjalankan, konfigurasi, kredensial lokal | Siapa pun yang mau menjalankan proyek |
-| [API.md](../API.md) | Kontrak API: payload JSON, skema HMAC perangkat | Integrator (perangkat ESP32, klien lain) |
-| [architecture.md](architecture.md) | Arsitektur: komponen, batas kepercayaan, ADR, invarian | Perancang/peninjau teknis |
-| [code-guide.md](code-guide.md) | Penjelasan kode per lapisan + resep tugas umum | Developer yang mengubah kode |
-| [SRS.md](SRS.md) | Kerangka SRS (kebutuhan fungsional & non-fungsional) | Penyusun SRS / kebutuhan formal |
+| [README.md](../README.md) | Cara menjalankan, konfigurasi, hardening, checklist production | Siapa pun yang mau menjalankan proyek |
+| [API.md](../API.md) | Kontrak API JSON, fragment `/partials/*`, format error, HMAC perangkat | Integrator (perangkat, klien lain) |
+| [architecture.md](architecture.md) | Komponen, alur data, batas kepercayaan, ADR, invarian | Perancang/peninjau teknis |
+| [code-guide.md](code-guide.md) | Penjelasan kode per lapisan + resep tugas umum + jebakan | Developer yang mengubah kode |
+| [database.md](database.md) | Koleksi MongoDB, index, seed, aturan waktu, operasi `mongosh`, backup | Developer & operator |
+| [devices.md](devices.md) | Firmware ESP8266, protokol ping & scan, klien uji, troubleshooting | Pengembang perangkat |
+| [face-service.md](face-service.md) | Kontrak & kerangka face service Python (belum ada di repo) | Pengembang ML/Python |
+| [SRS.md](SRS.md) | Kebutuhan fungsional & non-fungsional dengan status implementasi | Penyusun SRS / kebutuhan formal |
+| [diagram.excalidraw](diagram.excalidraw) | Diagram arsitektur (buka di excalidraw.com) | Semua |
 
 ## Peta cepat
 
@@ -20,18 +24,35 @@ internal/api/server.go      endpoint JSON + query ber-scope role + domain method
 internal/controller/        web.go (halaman), partials.go (fragment htmx), auth.go (login)
 internal/model/page.go      view model halaman
 internal/security/          session, principal, CSRF, rate limit, CSP, panic recovery
-internal/store/             database.go (schema+seed), users.go (akun staf)
-services/face/main.py       FastAPI: /health, /enroll, /verify
+internal/store/             database.go (koneksi MongoDB, index, seed), users.go (akun staf)
 views/                      layouts/, pages/, partials/, fragments/, login.html
 static/css|js               aset; htmx + Lucide di-vendor lokal
+devices/esp8266/            firmware heartbeat ESP8266 (Arduino)
+services/face/              tempat face service Python — BELUM diimplementasi
 docs/                       dokumentasi (Anda di sini)
+.env.example                templat konfigurasi lokal
 ```
+
+## Pertanyaan umum → dokumen
+
+| Saya ingin… | Baca |
+| --- | --- |
+| menjalankan proyek pertama kali | [README.md](../README.md) §Mulai cepat |
+| menambah halaman atau endpoint | [code-guide.md](code-guide.md) §7 |
+| mengubah/menambah field data | [database.md](database.md) §8 |
+| menugaskan kelas ke dosen | [database.md](database.md) §6 |
+| membuat firmware kamera | [devices.md](devices.md) §4 |
+| menguji scan tanpa perangkat keras | [devices.md](devices.md) §4 (klien uji Python) |
+| membangun face service | [face-service.md](face-service.md) |
+| tahu apa yang belum dikerjakan | [HANDOFF.md](../HANDOFF.md) §Langkah Lanjutan, [SRS.md](SRS.md) §7 |
 
 ## Konvensi penulisan dokumen
 
 - Bahasa: Indonesia, istilah teknis dipertahankan apa adanya.
-- Semua klaim tentang kode dapat dilacak ke berkas/tabel; sebutkan nama berkas
-  saat merujuk perilaku.
+- Semua klaim tentang kode dapat dilacak ke berkas/fungsi; sebutkan nama
+  berkas saat merujuk perilaku.
 - Bedakan jelas antara **yang sudah ada di kode** dan **usulan/belum ada**.
   Dokumen di folder ini menandai status dengan `[TERSEDIA]`, `[SEBAGIAN]`,
   `[BELUM]`.
+- Bila kode berubah, perbarui dokumen terkait pada perubahan yang sama dan
+  catat tanggalnya di bagian status `HANDOFF.md`.

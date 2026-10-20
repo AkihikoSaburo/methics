@@ -1,54 +1,133 @@
-# Kontrak Integrasi Algorithmics Face Recognation
+# Kontrak API Algorithmics Face Recognation
 
-Halaman server-rendered Go pada `/`, `/mahasiswa`, `/kelas`, `/laporan`, dan `/akses` **tidak** membaca `/api/v1`. Halaman dirender Go dari query ber-scope role, lalu diperbarui lewat htmx yang menukar fragment HTML dari prefix `/partials/*`. Prefix `/api/v1` adalah API JSON publik/integrasi yang dipakai perangkat ESP32 dan klien lain; keduanya memakai query dan aturan validasi yang sama di `internal/api/server.go`, jadi bentuk data tetap konsisten. Backend Go dan service Python ada di workspace ini. Go menjadi satu-satunya API yang diakses browser dan ESP32. Layanan Python untuk verifikasi wajah tetap internal di belakang Go. View memakai `html/template` di `views/`, CSS di `static/css/`, dan JavaScript di `static/js/`.
+Acuan: `cmd/server/main.go` (routing), `internal/api/server.go` (handler JSON),
+`internal/controller/partials.go` (fragment htmx). Bila dokumen ini berbeda
+dengan kode, **kode yang berlaku** — lalu perbarui dokumen ini.
 
-## Dashboard
+Go adalah satu-satunya pintu masuk untuk browser dan perangkat. Face service
+Python bersifat internal di belakang Go (kontraknya di
+[docs/face-service.md](docs/face-service.md)).
 
-`GET /api/v1/dashboard`
+## 1. Peta endpoint
 
-Administrator menerima ringkasan semua kelas dan dosen hanya kelas yang ditugaskan. Mahasiswa adalah record roster tanpa akun dan tidak dapat mengakses dashboard/API staf; absensi mereka dicatat melalui perangkat ESP32. Halaman dan API staf memakai session cookie HttpOnly/SameSite yang diterbitkan setelah login. Semua POST di jalur browser/staf dilindungi CSRF (`csrf_token` form atau header `X-CSRF-Token`). Query role dan header role tidak digunakan untuk autentikasi.
+| Kelompok | Method & path | Auth | Respons |
+| --- | --- | --- | --- |
+| Halaman | `GET /`, `/mahasiswa`, `/kelas`, `/laporan`, `/logs` | session staf | HTML |
+| Halaman | `GET /akses` | session administrator (dosen dialihkan ke `/`) | HTML |
+| Auth | `GET /login`, `POST /login`, `POST /logout` | — / CSRF | HTML / redirect |
+| Fragment | `GET/POST /partials/*` (§5) | session staf (+ CSRF untuk POST) | HTML |
+| API staf | `GET /api/v1/dashboard`, `/classes`, `/reports` | session staf | JSON |
+| API staf | `POST /api/v1/students`, `/students/{nim}/face-template` | session administrator + CSRF | JSON |
+| Perangkat | `POST /api/v1/scans` | bearer `DEVICE_TOKEN` + HMAC + timestamp | JSON |
+| Perangkat | `GET\|POST /api/v1/devices/ping` | bearer `DEVICE_TOKEN` (hanya production) | JSON |
+| Publik | `GET /api/v1/health` | — | JSON |
+| Aset | `GET /static/*` | — | file |
 
-Contoh respons:
+Halaman server-rendered **tidak** membaca `/api/v1`; halaman memuat datanya
+dari `/partials/*`. Endpoint `/api/v1` adalah API JSON untuk integrasi,
+pengujian, dan perangkat. Keduanya memakai query & validasi yang sama di
+`internal/api/server.go`, jadi datanya konsisten.
+
+## 2. Autentikasi
+
+### Staf (browser)
+
+- Login `POST /login` (form `username`, `password`, `next`, `csrf_token`).
+  Berhasil → session token diperbarui, redirect `303` ke `next` (hanya path
+  lokal; selain itu ke `/`). Gagal → halaman login dengan pesan.
+- Rate limit login: **10 percobaan per IP per 5 menit**; lebih dari itu
+  `429` + header `Retry-After: 300`.
+- Session cookie `itbjh_session`: HttpOnly, SameSite=Lax, umur 8 jam, idle
+  30 menit, `Secure` bila `APP_ENV=production`. Disimpan **in-memory**.
+- CSRF (gorilla/csrf, cookie `itbjh_csrf`) berlaku untuk semua method tidak
+  aman di jalur staf, termasuk `POST /api/v1/*` staf. Kirim lewat field form
+  `csrf_token` atau header `X-CSRF-Token`. Token tersedia di
+  `<meta name="csrf-token">` pada halaman. Token salah → `403` (teks biasa).
+- Role dan kelas dosen dibaca ulang dari MongoDB di setiap request
+  (`users.role`, `users.class_ids`). Role dari query/header klien tidak
+  pernah dipakai.
+
+### Perangkat
+
+Lihat §4 dan [docs/devices.md](docs/devices.md). Endpoint perangkat
+dipasang di luar session/CSRF.
+
+## 3. Format error JSON
+
+Semua error dari `/api/v1/*` berbentuk:
+
+```json
+{ "error": { "code": "invalid_signature", "message": "Signature scan tidak valid atau timestamp kedaluwarsa." } }
+```
+
+| HTTP | `code` | Sumber |
+| --- | --- | --- |
+| 401 | `unauthorized` | session tidak ada/kedaluwarsa (API staf & `/partials/*`) |
+| 403 | `forbidden` | role tidak diizinkan (mis. dosen memanggil `POST /api/v1/students`) |
+| 400 | `invalid_json` | body JSON rusak / > 1 MiB |
+| 400 | `missing_fields` | field wajib kosong |
+| 400 | `invalid_class`, `unknown_class` | kelas tidak ada |
+| 409 | `student_exists` | NIM sudah terdaftar |
+| 404 | `student_not_found` | NIM tidak ditemukan saat enrollment |
+| 400 | `invalid_image` | bukan multipart, field `image` hilang, kosong, atau > 8 MiB |
+| 401 | `invalid_device` | bearer token perangkat salah (scan) |
+| 401 | `invalid_token` | bearer token perangkat salah (ping, production) |
+| 401 | `invalid_signature` | HMAC salah atau `X-Device-Timestamp` > ±2 menit |
+| 400 | `stale_capture` | `captured_at` bukan RFC3339 atau > ±5 menit |
+| 400 | `invalid_liveness` | `liveness_passed` bukan `true`/`false` |
+| 403 | `unknown_device` | `device_id` tidak ada di koleksi `devices` |
+| 502 | `face_service_error` | face service gagal/timeout (8 detik) |
+| 500 | `database_error`, `enroll_error` | kegagalan internal |
+
+## 4. API JSON
+
+### `GET /api/v1/health` — publik
+
+```json
+{ "status": "ok", "faceVerification": { "online": false, "provider": "Python service" } }
+```
+
+`faceVerification.online` = face service menjawab `GET /health` dengan
+`200` dan `modelReady: true`. `provider` bernilai `Python face_recognition`
+bila service menjawab `200` dengan JSON valid, dan `Python service` bila
+tidak terjangkau. Opsional `?device_id=<id>` memperbarui `devices.last_seen`
+(upsert, **tanpa token** — lihat catatan keamanan di `docs/devices.md` §5).
+
+### `GET /api/v1/dashboard` — staf
+
+Administrator menerima semua kelas; dosen hanya `users.class_ids`. Data
+"hari ini" mengikuti zona waktu server.
 
 ```json
 {
-  "summary": {
-    "students": 5,
-    "classes": 3,
-    "verifiedScans": 3,
-    "scansToReview": 0,
-    "faceTemplates": 2
-  },
+  "summary": { "students": 5, "classes": 3, "verifiedScans": 3, "scansToReview": 0, "faceTemplates": 2 },
   "classes": [
-    { "id": "IK24-A", "name": "Ilmu Komputer A", "present": 2, "studentCount": 2 },
-    { "id": "IK24-B", "name": "Ilmu Komputer B", "present": 1, "studentCount": 2 },
-    { "id": "IK24-C", "name": "Ilmu Komputer C", "present": 0, "studentCount": 1 }
+    { "id": "IK24-A", "name": "Ilmu Komputer A", "present": 2, "studentCount": 2 }
   ],
   "integrations": {
     "esp32": { "online": true, "lastSeen": "08:11" },
-    "faceVerification": { "online": true, "provider": "Python service" }
+    "faceVerification": { "online": true, "provider": "Python face_recognition" }
   },
   "attendance": [
     {
-      "student": { "name": "Alya Putri", "nim": "IK24001" },
+      "student": { "id": "student-ik24001", "nim": "IK24001", "name": "Alya Putri" },
       "class": { "id": "IK24-A", "name": "Ilmu Komputer A" },
-      "scannedAt": "2026-10-16T08:02:00+07:00",
+      "scannedAt": "2026-10-21T00:02:00Z",
       "faceVerified": true,
       "faceEnrolled": true,
-      "status": "Hadir",
-      "deviceId": "ESP32-GED-A1"
+      "deviceId": "ESP32-GED-A1",
+      "status": "Hadir"
     }
   ]
 }
 ```
 
-Endpoint mengembalikan `application/json`. **Halaman staf tidak memanggil endpoint ini** — halaman memuat fragment dari `/partials/*` (dashboard/kelas/laporan menyegarkan diri setiap 15 detik lewat atribut htmx). Endpoint `/api/v1` ditujukan untuk integrasi dan pengujian; ia menyertakan session cookie dan menolak akses tanpa session staf. GET health bersifat publik; scan ESP32 tidak menggunakan session.
+- `attendance` = seluruh roster dalam cakupan + scan **terakhir hari ini**
+  per mahasiswa. Belum ada scan → `scannedAt: null`, `status: "Belum hadir"`.
+- `scannedAt` berupa RFC3339 UTC; `esp32.lastSeen` berupa jam lokal `HH:MM`
+  (kosong bila belum pernah terlihat). `esp32.online` = `last_seen` < 2 menit.
 
-## Kelas dan laporan
-
-`GET /api/v1/classes`
-
-Session staf wajib. Mengembalikan ringkasan dan daftar kelas dalam cakupan role; dosen hanya menerima kelas yang ditugaskan, administrator menerima semua kelas.
+### `GET /api/v1/classes` — staf
 
 ```json
 {
@@ -59,9 +138,10 @@ Session staf wajib. Mengembalikan ringkasan dan daftar kelas dalam cakupan role;
 }
 ```
 
-`GET /api/v1/reports`
+`present` = jumlah mahasiswa unik berstatus `Hadir` hari ini;
+`attendanceRate` = `present * 100 / studentCount` (dibulatkan ke bawah).
 
-Session staf wajib dan dibatasi role. Mengembalikan rekap status scan hari ini, komposisi status, kehadiran per kelas, dan 50 event scan terbaru.
+### `GET /api/v1/reports` — staf
 
 ```json
 {
@@ -72,7 +152,7 @@ Session staf wajib dan dibatasi role. Mengembalikan rekap status scan hari ini, 
     {
       "student": { "nim": "IK24001", "name": "Alya Putri" },
       "class": { "id": "IK24-A", "name": "Ilmu Komputer A" },
-      "scannedAt": "2026-10-16T08:02:00+07:00",
+      "scannedAt": "2026-10-21T00:02:00Z",
       "status": "Hadir",
       "confidence": 0.91,
       "reviewReason": "",
@@ -82,55 +162,153 @@ Session staf wajib dan dibatasi role. Mengembalikan rekap status scan hari ini, 
 }
 ```
 
-## Scan ESP32
+`summary` dan `statusBreakdown` dihitung untuk **hari ini**; `events` adalah
+**50 event terbaru tanpa batas tanggal**. `statusBreakdown` hanya memuat
+status yang jumlahnya > 0.
 
-`POST /api/v1/scans`
+### `POST /api/v1/students` — administrator + CSRF
 
-ESP32 mengirim multipart fields `device_id`, `class_id`, `captured_at` (RFC3339), `liveness_passed`, dan file `image` ke Go melalui TLS. Gunakan `Authorization: Bearer <device token>` dan HMAC-SHA256 request signature. String yang ditandatangani adalah enam baris berikut:
+Request `application/json` (maks 1 MiB):
+
+```json
+{ "name": "Fajar Nugroho", "nim": "IK24006", "classId": "IK24-A" }
+```
+
+`nim` dan `classId` di-uppercase. Respons `201`:
+
+```json
+{ "id": "student-ik24006", "nim": "IK24006", "name": "Fajar Nugroho", "classId": "IK24-A", "faceEnrolled": false }
+```
+
+Error: `400 invalid_json | missing_fields | invalid_class`, `409 student_exists`.
+
+### `POST /api/v1/students/{nim}/face-template` — administrator + CSRF
+
+`multipart/form-data` dengan file `image` (≤ 8 MiB). Go meneruskan ke
+face service `POST /enroll` dengan `student_id` = `_id` mahasiswa. Respons
+`201`:
+
+```json
+{ "nim": "IK24001", "faceEnrolled": true, "result": { "…": "body dari face service" } }
+```
+
+Error: `400 invalid_image`, `404 student_not_found`, `502 face_service_error`.
+
+### `POST /api/v1/scans` — perangkat
+
+`multipart/form-data`: `device_id`, `class_id`, `captured_at` (RFC3339),
+`liveness_passed` (`true`/`false`), file `image` (≤ 8 MiB). Header:
+`Authorization: Bearer <DEVICE_TOKEN>`, `X-Device-Timestamp` (RFC3339),
+`X-Device-Signature` (hex HMAC-SHA256).
+
+Pesan HMAC = enam baris digabung `\n`, kunci = `DEVICE_TOKEN`:
 
 ```text
 <X-Device-Timestamp RFC3339>
 <device_id>
-<class_id>
+<class_id huruf besar>
 <captured_at persis seperti field>
 <liveness_passed lowercase true/false>
 <hex SHA-256 dari byte image>
 ```
 
-Kirim digest sebagai `X-Device-Signature` hex dan timestamp sebagai `X-Device-Timestamp`. Kunci HMAC adalah device token. Timestamp request diterima maksimal dua menit dari jam server; capture maksimal lima menit. Go memvalidasi perangkat dan kelas, lalu meneruskan gambar sementara ke service Python internal. Python mencocokkan template dan mengembalikan identitas kandidat serta skor jarak. Go mencatat scan hadir hanya bila wajah cocok, kandidat anggota kelas, dan flag liveness benar; selain itu hasil ditandai untuk ditinjau atau ditolak.
+Urutan validasi: token → gambar → field wajib → `captured_at` (±5 menit) →
+`liveness_passed` → HMAC & `X-Device-Timestamp` (±2 menit) → perangkat
+terdaftar → kelas ada → face service `/verify`.
 
-Penting: flag liveness saat ini adalah klaim perangkat yang ditandatangani, bukan deteksi biologis oleh backend. HMAC tidak membuktikan bahwa orang di gambar hidup. Perangkat perlu mekanisme anti-spoof tervalidasi sebelum hasil dipakai sebagai bukti kehadiran.
+Penentuan status:
 
-Hindari menyimpan gambar mentah bila embedding/template sudah mencukupi. Lindungi template biometrik dengan enkripsi, kontrol akses ketat, retensi terbatas, serta prosedur persetujuan dan penghapusan. Jangan mengirim gambar atau template wajah ke browser.
-
-## Fragment htmx (antarmuka UI)
-
-Halaman staf memuat dan menyegarkan datanya dari endpoint fragment berikut. Semuanya **wajib session staf**; respons berupa HTML (bukan JSON), dan bila sesi tidak valid mengembalikan `401` (htmx mengalihkan ke `/login`). Semua POST butuh CSRF (`X-CSRF-Token` header untuk htmx, atau field `csrf_token`).
-
-| Endpoint | Guna | Akses |
+| Kondisi | `status` | `reviewReason` |
 | --- | --- | --- |
-| `GET /partials/dashboard` | metrik ringkasan, kehadiran per kelas, status perangkat/layanan, riwayat scan | staf |
-| `GET /partials/kelas` | ringkasan + tabel kelas | staf (ter-scope role) |
-| `GET /partials/laporan` | rekap status, komposisi, kehadiran per kelas, riwayat scan | staf (ter-scope role) |
-| `GET /partials/mahasiswa` | tabel roster; menerima query `q` dan `class` | staf (ter-scope role) |
-| `GET /partials/mahasiswa/form` | form dialog pendaftaran mahasiswa | administrator |
-| `POST /partials/mahasiswa/students` | tambah mahasiswa (form-urlencoded) | administrator |
-| `POST /partials/mahasiswa/{nim}/face-template` | enrollment wajah (multipart `image`) | administrator |
+| tidak cocok / tidak ada kandidat | `Ditolak` | `reason` dari face service |
+| cocok, bukan anggota `class_id` | `Perlu ditinjau` | Mahasiswa terverifikasi tetapi bukan anggota kelas pada perangkat. |
+| cocok, anggota kelas, `liveness_passed=false` | `Perlu ditinjau` | Cocok wajah; bukti liveness belum tersedia atau tidak lolos. |
+| cocok, anggota kelas, `liveness_passed=true` | `Hadir` | — |
 
-Konvensi respons:
+Event disimpan ke `scan_events` dan `devices.last_seen` diperbarui. Respons
+`202`:
 
-- **Sukses POST** membalas HTML dan header `HX-Trigger` berisi event (`toast`, `student-dialog-close`, `roster-changed`).
-- **Gagal validasi** membalas **HTTP 200** dengan pesan inline di form/region, bukan JSON error.
-- Ringkasan roster pada `/partials/mahasiswa` dikirim lewat out-of-band swap (`hx-swap-oob`).
+```json
+{
+  "status": "Hadir",
+  "student": { "id": "student-ik24001", "nim": "IK24001", "name": "Alya Putri" },
+  "faceVerified": true,
+  "confidence": 0.91,
+  "reviewReason": ""
+}
+```
 
-## Role dan enrollment
+`student` bernilai `null` bila wajah tidak cocok. Bila face service gagal,
+respons `502` dan **tidak ada** event yang dicatat.
 
-- `administrator`: kelola roster, enrollment wajah, dan konfigurasi yang tersedia.
-- `dosen`: lihat absensi dan laporan kelas yang ditugaskan.
-- Mahasiswa adalah subjek absensi, bukan role login; tidak ada `STUDENT_TOKEN` atau endpoint akses mahasiswa.
-- `POST /api/v1/students`: administrator mendaftarkan identitas mahasiswa dan kelas.
-- Enrollment template wajah dilakukan lewat alur terautentikasi yang menghubungkan mahasiswa ke perangkat enrollment; jangan menerima template biometrik dari form publik.
+Penting: `liveness_passed` adalah klaim perangkat yang ditandatangani, bukan
+deteksi biologis. HMAC melindungi integritas pesan, bukan membuktikan bahwa
+wajah di gambar adalah orang hidup. Belum ada nonce anti-replay.
 
-Go menyediakan `GET /api/v1/health` dan `POST /api/v1/students/{nim}/face-template`; enrollment memakai multipart field `image`, session admin, dan CSRF. Service Python internal menyediakan `/health`, `/enroll`, dan `/verify`; jangan ekspos port Python ke jaringan publik. Service menyimpan embedding 128 dimensi, tidak menyimpan gambar mentah, dan saat ini tidak mengimplementasikan liveness detection. Endpoint Python mewajibkan bearer `FACE_SERVICE_TOKEN` bila secret dikonfigurasi. Login staf ada di `GET/POST /login`, logout di `POST /logout`; password di-hash bcrypt dan session diregenerasi setelah login.
+Contoh klien uji: [docs/devices.md](docs/devices.md) §4.
 
-Login tersedia pada `GET/POST /login`; `POST /logout` mengakhiri session dan wajib menyertakan CSRF token. Password staf di-hash menggunakan bcrypt. Middleware memuat user aktif dari session, mengambil daftar kelas dosen dari database, dan memasang principal pada request context. Pendaftaran dan enrollment hanya administrator. Request scan ESP32 (`POST /api/v1/scans`) sengaja tidak melewati session/CSRF browser: ia memakai bearer device token, HMAC-SHA256, dan timestamp. Server menolak start bila `CSRF_SECRET` atau `DEVICE_TOKEN` kosong atau kurang dari 32 karakter — di **semua mode**, bukan hanya production. Mode `APP_ENV=production` menambah kewajiban `FACE_SERVICE_TOKEN` (≥ 32 karakter) dan mengaktifkan cookie session `Secure`. Jangan meneruskan role dari query/header sebagai identitas.
+### `GET|POST /api/v1/devices/ping` — perangkat
+
+Heartbeat untuk status "Terhubung". ID dibaca dari form `device_id`, query
+`device_id`, atau header `X-Device-Id` (default `ESP32-GED-A1`). Token
+bearer hanya diperiksa saat `APP_ENV=production`. Upsert `devices`.
+
+```json
+{ "status": "ok", "device_id": "ESP32-GED-A1", "last_seen": "2026-10-21T00:15:00Z", "message": "Perangkat berhasil terhubung dan status aktif." }
+```
+
+## 5. Fragment htmx (`/partials/*`)
+
+Semua wajib session staf, membalas HTML, dan memakai query ber-scope role.
+Sesi tidak valid → `401` JSON (`app.js` lalu mengalihkan ke `/login`).
+POST wajib CSRF (`app.js` menambah header `X-CSRF-Token` otomatis).
+
+| Endpoint | Guna | Akses | Penyegaran |
+| --- | --- | --- | --- |
+| `GET /partials/dashboard` | metrik, kehadiran per kelas, status perangkat/face service, 8 baris pertama roster hari ini (beserta scan terakhirnya) | staf | `load, every 15s` |
+| `GET /partials/kelas` | ringkasan + tabel kelas | staf | `load, every 15s` |
+| `GET /partials/laporan` | rekap hari ini, komposisi status, kehadiran per kelas, 50 scan terbaru | staf | `load, every 15s` |
+| `GET /partials/mahasiswa?q=&class=` | tabel roster (+ ringkasan via `hx-swap-oob`) | staf | `load, every 15s`, ketik, ganti filter, event `roster-changed` |
+| `GET /partials/mahasiswa/form` | form dialog pendaftaran | administrator | sekali saat halaman dimuat |
+| `POST /partials/mahasiswa/students` | tambah mahasiswa (form-urlencoded `name`, `nim`, `classId`) | administrator | — |
+| `POST /partials/mahasiswa/{nim}/face-template` | enrollment wajah (multipart `image`, dikirim otomatis saat file dipilih; `q`/`class` ikut lewat `hx-include` agar filter tetap) | administrator | — |
+| `GET /partials/logs?q=&status=&class=` | log pemindaian seluruh waktu, maks 200 baris (+ ringkasan via `hx-swap-oob`) | staf | `load, every 15s`, ketik, ganti filter |
+
+Konvensi:
+
+- **Sukses POST** → HTML (form bersih) + header `HX-Trigger` JSON, mis.
+  `{"toast":{"message":"Mahasiswa X berhasil ditambahkan."},"student-dialog-close":true,"roster-changed":true}`.
+- **Gagal validasi** → **HTTP 200** dengan pesan inline di form/region, bukan
+  status 4xx. Non-administrator → `403` teks biasa.
+- ⚠️ **Bug yang diketahui:** pada `/partials/logs`, parameter `class` menimpa
+  pembatasan kelas dosen di `AllScanEvents` (`filter["class_id"]` ditulis
+  ulang), sehingga dosen dapat melihat log kelas lain lewat
+  `?class=<kelas lain>`. Perbaikan: abaikan/ tolak `class` yang tidak ada di
+  `users.class_ids` untuk role dosen.
+- Ringkasan `/partials/logs` (total, terverifikasi, ditinjau, ditolak)
+  dihitung untuk **seluruh waktu** dalam cakupan role dan **tidak** ikut
+  filter; tabelnya mengikuti filter. Pencarian `q` mencocokkan nama atau NIM
+  (regex case-insensitive, input di-escape).
+
+## 6. Role
+
+| Kemampuan | administrator | dosen | mahasiswa |
+| --- | --- | --- | --- |
+| Ringkasan, kelas, laporan, log, roster | semua kelas | kelas di `users.class_ids` | tidak ada akses |
+| Daftarkan mahasiswa | ya | tidak | — |
+| Enrollment wajah | ya | tidak | — |
+| Halaman `/akses` | ya | dialihkan ke `/` | — |
+| Absensi | — | — | lewat scan perangkat |
+
+Mahasiswa adalah record roster/subjek absensi tanpa akun aplikasi. Tidak ada
+`STUDENT_TOKEN` atau endpoint akses mahasiswa. Dosen tanpa kelas yang
+ditugaskan melihat data kosong.
+
+## 7. Privasi biometrik
+
+- Jangan kirim gambar atau template wajah ke browser; halaman hanya menerima
+  label status.
+- Gambar enrollment/scan hanya diteruskan sementara ke face service; yang
+  disimpan adalah embedding di `face_templates`.
+- Lindungi template dengan kontrol akses ketat, enkripsi backup, retensi
+  terbatas, serta prosedur persetujuan dan penghapusan.

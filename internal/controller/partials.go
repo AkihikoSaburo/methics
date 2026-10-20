@@ -52,6 +52,7 @@ func (p *Partials) Handler() http.Handler {
 	mux.HandleFunc("GET /partials/mahasiswa/form", p.mahasiswaForm)
 	mux.HandleFunc("POST /partials/mahasiswa/students", p.createStudent)
 	mux.HandleFunc("POST /partials/mahasiswa/{nim}/face-template", p.enrollFace)
+	mux.HandleFunc("GET /partials/logs", p.logs)
 	return mux
 }
 
@@ -525,4 +526,62 @@ func formatConfidence(value float64) string {
 		return "-"
 	}
 	return fmt.Sprintf("%.3f", value)
+}
+
+type logsFragmentData struct {
+	Summary struct {
+		Total    int
+		Verified int
+		Review   int
+		Rejected int
+	}
+	Events     []api.ScanEvent
+	EventCount int
+	Filtered   bool
+	EmptyText  string
+}
+
+func (p *Partials) logs(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalOrError(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	statusFilter := strings.TrimSpace(r.URL.Query().Get("status"))
+	classFilter := strings.TrimSpace(r.URL.Query().Get("class"))
+	search := strings.TrimSpace(r.URL.Query().Get("q"))
+
+	statuses, err := p.server.AllScanStatusCounts(ctx, principal.Role, principal.ClassIDs)
+	if err != nil {
+		http.Error(w, "Gagal menghitung status scan.", http.StatusInternalServerError)
+		return
+	}
+
+	events, err := p.server.AllScanEvents(ctx, principal.Role, principal.ClassIDs, statusFilter, classFilter, search)
+	if err != nil {
+		http.Error(w, "Gagal memuat log pemindaian.", http.StatusInternalServerError)
+		return
+	}
+
+	filtered := (statusFilter != "" && statusFilter != "all") || (classFilter != "" && classFilter != "all") || search != ""
+
+	data := logsFragmentData{
+		Events:     events,
+		EventCount: len(events),
+		Filtered:   filtered,
+	}
+	data.Summary.Total = statuses["Hadir"] + statuses["Perlu ditinjau"] + statuses["Ditolak"]
+	data.Summary.Verified = statuses["Hadir"]
+	data.Summary.Review = statuses["Perlu ditinjau"]
+	data.Summary.Rejected = statuses["Ditolak"]
+
+	if len(events) == 0 {
+		if filtered {
+			data.EmptyText = "Tidak ada log pemindaian yang cocok dengan filter."
+		} else {
+			data.EmptyText = "Belum ada log pemindaian."
+		}
+	}
+
+	p.render(w, "logs_fragment", data)
 }

@@ -24,6 +24,7 @@ func NewPage(page, role string, userName, roleClasses, csrfToken string) Page {
 		"mahasiswa": "Mahasiswa",
 		"kelas":     "Kelas",
 		"laporan":   "Laporan absensi",
+		"logs":      "Log pemindaian",
 		"akses":     "Akses & pengguna",
 	}
 	roleNames := map[string]string{

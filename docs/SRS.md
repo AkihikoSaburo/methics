@@ -24,6 +24,7 @@ Riwayat revisi:
 | Versi | Tanggal | Perubahan | Oleh |
 | --- | --- | --- | --- |
 | 0.1 | ISI: | Kerangka awal dari kode yang ada | ISI: |
+| 0.2 | 2026-10-21 | Selaras dengan MongoDB; tambah log pemindaian (FR-LOG), heartbeat perangkat (FR-DEV-16); status biometrik diturunkan ke `[SEBAGIAN]` karena face service belum ada di repo; matriks dihitung ulang | ISI: |
 
 ## 1. Pendahuluan
 
@@ -70,6 +71,9 @@ Di luar cakupan:
 - `docs/architecture.md` — arsitektur & keputusan.
 - `docs/code-guide.md` — penjelasan kode.
 - `HANDOFF.md` — status & risiko.
+- `docs/database.md` — skema MongoDB.
+- `docs/devices.md` — firmware & protokol perangkat.
+- `docs/face-service.md` — kontrak layanan wajah.
 - `ISI:` standar/regulasi yang berlaku (mis. UU PDP), kebijakan kampus, dokumen akademik.
 
 ### 1.5 Ikhtisar dokumen
@@ -86,7 +90,8 @@ Sistem baru yang menggantikan pencatatan absensi manual. Terdiri dari:
 
 ```text
 Perangkat ESP32-CAM ──► Backend Go ──► Layanan verifikasi wajah (Python)
-                          └──► Basis data (SQLite)
+Perangkat ESP8266 ───►     │                      │
+(heartbeat)                └──► Basis data (MongoDB) ◄┘
 Staf (browser) ──────► Backend Go (halaman + API)
 ```
 
@@ -108,17 +113,17 @@ diekspos ke jaringan luar.
 | --- | --- | --- |
 | Administrator | Staf pengelola sistem/roster | Semua kelas; kelola mahasiswa; enrollment; halaman akses |
 | Dosen | Pengajar | Hanya kelas yang ditugaskan (baca) |
-| Perangkat (ESP32) | Klien mesin | Hanya endpoint scan/health dengan token perangkat |
+| Perangkat (ESP32/ESP8266) | Klien mesin | Endpoint scan (token + HMAC), heartbeat ping, dan health |
 | Mahasiswa | Subjek absensi | Tidak punya akses aplikasi |
 | `ISI:` Operator/IT | ISI: bila ada | ISI: |
 
 ### 2.4 Lingkungan operasi
 
-- **Server:** `ISI:` OS & spesifikasi (dev saat ini Windows; produksi TBD).
-- **Basis data:** SQLite (implementasi sekarang). `ISI:` apakah produksi tetap SQLite atau Postgres.
-- **Perangkat:** ESP32-CAM dengan modul jaringan. `ISI:` jumlah perangkat & lokasi.
+- **Server:** `ISI:` OS & spesifikasi (dev saat ini Windows; produksi TBD). Zona waktu server menentukan batas "hari ini".
+- **Basis data:** MongoDB (default `mongodb://10.100.1.11:27017`, database `attendance`). `ISI:` versi & topologi produksi (single node / replica set).
+- **Perangkat:** ESP32-CAM untuk scan (firmware belum ada) dan ESP8266 untuk heartbeat (firmware ada). `ISI:` jumlah perangkat & lokasi.
 - **Jaringan:** `ISI:` LAN kampus / VPN / TLS reverse proxy.
-- **Layanan wajah:** Python 3.10–3.12 + `face-recognition`/dlib.
+- **Layanan wajah:** Python 3.10–3.12 + `face-recognition`/dlib — **belum ada di repo** (kontrak di `docs/face-service.md`).
 
 ### 2.5 Batasan desain
 
@@ -136,7 +141,7 @@ diekspos ke jaringan luar.
 | ID | Asumsi/Ketergantungan |
 | --- | --- |
 | AS-01 | Jam perangkat ESP32 tersinkron dengan server (toleransi ±2 menit untuk request, ±5 menit untuk capture). |
-| AS-02 | Layanan wajah berjalan dan dapat dijangkau backend. |
+| AS-02 | Layanan wajah berjalan dan dapat dijangkau backend (saat ini belum diimplementasi). |
 | AS-03 | `ISI:` ketersediaan jaringan di lokasi perangkat. |
 | AS-04 | `ISI:` data mahasiswa (NIM, nama, kelas) berasal dari sumber tepercaya. |
 
@@ -202,7 +207,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | FR-STU-04 | Administrator dapat menambah mahasiswa (nama, NIM, kelas) | W | `[TERSEDIA]` |
 | FR-STU-05 | Kesalahan validasi ditampilkan pada form (inline), bukan halaman error | W | `[TERSEDIA]` |
 | FR-STU-06 | NIM unik; penambahan dengan NIM ganda ditolak dengan pesan jelas | W | `[TERSEDIA]` |
-| FR-STU-07 | Administrator dapat melakukan enrollment wajah mahasiswa | W | `[TERSEDIA]` |
+| FR-STU-07 | Administrator dapat melakukan enrollment wajah mahasiswa | W | `[SEBAGIAN]` (UI & proxy Go ada; face service belum ada) |
 | FR-STU-08 | Enrollment gagal (wajah tidak terdeteksi/service mati) memberi pesan yang dapat ditindaklanjuti | W | `[TERSEDIA]` |
 | FR-STU-09 | Administrator dapat mengubah data mahasiswa | S | `[BELUM]` |
 | FR-STU-10 | Administrator dapat menghapus/menonaktifkan mahasiswa | S | `[BELUM]` |
@@ -229,9 +234,9 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | --- | --- | --- | --- |
 | FR-DEV-01 | Perangkat mengautentikasi dengan token + tanda tangan HMAC + timestamp | W | `[TERSEDIA]` |
 | FR-DEV-02 | Request dengan timestamp kedaluwarsa ditolak | W | `[TERSEDIA]` |
-| FR-DEV-03 | Hanya perangkat terdaftar yang diterima | W | `[TERSEDIA]` |
+| FR-DEV-03 | Hanya perangkat terdaftar yang diterima | W | `[SEBAGIAN]` (scan memeriksa `devices`, tetapi ping/health dapat mendaftarkan ID baru otomatis) |
 | FR-DEV-04 | Kelas pada scan harus valid | W | `[TERSEDIA]` |
-| FR-DEV-05 | Capture diverifikasi ke template wajah melalui layanan wajah | W | `[TERSEDIA]` |
+| FR-DEV-05 | Capture diverifikasi ke template wajah melalui layanan wajah | W | `[SEBAGIAN]` (sisi Go ada; face service belum ada) |
 | FR-DEV-06 | Capture > 8 MB atau bukan gambar ditolak | W | `[TERSEDIA]` |
 | FR-DEV-07 | Baris absensi dicatat dengan status dan alasan peninjauan | W | `[TERSEDIA]` |
 | FR-DEV-08 | Status ditentukan berlapis: cocok + anggota kelas + liveness → Hadir; selain kondisi tertentu → Perlu ditinjau/Ditolak | W | `[TERSEDIA]` |
@@ -242,15 +247,16 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | FR-DEV-13 | Deteksi liveness yang tervalidasi (anti-spoof) | W | `[BELUM]` |
 | FR-DEV-14 | Administrator dapat mengelola daftar perangkat | S | `[BELUM]` |
 | FR-DEV-15 | Perangkat menerima konfigurasi/pembaruan dari server | B | `[BELUM]` |
+| FR-DEV-16 | Perangkat mengirim heartbeat berkala sehingga status "Terhubung" tampil di dashboard | S | `[TERSEDIA]` (`/api/v1/devices/ping` + firmware ESP8266) |
 
 ### 3.8 Pengenalan wajah
 
 | ID | Kebutuhan | Pri | Status |
 | --- | --- | --- | --- |
-| FR-BIO-01 | Enrollment memerlukan tepat satu wajah terdeteksi | W | `[TERSEDIA]` |
-| FR-BIO-02 | Disimpan sebagai embedding (bukan gambar mentah) | W | `[TERSEDIA]` |
-| FR-BIO-03 | Pencocokan 1:N dengan ambang batas jarak | W | `[TERSEDIA]` (default 0.50) |
-| FR-BIO-04 | Hasil cocok menghasilkan identitas kandidat + skor keyakinan | W | `[TERSEDIA]` |
+| FR-BIO-01 | Enrollment memerlukan tepat satu wajah terdeteksi | W | `[SEBAGIAN]` (kontrak; service belum ada) |
+| FR-BIO-02 | Disimpan sebagai embedding (bukan gambar mentah) | W | `[SEBAGIAN]` (Go tidak menyimpan gambar; service belum ada) |
+| FR-BIO-03 | Pencocokan 1:N dengan ambang batas jarak | W | `[SEBAGIAN]` (kontrak, default 0.50; service belum ada) |
+| FR-BIO-04 | Hasil cocok menghasilkan identitas kandidat + skor keyakinan | W | `[SEBAGIAN]` (Go membaca `studentId`/`confidence`; service belum ada) |
 | FR-BIO-05 | Ambang batas dikalibrasi terhadap data nyata (FRR/FAR) | W | `[BELUM]` |
 | FR-BIO-06 | Pencocokan dapat dibatasi ke kandidat kelas terkait | S | `[BELUM]` |
 | FR-BIO-07 | Enrollment tercatat untuk audit (siapa, kapan, hasil) | W | `[BELUM]` |
@@ -268,6 +274,17 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | FR-API-05 | Dokumentasi mesin (OpenAPI/Swagger) | S | `[BELUM]` |
 | FR-API-06 | Format error konsisten (kode + pesan) | W | `[TERSEDIA]` |
 | FR-API-07 | Rate limit terpisah per jenis klien | S | `[SEBAGIAN]` (baru untuk login) |
+
+### 3.10 Log pemindaian
+
+| ID | Kebutuhan | Pri | Status |
+| --- | --- | --- | --- |
+| FR-LOG-01 | Menampilkan riwayat scan seluruh waktu (200 terbaru) dalam cakupan role | S | `[SEBAGIAN]` (filter `class` dapat menembus cakupan dosen — bug) |
+| FR-LOG-02 | Menyaring log berdasarkan status dan kelas | S | `[TERSEDIA]` |
+| FR-LOG-03 | Mencari log berdasarkan nama atau NIM mahasiswa | S | `[TERSEDIA]` |
+| FR-LOG-04 | Ringkasan jumlah total/terverifikasi/ditinjau/ditolak seluruh waktu | S | `[TERSEDIA]` |
+| FR-LOG-05 | Log dapat dicetak | B | `[TERSEDIA]` |
+| FR-LOG-06 | Paginasi untuk melihat lebih dari 200 event | S | `[BELUM]` |
 
 ## 4. Kebutuhan Antarmuka Eksternal
 
@@ -287,8 +304,9 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 
 | ID | Antarmuka | Detail | Status |
 | --- | --- | --- | --- |
-| IF-SW-01 | Backend ↔ Layanan wajah | HTTP internal; `/health`, `/enroll`, `/verify`; bearer `FACE_SERVICE_TOKEN` | `[TERSEDIA]` |
-| IF-SW-02 | Backend ↔ Basis data | SQLite | `[TERSEDIA]` |
+| IF-SW-01 | Backend ↔ Layanan wajah | HTTP internal; `/health`, `/enroll`, `/verify`; bearer `FACE_SERVICE_TOKEN` | `[SEBAGIAN]` (klien Go ada; service belum ada) |
+| IF-SW-02 | Backend ↔ Basis data | MongoDB (driver Go resmi v1.17) | `[TERSEDIA]` |
+| IF-SW-05 | Layanan wajah ↔ Basis data | MongoDB, koleksi `face_templates` | `[BELUM]` |
 | IF-SW-03 | Browser ↔ Backend | HTML/htmx + JSON `/api/v1` | `[TERSEDIA]` |
 | IF-SW-04 | `ISI:` Backend ↔ SIAKAD/SSO kampus | ISI: | TBD |
 
@@ -296,7 +314,8 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 
 | ID | Kebutuhan | Status |
 | --- | --- | --- |
-| IF-HW-01 | Perangkat kamera mengirim gambar via HTTP multipart ke backend | `[TERSEDIA]` |
+| IF-HW-01 | Perangkat kamera mengirim gambar via HTTP multipart ke backend | `[SEBAGIAN]` (endpoint ada; firmware kamera belum ada) |
+| IF-HW-04 | Perangkat mengirim heartbeat HTTP berkala (< 2 menit) | `[TERSEDIA]` (ESP8266) |
 | IF-HW-02 | `ISI:` spesifikasi minimum kamera/resolusi & pencahayaan | TBD |
 | IF-HW-03 | `ISI:` kebutuhan daya & jaringan di lokasi | TBD |
 
@@ -335,6 +354,8 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | NFR-SEC-08 | Jejak audit (login, enrollment, perubahan data) | `[BELUM]` |
 | NFR-SEC-09 | Pemindaian dependensi / pembaruan berkala | `ISI:` |
 | NFR-SEC-10 | Penanganan panic tanpa membocorkan detail internal | `[TERSEDIA]` |
+| NFR-SEC-11 | Kredensial (Wi-Fi, token) tidak tertulis di kode firmware/repo | `[BELUM]` |
+| NFR-SEC-12 | Endpoint perangkat tidak membuat perangkat baru tanpa autentikasi | `[BELUM]` |
 
 ### 5.3 Privasi & kepatuhan
 
@@ -374,7 +395,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | ID | Kebutuhan | Status |
 | --- | --- | --- |
 | NFR-PORT-01 | Dapat berjalan di Windows (dev) dan Linux (produksi) | `[SEBAGIAN]` |
-| NFR-PORT-02 | Dukungan basis data produksi (SQLite/Postgres) | `ISI:` | TBD |
+| NFR-PORT-02 | Basis data produksi MongoDB dengan autentikasi & TLS | `[SEBAGIAN]` (koneksi ada; hardening manual sesuai README) |
 | NFR-PORT-03 | Konfigurasi via environment, tanpa mengubah kode | `[TERSEDIA]` |
 
 ### 5.7 Kegunaan & aksesibilitas
@@ -394,29 +415,31 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | CN-03 | Ambang pencocokan belum dikalibrasi | Risiko false accept/reject |
 | CN-04 | Session & rate limit in-memory | Tidak aman untuk multi-instance |
 | CN-05 | Satu token perangkat global | Bocor satu = bocor semua |
+| CN-07 | Face service belum diimplementasi | Enrollment & scan belum dapat diuji end-to-end |
 | CN-06 | `ISI:` kepatuhan lain (akreditasi, audit internal) | ISI: |
 
 ## 7. Matriks Keterlacakan (ringkas)
 
-| Area | Jumlah FR | `[TERSEDIA]` | `[SEBAGIAN]` | `[BELUM]` |
-| --- | --- | --- | --- | --- |
-| Autentikasi & sesi | 11 | 8 | 0 | 2 (1 TBD) |
-| Otorisasi | 7 | 5 | 0 | 2 |
-| Dashboard | 7 | 6 | 0 | 1 |
-| Kelas | 3 | 2 | 0 | 1 |
-| Mahasiswa & enrollment | 12 | 8 | 0 | 4 |
-| Laporan | 9 | 5 | 0 | 3 (1 TBD) |
-| Perangkat | 15 | 10 | 0 | 5 |
-| Pengenalan wajah | 9 | 4 | 0 | 5 |
-| API | 7 | 5 | 1 | 1 |
-| **Total** | **80** | **53** | **1** | **24 (+3 TBD)** |
+| Area | Jumlah FR | `[TERSEDIA]` | `[SEBAGIAN]` | `[BELUM]` | TBD |
+| --- | --- | --- | --- | --- | --- |
+| Autentikasi & sesi | 11 | 8 | 0 | 2 | 1 |
+| Otorisasi | 7 | 5 | 0 | 2 | 0 |
+| Dashboard | 7 | 6 | 0 | 1 | 0 |
+| Kelas | 3 | 2 | 0 | 1 | 0 |
+| Mahasiswa & enrollment | 12 | 8 | 1 | 3 | 0 |
+| Laporan | 9 | 5 | 0 | 3 | 1 |
+| Perangkat & absensi otomatis | 16 | 9 | 2 | 5 | 0 |
+| Pengenalan wajah | 9 | 0 | 4 | 5 | 0 |
+| API integrasi | 7 | 4 | 2 | 1 | 0 |
+| Log pemindaian | 6 | 4 | 1 | 1 | 0 |
+| **Total** | **87** | **51** | **10** | **24** | **2** |
 
-> Angka di atas dihitung dari tabel Bagian 3 pada dokumen ini; perbarui bila
-> kebutuhan berubah.
+> Angka di atas dihitung dari tabel Bagian 3 pada dokumen ini (revisi 0.2,
+> 21 Oktober 2026); perbarui bila kebutuhan berubah.
 
 ## 8. Daftar Keputusan yang Diperlukan (TBD)
 
-1. Basis data produksi: tetap SQLite atau pindah ke Postgres?
+1. ~~Basis data produksi~~ — **diputuskan: MongoDB** (lihat ADR-6). Sisa: topologi (replica set?) dan kebijakan backup.
 2. Target performa & ketersediaan (NFR-PERF-03/04, NFR-REL-05/06).
 3. Regulasi privasi yang mengikat & kebijakan retensi biometrik.
 4. Perlu integrasi SIAKAD/SSO kampus?

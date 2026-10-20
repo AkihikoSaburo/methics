@@ -6,7 +6,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,11 +14,15 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
 	"dash.algorithmics/internal/security"
 	"dash.algorithmics/internal/store"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type Config struct {
@@ -87,6 +90,8 @@ func (s *Server) StaffHandler() http.Handler {
 func (s *Server) DeviceHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.health)
+	mux.HandleFunc("GET /api/v1/devices/ping", s.devicePing)
+	mux.HandleFunc("POST /api/v1/devices/ping", s.devicePing)
 	mux.HandleFunc("POST /api/v1/scans", s.receiveScan)
 	return securityHeaders(mux)
 }
@@ -99,6 +104,7 @@ func (s *Server) Handler(staticDir string) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/scans", s.DeviceHandler())
 	mux.Handle("/api/v1/health", s.DeviceHandler())
+	mux.Handle("/api/v1/devices/", s.DeviceHandler())
 	mux.Handle("/api/v1/", s.StaffHandler())
 	mux.Handle("/static/", s.StaticHandler(staticDir))
 	return mux
@@ -238,111 +244,141 @@ func (s *Server) reports(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func todayRangeUTC() (string, string) {
+	now := time.Now()
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).UTC()
+	end := start.Add(24 * time.Hour)
+	return start.Format(time.RFC3339), end.Format(time.RFC3339)
+}
+
 func (s *Server) classOverview(ctx context.Context, user principal) ([]ClassRow, error) {
-	query := `SELECT c.id, c.name,
-		COUNT(DISTINCT cs.student_id),
-		COUNT(DISTINCT CASE WHEN ft.student_id IS NOT NULL THEN cs.student_id END),
-		COUNT(DISTINCT CASE WHEN a.status = 'Hadir' THEN a.student_id END)
-		FROM classes c
-		LEFT JOIN class_students cs ON cs.class_id = c.id
-		LEFT JOIN face_templates ft ON ft.student_id = cs.student_id
-		LEFT JOIN scan_events a ON a.class_id = c.id AND a.status = 'Hadir' AND date(a.scanned_at, 'localtime') = date('now', 'localtime')`
-	args := []any{}
+	classFilter := bson.M{}
 	if user.role == "dosen" {
 		if len(user.classes) == 0 {
 			return []ClassRow{}, nil
 		}
-		query += ` WHERE c.id IN (` + placeholders(len(user.classes)) + `)`
-		for _, classID := range user.classes {
-			args = append(args, classID)
-		}
+		classFilter["_id"] = bson.M{"$in": user.classes}
 	}
-	query += ` GROUP BY c.id, c.name ORDER BY c.id`
-	rows, err := s.db.SQL.QueryContext(ctx, query, args...)
+	cur, err := s.db.Collection("classes").Find(ctx, classFilter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}))
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer cur.Close(ctx)
 
-	result := make([]ClassRow, 0, 3)
-	for rows.Next() {
-		var row ClassRow
-		if err := rows.Scan(&row.ID, &row.Name, &row.StudentCount, &row.Enrolled, &row.Present); err != nil {
+	var classes []struct {
+		ID   string `bson:"_id"`
+		Name string `bson:"name"`
+	}
+	if err := cur.All(ctx, &classes); err != nil {
+		return nil, err
+	}
+
+	startStr, endStr := todayRangeUTC()
+
+	result := make([]ClassRow, 0, len(classes))
+	for _, c := range classes {
+		studentCount, err := s.db.Collection("students").CountDocuments(ctx, bson.M{"class_id": c.ID})
+		if err != nil {
 			return nil, err
+		}
+
+		sCur, err := s.db.Collection("students").Find(ctx, bson.M{"class_id": c.ID}, options.Find().SetProjection(bson.M{"_id": 1}))
+		var studentIDs []string
+		if err == nil {
+			var stDocs []struct {
+				ID string `bson:"_id"`
+			}
+			if err := sCur.All(ctx, &stDocs); err == nil {
+				for _, st := range stDocs {
+					studentIDs = append(studentIDs, st.ID)
+				}
+			}
+		}
+
+		var enrolledCount int64
+		if len(studentIDs) > 0 {
+			enrolledCount, _ = s.db.Collection("face_templates").CountDocuments(ctx, bson.M{"student_id": bson.M{"$in": studentIDs}})
+		}
+
+		distinctPresent, err := s.db.Collection("scan_events").Distinct(ctx, "student_id", bson.M{
+			"class_id":   c.ID,
+			"status":     "Hadir",
+			"scanned_at": bson.M{"$gte": startStr, "$lt": endStr},
+		})
+		presentCount := 0
+		if err == nil {
+			for _, val := range distinctPresent {
+				if sID, ok := val.(string); ok && sID != "" {
+					presentCount++
+				}
+			}
+		}
+
+		row := ClassRow{
+			ID:           c.ID,
+			Name:         c.Name,
+			StudentCount: int(studentCount),
+			Enrolled:     int(enrolledCount),
+			Present:      presentCount,
 		}
 		if row.StudentCount > 0 {
 			row.AttendanceRate = row.Present * 100 / row.StudentCount
 		}
 		result = append(result, row)
 	}
-	return result, rows.Err()
+	return result, nil
 }
 
 func (s *Server) scanStatusCounts(ctx context.Context, user principal) (map[string]int, error) {
-	query := `SELECT status, COUNT(*) FROM scan_events WHERE date(scanned_at, 'localtime') = date('now', 'localtime')`
-	args := []any{}
+	startStr, endStr := todayRangeUTC()
+	filter := bson.M{
+		"scanned_at": bson.M{"$gte": startStr, "$lt": endStr},
+	}
 	if user.role == "dosen" {
 		if len(user.classes) == 0 {
 			return map[string]int{}, nil
 		}
-		query += ` AND class_id IN (` + placeholders(len(user.classes)) + `)`
-		for _, classID := range user.classes {
-			args = append(args, classID)
-		}
+		filter["class_id"] = bson.M{"$in": user.classes}
 	}
-	query += ` GROUP BY status`
-	rows, err := s.db.SQL.QueryContext(ctx, query, args...)
+	return s.aggregateStatusCounts(ctx, filter)
+}
+
+func (s *Server) aggregateStatusCounts(ctx context.Context, filter bson.M) (map[string]int, error) {
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: filter}},
+		{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: "$status"},
+			{Key: "count", Value: bson.D{{Key: "$sum", Value: 1}}},
+		}}},
+	}
+	cur, err := s.db.Collection("scan_events").Aggregate(ctx, pipeline)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer cur.Close(ctx)
 
 	counts := make(map[string]int)
-	for rows.Next() {
-		var status string
-		var count int
-		if err := rows.Scan(&status, &count); err != nil {
-			return nil, err
+	for cur.Next(ctx) {
+		var row struct {
+			Status string `bson:"_id"`
+			Count  int    `bson:"count"`
 		}
-		counts[status] = count
+		if err := cur.Decode(&row); err == nil {
+			counts[row.Status] = row.Count
+		}
 	}
-	return counts, rows.Err()
+	return counts, cur.Err()
 }
 
 func (s *Server) recentEvents(ctx context.Context, user principal) ([]ScanEvent, error) {
-	query := `SELECT se.scanned_at, se.status, se.confidence, se.review_reason, se.device_id, st.nim, st.name, c.id, c.name
-		FROM scan_events se
-		LEFT JOIN students st ON st.id = se.student_id
-		JOIN classes c ON c.id = se.class_id`
-	args := []any{}
+	filter := bson.M{}
 	if user.role == "dosen" {
 		if len(user.classes) == 0 {
 			return []ScanEvent{}, nil
 		}
-		query += ` WHERE se.class_id IN (` + placeholders(len(user.classes)) + `)`
-		for _, classID := range user.classes {
-			args = append(args, classID)
-		}
+		filter["class_id"] = bson.M{"$in": user.classes}
 	}
-	query += ` ORDER BY se.scanned_at DESC, se.id DESC LIMIT 50`
-	rows, err := s.db.SQL.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := make([]ScanEvent, 0, 50)
-	for rows.Next() {
-		var event ScanEvent
-		var nim, name sql.NullString
-		if err := rows.Scan(&event.ScannedAt, &event.Status, &event.Confidence, &event.ReviewReason, &event.DeviceID, &nim, &name, &event.ClassID, &event.ClassName); err != nil {
-			return nil, err
-		}
-		event.StudentNIM = nim.String
-		event.StudentName = name.String
-		result = append(result, event)
-	}
-	return result, rows.Err()
+	return s.fetchScanEvents(ctx, filter, 50)
 }
 
 func sumPresent(classes []ClassRow) int {
@@ -365,7 +401,7 @@ func classRowsToMaps(rows []ClassRow) []map[string]any {
 }
 
 // ClassRows, StudentCount, dan TemplateCount mengekspos query ber-scope role
-// agar fragment HTML (htmx) dapat memakai ulang SQL yang sama tanpa duplikasi.
+// agar fragment HTML (htmx) dapat memakai ulang logika yang sama tanpa duplikasi.
 func (s *Server) ClassRows(ctx context.Context, role string, classes []string) ([]ClassRow, error) {
 	return s.classOverview(ctx, principal{role: role, classes: classes})
 }
@@ -384,6 +420,165 @@ func (s *Server) RecentEvents(ctx context.Context, role string, classes []string
 
 func (s *Server) ScanStatusCounts(ctx context.Context, role string, classes []string) (map[string]int, error) {
 	return s.scanStatusCounts(ctx, principal{role: role, classes: classes})
+}
+
+// AllScanEvents mengembalikan seluruh event scan (tanpa batas tanggal) dengan
+// filter opsional status dan kelas. Dibatasi 200 event terbaru.
+func (s *Server) AllScanEvents(ctx context.Context, role string, roleClasses []string, statusFilter, classFilter, search string) ([]ScanEvent, error) {
+	filter := bson.M{}
+	if role == "dosen" {
+		if len(roleClasses) == 0 {
+			return []ScanEvent{}, nil
+		}
+		filter["class_id"] = bson.M{"$in": roleClasses}
+	}
+	if statusFilter != "" && statusFilter != "all" {
+		filter["status"] = statusFilter
+	}
+	if classFilter != "" && classFilter != "all" {
+		filter["class_id"] = classFilter
+	}
+
+	search = strings.TrimSpace(search)
+	if search != "" {
+		needle := regexp.QuoteMeta(search)
+		studentCur, err := s.db.Collection("students").Find(ctx, bson.M{
+			"$or": []bson.M{
+				{"name": bson.M{"$regex": needle, "$options": "i"}},
+				{"nim": bson.M{"$regex": needle, "$options": "i"}},
+			},
+		}, options.Find().SetProjection(bson.M{"_id": 1}))
+		if err != nil {
+			return nil, err
+		}
+		var matched []struct {
+			ID string `bson:"_id"`
+		}
+		_ = studentCur.All(ctx, &matched)
+		if len(matched) == 0 {
+			return []ScanEvent{}, nil
+		}
+		ids := make([]string, 0, len(matched))
+		for _, m := range matched {
+			ids = append(ids, m.ID)
+		}
+		filter["student_id"] = bson.M{"$in": ids}
+	}
+
+	return s.fetchScanEvents(ctx, filter, 200)
+}
+
+func (s *Server) fetchScanEvents(ctx context.Context, filter bson.M, limit int64) ([]ScanEvent, error) {
+	findOpts := options.Find().SetSort(bson.D{{Key: "scanned_at", Value: -1}}).SetLimit(limit)
+	cur, err := s.db.Collection("scan_events").Find(ctx, filter, findOpts)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+
+	type rawScanDoc struct {
+		StudentID    string  `bson:"student_id"`
+		ClassID      string  `bson:"class_id"`
+		DeviceID     string  `bson:"device_id"`
+		ScannedAt    string  `bson:"scanned_at"`
+		Status       string  `bson:"status"`
+		Confidence   float64 `bson:"confidence"`
+		ReviewReason string  `bson:"review_reason"`
+	}
+	var docs []rawScanDoc
+	if err := cur.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	if len(docs) == 0 {
+		return []ScanEvent{}, nil
+	}
+
+	studentIDSet := make(map[string]struct{})
+	classIDSet := make(map[string]struct{})
+	for _, doc := range docs {
+		if doc.StudentID != "" {
+			studentIDSet[doc.StudentID] = struct{}{}
+		}
+		if doc.ClassID != "" {
+			classIDSet[doc.ClassID] = struct{}{}
+		}
+	}
+
+	studentIDs := make([]string, 0, len(studentIDSet))
+	for id := range studentIDSet {
+		studentIDs = append(studentIDs, id)
+	}
+	classIDs := make([]string, 0, len(classIDSet))
+	for id := range classIDSet {
+		classIDs = append(classIDs, id)
+	}
+
+	studentsMap := make(map[string]struct{ NIM, Name string })
+	if len(studentIDs) > 0 {
+		stCur, err := s.db.Collection("students").Find(ctx, bson.M{"_id": bson.M{"$in": studentIDs}})
+		if err == nil {
+			var stList []struct {
+				ID   string `bson:"_id"`
+				NIM  string `bson:"nim"`
+				Name string `bson:"name"`
+			}
+			if err := stCur.All(ctx, &stList); err == nil {
+				for _, st := range stList {
+					studentsMap[st.ID] = struct{ NIM, Name string }{NIM: st.NIM, Name: st.Name}
+				}
+			}
+		}
+	}
+
+	classesMap := make(map[string]string)
+	if len(classIDs) > 0 {
+		cCur, err := s.db.Collection("classes").Find(ctx, bson.M{"_id": bson.M{"$in": classIDs}})
+		if err == nil {
+			var cList []struct {
+				ID   string `bson:"_id"`
+				Name string `bson:"name"`
+			}
+			if err := cCur.All(ctx, &cList); err == nil {
+				for _, c := range cList {
+					classesMap[c.ID] = c.Name
+				}
+			}
+		}
+	}
+
+	result := make([]ScanEvent, 0, len(docs))
+	for _, doc := range docs {
+		st := studentsMap[doc.StudentID]
+		className := classesMap[doc.ClassID]
+		if className == "" {
+			className = doc.ClassID
+		}
+		result = append(result, ScanEvent{
+			StudentNIM:   st.NIM,
+			StudentName:  st.Name,
+			ClassID:      doc.ClassID,
+			ClassName:    className,
+			ScannedAt:    doc.ScannedAt,
+			Status:       doc.Status,
+			Confidence:   doc.Confidence,
+			ReviewReason: doc.ReviewReason,
+			DeviceID:     doc.DeviceID,
+		})
+	}
+	return result, nil
+}
+
+// AllScanStatusCounts menghitung status scan seluruh waktu (tanpa batas tanggal),
+// ber-scope role.
+func (s *Server) AllScanStatusCounts(ctx context.Context, role string, classes []string) (map[string]int, error) {
+	filter := bson.M{}
+	if role == "dosen" {
+		if len(classes) == 0 {
+			return map[string]int{}, nil
+		}
+		filter["class_id"] = bson.M{"$in": classes}
+	}
+	return s.aggregateStatusCounts(ctx, filter)
 }
 
 // DeviceStatus melaporkan apakah perangkat ESP32 baru-baru ini mengirim data.
@@ -456,26 +651,50 @@ func (s *Server) CreateStudent(ctx context.Context, name, nim, classID string) (
 	if name == "" || nim == "" || classID == "" {
 		return "", ErrMissingFields
 	}
-	id := "student-" + strings.ToLower(nim)
-	if _, err := s.db.SQL.ExecContext(ctx, `INSERT INTO students(id, nim, name) VALUES(?, ?, ?)`, id, nim, name); err != nil {
-		return "", ErrStudentExists
-	}
-	if _, err := s.db.SQL.ExecContext(ctx, `INSERT INTO class_students(class_id, student_id) VALUES(?, ?)`, classID, id); err != nil {
-		_, _ = s.db.SQL.ExecContext(ctx, `DELETE FROM students WHERE id = ?`, id)
+
+	classCount, err := s.db.Collection("classes").CountDocuments(ctx, bson.M{"_id": classID})
+	if err != nil || classCount == 0 {
 		return "", ErrInvalidClass
 	}
+
+	existingCount, err := s.db.Collection("students").CountDocuments(ctx, bson.M{"nim": nim})
+	if err != nil || existingCount > 0 {
+		return "", ErrStudentExists
+	}
+
+	id := "student-" + strings.ToLower(nim)
+	_, err = s.db.Collection("students").InsertOne(ctx, bson.M{
+		"_id":      id,
+		"nim":      nim,
+		"name":     name,
+		"email":    "",
+		"class_id": classID,
+	})
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return "", ErrStudentExists
+		}
+		return "", err
+	}
+	_, _ = s.db.Collection("class_students").InsertOne(ctx, bson.M{
+		"class_id":   classID,
+		"student_id": id,
+	})
 	return id, nil
 }
 
 // EnrollFace mengirim gambar ke layanan verifikasi wajah untuk NIM tertentu.
 func (s *Server) EnrollFace(ctx context.Context, nim string, image []byte, filename string) (map[string]any, error) {
 	nim = strings.ToUpper(strings.TrimSpace(nim))
-	var studentID string
-	if err := s.db.SQL.QueryRowContext(ctx, `SELECT id FROM students WHERE nim = ?`, nim).Scan(&studentID); err != nil {
+	var student struct {
+		ID string `bson:"_id"`
+	}
+	err := s.db.Collection("students").FindOne(ctx, bson.M{"nim": nim}).Decode(&student)
+	if err != nil {
 		return nil, ErrStudentNotFound
 	}
 	var response map[string]any
-	if err := s.callFaceService(ctx, "/enroll", map[string]string{"student_id": studentID}, "image", filename, image, &response); err != nil {
+	if err := s.callFaceService(ctx, "/enroll", map[string]string{"student_id": student.ID}, "image", filename, image, &response); err != nil {
 		return nil, ErrFaceService
 	}
 	return response, nil
@@ -508,134 +727,224 @@ func rosterToMaps(entries []RosterEntry) []map[string]any {
 }
 
 func (s *Server) dashboardClasses(ctx context.Context, user principal) ([]map[string]any, error) {
-	query := `SELECT c.id, c.name, COUNT(DISTINCT cs.student_id),
-		COUNT(DISTINCT CASE WHEN a.status = 'Hadir' THEN a.student_id END)
-		FROM classes c
-		LEFT JOIN class_students cs ON cs.class_id = c.id
-		LEFT JOIN scan_events a ON a.class_id = c.id AND a.status = 'Hadir' AND date(a.scanned_at, 'localtime') = date('now', 'localtime')`
-	args := []any{}
-	if user.role == "dosen" {
-		if len(user.classes) == 0 {
-			return []map[string]any{}, nil
-		}
-		query += ` WHERE c.id IN (` + placeholders(len(user.classes)) + `)`
-		for _, classID := range user.classes {
-			args = append(args, classID)
-		}
-	}
-	query += ` GROUP BY c.id, c.name ORDER BY c.id`
-	rows, err := s.db.SQL.QueryContext(ctx, query, args...)
+	rows, err := s.classOverview(ctx, user)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	result := make([]map[string]any, 0, 3)
-	for rows.Next() {
-		var id, name string
-		var total, present int
-		if err := rows.Scan(&id, &name, &total, &present); err != nil {
-			return nil, err
-		}
-		result = append(result, map[string]any{"id": id, "name": name, "studentCount": total, "present": present})
+	result := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, map[string]any{
+			"id":           row.ID,
+			"name":         row.Name,
+			"studentCount": row.StudentCount,
+			"present":      row.Present,
+		})
 	}
-	return result, rows.Err()
+	return result, nil
 }
 
 func (s *Server) dashboardAttendance(ctx context.Context, user principal) ([]RosterEntry, error) {
-	query := `SELECT st.id, st.nim, st.name, c.id, c.name, e.scanned_at, COALESCE(e.face_verified, 0), e.device_id, e.status,
-		EXISTS(SELECT 1 FROM face_templates ft WHERE ft.student_id = st.id)
-		FROM students st
-		JOIN class_students cs ON cs.student_id = st.id
-		JOIN classes c ON c.id = cs.class_id
-		LEFT JOIN scan_events e ON e.id = (
-			SELECT se.id FROM scan_events se WHERE se.student_id = st.id AND se.class_id = c.id
-			AND date(se.scanned_at, 'localtime') = date('now', 'localtime') ORDER BY se.scanned_at DESC, se.id DESC LIMIT 1
-		)`
-	args := []any{}
+	classFilter := bson.M{}
 	if user.role == "dosen" {
 		if len(user.classes) == 0 {
 			return []RosterEntry{}, nil
 		}
-		query += ` WHERE c.id IN (` + placeholders(len(user.classes)) + `)`
-		for _, classID := range user.classes {
-			args = append(args, classID)
-		}
+		classFilter["_id"] = bson.M{"$in": user.classes}
 	}
-	query += ` ORDER BY c.id, st.nim`
-	rows, err := s.db.SQL.QueryContext(ctx, query, args...)
+
+	cCur, err := s.db.Collection("classes").Find(ctx, classFilter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}))
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer cCur.Close(ctx)
 
-	result := make([]RosterEntry, 0, 5)
-	for rows.Next() {
-		var entry RosterEntry
-		var scannedAt, deviceID, status sql.NullString
-		if err := rows.Scan(&entry.StudentID, &entry.StudentNIM, &entry.StudentName, &entry.ClassID, &entry.ClassName, &scannedAt, &entry.FaceVerified, &deviceID, &status, &entry.FaceEnrolled); err != nil {
-			return nil, err
+	var classes []struct {
+		ID   string `bson:"_id"`
+		Name string `bson:"name"`
+	}
+	if err := cCur.All(ctx, &classes); err != nil {
+		return nil, err
+	}
+
+	classIDs := make([]string, 0, len(classes))
+	classesMap := make(map[string]string)
+	for _, c := range classes {
+		classIDs = append(classIDs, c.ID)
+		classesMap[c.ID] = c.Name
+	}
+	if len(classIDs) == 0 {
+		return []RosterEntry{}, nil
+	}
+
+	stCur, err := s.db.Collection("students").Find(ctx,
+		bson.M{"class_id": bson.M{"$in": classIDs}},
+		options.Find().SetSort(bson.D{{Key: "class_id", Value: 1}, {Key: "nim", Value: 1}}),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer stCur.Close(ctx)
+
+	var students []struct {
+		ID      string `bson:"_id"`
+		NIM     string `bson:"nim"`
+		Name    string `bson:"name"`
+		ClassID string `bson:"class_id"`
+	}
+	if err := stCur.All(ctx, &students); err != nil {
+		return nil, err
+	}
+	if len(students) == 0 {
+		return []RosterEntry{}, nil
+	}
+
+	studentIDs := make([]string, 0, len(students))
+	for _, st := range students {
+		studentIDs = append(studentIDs, st.ID)
+	}
+
+	enrolledMap := make(map[string]bool)
+	ftCur, err := s.db.Collection("face_templates").Find(ctx, bson.M{"student_id": bson.M{"$in": studentIDs}})
+	if err == nil {
+		var ftList []struct {
+			StudentID string `bson:"student_id"`
 		}
-		entry.Status = "Belum hadir"
-		if status.Valid {
-			entry.Status = status.String
+		if err := ftCur.All(ctx, &ftList); err == nil {
+			for _, ft := range ftList {
+				enrolledMap[ft.StudentID] = true
+			}
 		}
-		entry.DeviceID = deviceID.String
-		if scannedAt.Valid {
-			value := scannedAt.String
-			entry.ScannedAt = &value
+	}
+
+	startStr, endStr := todayRangeUTC()
+	scanCur, err := s.db.Collection("scan_events").Find(ctx,
+		bson.M{
+			"class_id":   bson.M{"$in": classIDs},
+			"scanned_at": bson.M{"$gte": startStr, "$lt": endStr},
+		},
+		options.Find().SetSort(bson.D{{Key: "scanned_at", Value: -1}}),
+	)
+	type scanDoc struct {
+		StudentID    string `bson:"student_id"`
+		ClassID      string `bson:"class_id"`
+		ScannedAt    string `bson:"scanned_at"`
+		FaceVerified bool   `bson:"face_verified"`
+		DeviceID     string `bson:"device_id"`
+		Status       string `bson:"status"`
+	}
+	latestScanMap := make(map[string]scanDoc)
+	if err == nil {
+		var allScans []scanDoc
+		if err := scanCur.All(ctx, &allScans); err == nil {
+			for _, sc := range allScans {
+				key := sc.StudentID + "|" + sc.ClassID
+				if _, ok := latestScanMap[key]; !ok {
+					latestScanMap[key] = sc
+				}
+			}
+		}
+	}
+
+	result := make([]RosterEntry, 0, len(students))
+	for _, st := range students {
+		entry := RosterEntry{
+			StudentID:    st.ID,
+			StudentNIM:   st.NIM,
+			StudentName:  st.Name,
+			ClassID:      st.ClassID,
+			ClassName:    classesMap[st.ClassID],
+			Status:       "Belum hadir",
+			FaceEnrolled: enrolledMap[st.ID],
+		}
+		key := st.ID + "|" + st.ClassID
+		if scan, ok := latestScanMap[key]; ok {
+			scannedTime := scan.ScannedAt
+			entry.ScannedAt = &scannedTime
+			if scan.FaceVerified {
+				entry.FaceVerified = true
+			}
+			entry.DeviceID = scan.DeviceID
+			if scan.Status != "" {
+				entry.Status = scan.Status
+			}
 		}
 		result = append(result, entry)
 	}
-	return result, rows.Err()
+	return result, nil
 }
 
 func (s *Server) countStudents(ctx context.Context, user principal) (int, error) {
-	query, args := scopedStudentCount(user)
-	var count int
-	err := s.db.SQL.QueryRowContext(ctx, query, args...).Scan(&count)
-	return count, err
+	filter := bson.M{}
+	if user.role == "dosen" {
+		if len(user.classes) == 0 {
+			return 0, nil
+		}
+		filter["class_id"] = bson.M{"$in": user.classes}
+	}
+	count, err := s.db.Collection("students").CountDocuments(ctx, filter)
+	return int(count), err
 }
 
 func (s *Server) countTemplates(ctx context.Context, user principal) (int, error) {
-	query := `SELECT COUNT(DISTINCT ft.student_id) FROM face_templates ft JOIN students st ON st.id = ft.student_id`
-	args := []any{}
 	if user.role == "dosen" {
-		query += ` JOIN class_students cs ON cs.student_id = st.id WHERE cs.class_id IN (` + placeholders(len(user.classes)) + `)`
-		for _, classID := range user.classes {
-			args = append(args, classID)
+		if len(user.classes) == 0 {
+			return 0, nil
 		}
+		sCur, err := s.db.Collection("students").Find(ctx, bson.M{"class_id": bson.M{"$in": user.classes}}, options.Find().SetProjection(bson.M{"_id": 1}))
+		if err != nil {
+			return 0, err
+		}
+		var stDocs []struct {
+			ID string `bson:"_id"`
+		}
+		_ = sCur.All(ctx, &stDocs)
+		if len(stDocs) == 0 {
+			return 0, nil
+		}
+		ids := make([]string, 0, len(stDocs))
+		for _, st := range stDocs {
+			ids = append(ids, st.ID)
+		}
+		count, err := s.db.Collection("face_templates").CountDocuments(ctx, bson.M{"student_id": bson.M{"$in": ids}})
+		return int(count), err
 	}
-	var count int
-	err := s.db.SQL.QueryRowContext(ctx, query, args...).Scan(&count)
-	return count, err
+	count, err := s.db.Collection("face_templates").CountDocuments(ctx, bson.M{})
+	return int(count), err
 }
 
 func (s *Server) countScans(ctx context.Context, user principal) (int, int, error) {
-	query := `SELECT COUNT(CASE WHEN status = 'Hadir' THEN 1 END), COUNT(CASE WHEN status = 'Perlu ditinjau' THEN 1 END) FROM scan_events WHERE date(scanned_at, 'localtime') = date('now', 'localtime')`
-	args := []any{}
+	startStr, endStr := todayRangeUTC()
+	baseFilter := bson.M{
+		"scanned_at": bson.M{"$gte": startStr, "$lt": endStr},
+	}
 	if user.role == "dosen" {
 		if len(user.classes) == 0 {
 			return 0, 0, nil
 		}
-		query += ` AND class_id IN (` + placeholders(len(user.classes)) + `)`
-		for _, classID := range user.classes {
-			args = append(args, classID)
-		}
+		baseFilter["class_id"] = bson.M{"$in": user.classes}
 	}
-	var verified, review int
-	err := s.db.SQL.QueryRowContext(ctx, query, args...).Scan(&verified, &review)
-	return verified, review, err
-}
 
-func scopedStudentCount(user principal) (string, []any) {
-	if user.role == "dosen" {
-		if len(user.classes) == 0 {
-			return `SELECT 0`, nil
-		}
-		return `SELECT COUNT(DISTINCT student_id) FROM class_students WHERE class_id IN (` + placeholders(len(user.classes)) + `)`, stringArgs(user.classes)
+	filterVerified := bson.M{}
+	for k, v := range baseFilter {
+		filterVerified[k] = v
 	}
-	return `SELECT COUNT(*) FROM students`, nil
+	filterVerified["status"] = "Hadir"
+	verified, err := s.db.Collection("scan_events").CountDocuments(ctx, filterVerified)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	filterReview := bson.M{}
+	for k, v := range baseFilter {
+		filterReview[k] = v
+	}
+	filterReview["status"] = "Perlu ditinjau"
+	review, err := s.db.Collection("scan_events").CountDocuments(ctx, filterReview)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return int(verified), int(review), nil
 }
 
 func (s *Server) createStudent(w http.ResponseWriter, r *http.Request) {
@@ -731,12 +1040,13 @@ func (s *Server) receiveScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid_signature", "Signature scan tidak valid atau timestamp kedaluwarsa.")
 		return
 	}
-	var exists int
-	if err = s.db.SQL.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM devices WHERE id = ?`, deviceID).Scan(&exists); err != nil || exists == 0 {
+	deviceCount, err := s.db.Collection("devices").CountDocuments(r.Context(), bson.M{"_id": deviceID})
+	if err != nil || deviceCount == 0 {
 		writeError(w, http.StatusForbidden, "unknown_device", "Perangkat belum terdaftar.")
 		return
 	}
-	if err = s.db.SQL.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM classes WHERE id = ?`, classID).Scan(&exists); err != nil || exists == 0 {
+	classCount, err := s.db.Collection("classes").CountDocuments(r.Context(), bson.M{"_id": classID})
+	if err != nil || classCount == 0 {
 		writeError(w, http.StatusBadRequest, "unknown_class", "Kelas tidak ditemukan.")
 		return
 	}
@@ -756,8 +1066,8 @@ func (s *Server) receiveScan(w http.ResponseWriter, r *http.Request) {
 	status := "Ditolak"
 	reason := verification.Reason
 	if faceVerified {
-		var enrolled int
-		if err = s.db.SQL.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM class_students WHERE class_id = ? AND student_id = ?`, classID, studentID).Scan(&enrolled); err != nil {
+		enrolled, err := s.db.Collection("students").CountDocuments(r.Context(), bson.M{"_id": studentID, "class_id": classID})
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, "database_error", "Gagal memvalidasi kelas mahasiswa.")
 			return
 		}
@@ -772,20 +1082,33 @@ func (s *Server) receiveScan(w http.ResponseWriter, r *http.Request) {
 			reason = ""
 		}
 	}
-	_, err = s.db.SQL.ExecContext(r.Context(), `
-		INSERT INTO scan_events(student_id, class_id, device_id, scanned_at, face_verified, liveness_passed, confidence, status, review_reason)
-		VALUES(NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?)
-	`, studentID, classID, deviceID, scannedAt.Format(time.RFC3339), faceVerified, strings.EqualFold(r.FormValue("liveness_passed"), "true"), verification.Confidence, status, reason)
+	_, err = s.db.Collection("scan_events").InsertOne(r.Context(), bson.M{
+		"student_id":      studentID,
+		"class_id":        classID,
+		"device_id":       deviceID,
+		"scanned_at":      scannedAt.Format(time.RFC3339),
+		"face_verified":   faceVerified,
+		"liveness_passed": strings.EqualFold(r.FormValue("liveness_passed"), "true"),
+		"confidence":      verification.Confidence,
+		"status":          status,
+		"review_reason":   reason,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Gagal menyimpan event scan.")
 		return
 	}
-	_, _ = s.db.SQL.ExecContext(r.Context(), `UPDATE devices SET last_seen = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339), deviceID)
+	_, _ = s.db.Collection("devices").UpdateOne(r.Context(),
+		bson.M{"_id": deviceID},
+		bson.M{"$set": bson.M{"last_seen": time.Now().UTC().Format(time.RFC3339)}},
+	)
 	var student map[string]any
 	if faceVerified {
-		var nim, name string
-		if err = s.db.SQL.QueryRowContext(r.Context(), `SELECT nim, name FROM students WHERE id = ?`, studentID).Scan(&nim, &name); err == nil {
-			student = map[string]any{"id": studentID, "nim": nim, "name": name}
+		var st struct {
+			NIM  string `bson:"nim"`
+			Name string `bson:"name"`
+		}
+		if err = s.db.Collection("students").FindOne(r.Context(), bson.M{"_id": studentID}).Decode(&st); err == nil {
+			student = map[string]any{"id": studentID, "nim": st.NIM, "name": st.Name}
 		}
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
@@ -794,7 +1117,58 @@ func (s *Server) receiveScan(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) devicePing(w http.ResponseWriter, r *http.Request) {
+	deviceID := strings.TrimSpace(r.FormValue("device_id"))
+	if deviceID == "" {
+		deviceID = strings.TrimSpace(r.URL.Query().Get("device_id"))
+	}
+	if deviceID == "" {
+		deviceID = strings.TrimSpace(r.Header.Get("X-Device-Id"))
+	}
+	if deviceID == "" {
+		deviceID = "ESP32-GED-A1"
+	}
+
+	if s.config.Environment == "production" && !s.validDeviceToken(r) {
+		writeError(w, http.StatusUnauthorized, "invalid_token", "Device token tidak valid.")
+		return
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.Collection("devices").UpdateOne(r.Context(),
+		bson.M{"_id": deviceID},
+		bson.M{
+			"$set":         bson.M{"last_seen": now},
+			"$setOnInsert": bson.M{"_id": deviceID, "name": "Perangkat " + deviceID},
+		},
+		options.Update().SetUpsert(true),
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "Gagal memperbarui status perangkat.")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":    "ok",
+		"device_id": deviceID,
+		"last_seen": now,
+		"message":   "Perangkat berhasil terhubung dan status aktif.",
+	})
+}
+
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	deviceID := strings.TrimSpace(r.URL.Query().Get("device_id"))
+	if deviceID != "" {
+		now := time.Now().UTC().Format(time.RFC3339)
+		_, _ = s.db.Collection("devices").UpdateOne(r.Context(),
+			bson.M{"_id": deviceID},
+			bson.M{
+				"$set":         bson.M{"last_seen": now},
+				"$setOnInsert": bson.M{"_id": deviceID, "name": "Perangkat " + deviceID},
+			},
+			options.Update().SetUpsert(true),
+		)
+	}
 	face := s.faceHealth(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "faceVerification": face})
 }
@@ -822,12 +1196,18 @@ func (s *Server) faceHealth(ctx context.Context) map[string]any {
 }
 
 func (s *Server) lastDeviceSeen(ctx context.Context) (*time.Time, error) {
-	var value sql.NullString
-	err := s.db.SQL.QueryRowContext(ctx, `SELECT MAX(last_seen) FROM devices`).Scan(&value)
-	if err != nil || !value.Valid {
+	opts := options.FindOne().SetSort(bson.D{{Key: "last_seen", Value: -1}})
+	var doc struct {
+		LastSeen string `bson:"last_seen"`
+	}
+	err := s.db.Collection("devices").FindOne(ctx, bson.M{"last_seen": bson.M{"$exists": true, "$ne": ""}}, opts).Decode(&doc)
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, nil
+		}
 		return nil, err
 	}
-	parsed, err := time.Parse(time.RFC3339, value.String)
+	parsed, err := time.Parse(time.RFC3339, doc.LastSeen)
 	if err != nil {
 		return nil, nil
 	}

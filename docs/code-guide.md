@@ -3,14 +3,17 @@
 Dokumen ini menjelaskan **bagaimana kode disusun dan mengapa**, agar perubahan
 berikutnya konsisten dengan pola yang ada. Untuk gambaran besar, lihat
 [architecture.md](architecture.md). Untuk kontrak API, lihat [API.md](../API.md).
+Untuk skema data, lihat [database.md](database.md). Terakhir diselaraskan dengan
+kode: 21 Oktober 2026.
 
 ## 1. Prinsip yang dipegang
 
 1. **Server-rendered, bukan SPA.** Halaman dirender Go dengan `html/template`;
    htmx hanya menukar potongan HTML. Tidak ada logika role di klien.
-2. **Satu sumber query & validasi.** Sembilan endpoint JSON dan tujuh endpoint
-   fragment memakai fungsi yang sama di `internal/api/server.go`. Tidak ada SQL
-   atau aturan validasi yang ditulis dua kali.
+2. **Satu sumber query & validasi.** Endpoint JSON (`/api/v1/*`) dan delapan
+   endpoint fragment (`/partials/*`) memakai fungsi yang sama di
+   `internal/api/server.go`. Tidak ada query MongoDB atau aturan validasi yang
+   ditulis dua kali.
 3. **Otorisasi di server, dari database.** Role dan daftar kelas dosen diambil
    ulang dari DB setiap request (`security.RequireSession`). Query/header role
    dari klien tidak pernah dipercaya.
@@ -30,9 +33,10 @@ internal/security/middleware.go
                               session SCS, Principal, RequireSession, RequireRole,
                               LoginRateLimit, SecurityHeaders (CSP), Recover
 internal/store/
-  database.go                 Open, migrate (schema), seed (kelas/mahasiswa/perangkat)
+  database.go                 Open (connect+ping MongoDB), migrate (index), seed (kelas/mahasiswa/perangkat)
   users.go                    User, CreateUser, EnsureUser, AuthenticateUser, UserByID
-services/face/main.py         FastAPI: /health, /enroll, /verify (embedding 128-dimensi)
+services/face/                BELUM ADA — kontrak di docs/face-service.md
+devices/esp8266/esp8266_ping/ firmware heartbeat ESP8266 (Arduino)
 views/
   layouts/base.html           kerangka halaman (head, sidebar, topbar, content)
   pages/*.html                shell per halaman (isi div tempat htmx menaruh fragment)
@@ -45,7 +49,7 @@ static/js/lib/ui.js           refreshIcons, toast
 static/js/vendor/*            htmx, lucide (versi terpin, di-vendor lokal)
 ```
 
-## 3. Tiga alur request
+## 3. Empat alur request
 
 ### 3.1 Halaman staf (muat penuh)
 
@@ -92,11 +96,13 @@ POST /api/v1/scans
   → (tanpa sesi, tanpa CSRF)
   → validDeviceToken        (Authorization: Bearer <DEVICE_TOKEN>, perbandingan konstan-waktu)
   → readImagePart           (multipart field "image", maks 8 MB)
-  → validScanSignature      (HMAC-SHA256 atas X-Device-Timestamp + fields + hash gambar)
-  → cek device terdaftar, kelas ada
-  → callFaceService POST /verify  (Python; bearer FACE_SERVICE_TOKEN)
+  → cek device_id & class_id tidak kosong, captured_at RFC3339 ±5 menit, liveness_passed true/false
+  → validScanSignature      (HMAC-SHA256 atas X-Device-Timestamp ±2 menit + fields + hash gambar)
+  → cek devices._id ada, classes._id ada
+  → callFaceService POST /verify  (Python; field class_id + image; bearer FACE_SERVICE_TOKEN; timeout 8 s)
   → tentukan status: Hadir / Perlu ditinjau / Ditolak
-  → INSERT scan_events + UPDATE devices.last_seen
+  → InsertOne scan_events + UpdateOne devices.last_seen
+  → 202 JSON {status, student, faceVerified, confidence, reviewReason}
 ```
 
 Urutan penentuan status (di `receiveScan`) penting dan berlapis:
@@ -108,6 +114,24 @@ Urutan penentuan status (di `receiveScan`) penting dan berlapis:
 | Cocok, anggota kelas, tapi `liveness_passed != true` | `Perlu ditinjau` | "…bukti liveness belum tersedia atau tidak lolos." |
 | Cocok + anggota kelas + liveness true | `Hadir` | kosong |
 
+"Anggota kelas" dicek dengan `students.class_id == class_id` (bukan
+`class_students`). Bila `/verify` gagal, respons `502` dan event **tidak**
+disimpan.
+
+### 3.4 Heartbeat perangkat
+
+```text
+GET|POST /api/v1/devices/ping
+  → (tanpa sesi, tanpa CSRF)
+  → device_id dari form → query → header X-Device-Id → default "ESP32-GED-A1"
+  → validDeviceToken hanya bila APP_ENV=production
+  → UpdateOne devices {$set: last_seen, $setOnInsert: name} upsert=true
+  → 200 JSON {status, device_id, last_seen, message}
+```
+
+`GET /api/v1/health?device_id=…` melakukan upsert yang sama **tanpa** token.
+Lihat risiko di [devices.md](devices.md) §5.
+
 ## 4. Penjelasan per berkas
 
 ### `cmd/server/main.go`
@@ -116,13 +140,20 @@ Urutan penentuan status (di `receiveScan`) penting dan berlapis:
 - **Menolak start** bila `CSRF_SECRET` atau `DEVICE_TOKEN` < 32 karakter (semua
   mode); `FACE_SERVICE_TOKEN` < 32 karakter ditegakkan di mode production.
 - `bootstrapStaff` membuat administrator pertama dari `BOOTSTRAP_ADMIN_*` bila
-  tabel `users` belum punya administrator; dosen opsional dari
-  `BOOTSTRAP_LECTURER_*`. Tidak ada akun demo bawaan.
+  koleksi `users` belum punya administrator aktif; dosen opsional dari
+  `BOOTSTRAP_LECTURER_*` (dibuat lewat `EnsureUser`, jadi dilewati bila
+  username sudah ada — kelasnya tidak diperbarui). Tidak ada akun demo bawaan.
+- `store.Open(MONGODB_URI, MONGODB_DATABASE)` — gagal konek/ping dalam 8 detik
+  menghentikan proses.
 - Dua cabang routing:
-  - `protected` (di balik session + CSRF): halaman, `/api/v1/` staf, `/partials/`, `/static/`.
-  - `router` (tanpa session): `POST /api/v1/scans`, `GET /api/v1/health`.
-- Middleware global: `sessions.LoadAndSave` → `csrf.Protect` → (`Recover` +
-  `SecurityHeaders`) pada level server HTTP.
+  - `protected` (di balik session + CSRF): halaman (`/`, `/mahasiswa`,
+    `/kelas`, `/laporan`, `/logs`, `/akses`), login/logout, `/api/v1/` staf,
+    `/partials/`, `/static/`.
+  - `router` (tanpa session): `POST /api/v1/scans`, `GET /api/v1/health`,
+    `GET|POST /api/v1/devices/ping`; sisanya diteruskan ke `protected`.
+- Middleware: `Recover` → `SecurityHeaders` membungkus seluruh router; cabang
+  `protected` dibungkus `sessions.LoadAndSave` → `csrf.Protect`.
+- Timeout server: read header 5 s, read 15 s, write 15 s, idle 60 s.
 - Graceful shutdown 8 detik pada SIGINT/SIGTERM.
 
 ### `internal/api/server.go`
@@ -130,8 +161,9 @@ Urutan penentuan status (di `receiveScan`) penting dan berlapis:
 Dua peran dalam satu berkas:
 
 **a. Handler HTTP** — `StaffHandler()` (`/api/v1/dashboard|classes|reports|students…`),
-`DeviceHandler()` (`/api/v1/health|scans`), `StaticHandler()`. Semua membungkus
-mux dengan `securityHeaders`.
+`DeviceHandler()` (`/api/v1/health|scans|devices/ping`), `StaticHandler()`. Semua
+membungkus mux dengan `securityHeaders`. Ada juga `Handler(staticDir)` yang
+menggabungkan semuanya tanpa session — tidak dipakai oleh `main.go`.
 
 **b. Query & domain** — fungsi ber-scope role yang menerima `principal{role, classes}`:
 
@@ -140,14 +172,21 @@ mux dengan `securityHeaders`.
 | `classOverview` | ringkasan per kelas (jumlah mahasiswa, enrolled, hadir hari ini) |
 | `dashboardAttendance` | roster + scan terakhir hari ini per mahasiswa |
 | `scanStatusCounts` | hitung status scan hari ini |
-| `recentEvents` | 50 event scan terbaru |
+| `recentEvents` | 50 event scan terbaru (tanpa batas tanggal) |
+| `AllScanEvents` | 200 event terbaru dengan filter status/kelas/pencarian (halaman log) |
+| `AllScanStatusCounts` | hitung status scan seluruh waktu |
 | `countStudents`, `countTemplates`, `countScans` | agregat dashboard |
 | `lastDeviceSeen` | dasar status online perangkat |
 | `faceHealth` | cek `/health` layanan Python |
 
-Pola berulang untuk scoping dosen: bila `role == "dosen"`, query diberi
-`WHERE … IN (<placeholders>)`; bila daftar kelas kosong, langsung kembalikan
-hasil kosong (tanpa menyentuh DB).
+Pola berulang untuk scoping dosen: bila `role == "dosen"`, filter diberi
+`bson.M{"class_id": bson.M{"$in": classes}}` (atau `_id` untuk koleksi
+`classes`); bila daftar kelas kosong, langsung kembalikan hasil kosong (tanpa
+menyentuh DB). Data "hari ini" difilter dengan rentang string dari
+`todayRangeUTC()`.
+
+Sisa era SQLite: helper `placeholders` dan `stringArgs` tidak dipakai lagi dan
+aman dihapus.
 
 **c. API publik untuk controller.** Fungsi ber-scope diekspor sebagai pembungkus
 bertipe supaya `internal/controller/partials.go` bisa memakainya:
@@ -157,13 +196,14 @@ s.ClassRows(ctx, role, classes)      // → classOverview
 s.StudentCount(ctx, role, classes)   // → countStudents
 s.TemplateCount(ctx, role, classes)  // → countTemplates
 s.ScanStatusCounts(...) / s.Roster(...) / s.RecentEvents(...)
+s.AllScanEvents(ctx, role, classes, status, class, q) / s.AllScanStatusCounts(...)
 s.DeviceStatus(ctx) / s.FaceStatus(ctx)
 s.CreateStudent(ctx, name, nim, classID)
 s.EnrollFace(ctx, nim, image, filename)
 api.ReadImagePart(w, r)
 ```
 
-**d. Error sentinel** — supaya controller bisa memetakan pesan tanpa tahu SQL:
+**d. Error sentinel** — supaya controller bisa memetakan pesan tanpa tahu detail query MongoDB:
 
 ```go
 ErrMissingFields, ErrStudentExists, ErrInvalidClass, ErrStudentNotFound, ErrFaceService
@@ -181,11 +221,15 @@ lama** tetap sama meski internalnya bertipe.
   rakit struct data → `p.render(w, "<nama>_fragment", data)`.
 - `mahasiswaRoster` adalah helper bersama untuk `/partials/mahasiswa` dan
   `enrollFace` (keduanya mengembalikan tabel roster yang sama).
-- `createStudent` dan `enrollFace` menolak non-administrator dengan 403.
+- `createStudent`, `mahasiswaForm`, dan `enrollFace` menolak non-administrator
+  dengan 403.
+- `logs` memanggil `AllScanStatusCounts` (ringkasan seluruh waktu, tidak ikut
+  filter) dan `AllScanEvents` (tabel, ikut filter `q`/`status`/`class`).
 
 ### `internal/controller/web.go`
 
-- `NewWeb` mem-parse tiap halaman bersama layout + partials (sidebar, topbar,
+- `NewWeb` mem-parse tiap halaman (`dashboard`, `mahasiswa`, `kelas`,
+  `laporan`, `logs`, `akses`) bersama layout + partials (sidebar, topbar,
   toast) sekali saat startup. **Konsekuensi: mengubah `.html` butuh restart**
   (sudah ditangani air).
 - `render` menolak bila principal tidak ada, mengalihkan non-admin dari
@@ -196,7 +240,7 @@ lama** tetap sama meski internalnya bertipe.
 | Simbol | Perilaku |
 | --- | --- |
 | `NewSessionManager` | SCS; cookie `itbjh_session`, lifetime 8 jam, idle 30 menit, HttpOnly, SameSite Lax, `Secure` bila production |
-| `RequireSession(…, apiRequest)` | Ambil `user_id` sesi → muat user dari DB → taruh `Principal`. Gagal: JSON 401 (`apiRequest=true`) atau redirect `/login?next=…` (`false`) |
+| `RequireSession(…, apiRequest)` | Ambil `user_id` sesi → muat user aktif dari koleksi `users` (termasuk `class_ids`) → taruh `Principal`. Gagal: JSON 401 (`apiRequest=true`) atau redirect `/login?next=…` (`false`) |
 | `RequireRole` | 403 JSON untuk `/api/`, redirect `/` untuk halaman |
 | `LoginRateLimit(10, 5m)` | Per `RemoteAddr`, jendela 5 menit, `Retry-After` pada 429 |
 | `SecurityHeaders` | nosniff, Referrer-Policy, X-Frame-Options DENY, Permissions-Policy, CSP, `Cache-Control: no-store` untuk non-`/static/` |
@@ -204,43 +248,53 @@ lama** tetap sama meski internalnya bertipe.
 
 ### `internal/store/`
 
-- `database.go`: `Open` → `migrate` (semua `CREATE TABLE IF NOT EXISTS`) →
-  `seed` (3 kelas, 5 mahasiswa, 2 perangkat; idempoten via `INSERT OR IGNORE`).
+- `database.go`: `Open` (connect + ping 8 detik) → `migrate` (membuat index,
+  idempoten) → `seed` (3 kelas, 5 mahasiswa, relasi `class_students`,
+  2 perangkat; idempoten via upsert `$setOnInsert`). `Collection(name)` adalah
+  helper akses koleksi.
 - `users.go`: `CreateUser` (bcrypt, password ≥ 12 karakter, role terbatas
-  `administrator`/`dosen`), `EnsureUser`, `AuthenticateUser` (termasuk
-  perbandingan hash dummy untuk menyamakan waktu saat user tidak ada),
-  `UserByID`, `UserClassIDs`, `CountUsersByRole`.
+  `administrator`/`dosen`, `_id` hex acak), `EnsureUser` (cek username
+  case-insensitive), `AuthenticateUser` (username case-insensitive lewat regex
+  yang di-escape; perbandingan hash dummy untuk menyamakan waktu saat user
+  tidak ada), `UserByID` (menolak akun nonaktif), `UserClassIDs`,
+  `CountUsersByRole` (hanya akun aktif).
 
-### `services/face/main.py`
+### `services/face/` (belum ada)
 
-- `/health` mengembalikan `modelReady` = database siap (bukan cek model AI).
-- `/enroll` mewajibkan tepat satu wajah terdeteksi, menyimpan embedding 128
-  dimensi (`face_templates`), **bukan gambar mentah**.
-- `/verify` menghitung jarak ke semua template, ambil terkecil, cocok bila
-  `distance <= FACE_DISTANCE_THRESHOLD` (default `0.50`); `confidence = 1 - distance`.
-- `livenessSupported: false` — liveness belum ada di sisi Python.
+Implementasi Python tidak ada di repo. Go hanya bergantung pada kontrak
+`GET /health` → `{modelReady}`, `POST /enroll` (`student_id`, `image`), dan
+`POST /verify` (`class_id`, `image`) → `{verified, studentId, confidence,
+reason}`. Detail dan kerangka implementasi: [face-service.md](face-service.md).
 
-## 5. Model data (SQLite)
+### `devices/esp8266/esp8266_ping/esp8266_ping.ino`
+
+Sketch Arduino ESP8266 yang tersambung ke Wi-Fi lalu mengirim
+`POST /api/v1/devices/ping` setiap 15 detik. Konfigurasi dan peringatan
+kredensial: [devices.md](devices.md).
+
+## 5. Model data (MongoDB)
+
+Ringkas — detail field, index, dan operasi ada di [database.md](database.md).
 
 ```text
-classes(id PK, name UNIQUE)
-students(id PK, nim UNIQUE, name, email)
-users(id PK, username UNIQUE NOCASE, display_name, role CHECK(administrator|dosen),
-      password_hash BLOB, active, created_at)
-user_classes(user_id FK, class_id FK, PK(user_id,class_id))
-class_students(class_id FK, student_id FK, PK(class_id,student_id))
-devices(id PK, name, last_seen)
-face_templates(student_id PK FK, encoding TEXT, created_at)
-scan_events(id PK AUTOINCREMENT, student_id FK NULL, class_id FK, device_id FK,
-            scanned_at, face_verified, liveness_passed, confidence, status, review_reason)
+classes        {_id: "IK24-A", name}
+students       {_id: "student-ik24001", nim (unik), name, email, class_id}
+class_students {class_id, student_id}              (unik gabungan; belum dibaca query)
+users          {_id, username (unik), display_name, role, password_hash,
+                active, class_ids: [...], created_at}
+devices        {_id: "ESP32-GED-A1", name, last_seen}
+face_templates {student_id (unik), encoding, created_at}   (ditulis face service)
+scan_events    {student_id, class_id, device_id, scanned_at, face_verified,
+                liveness_passed, confidence, status, review_reason}
 ```
 
 Catatan penyimpanan waktu:
 
-- `scan_events.scanned_at` disimpan sebagai **RFC3339** (dari `captured_at`
-  perangkat, di-UTC-kan); filter "hari ini" memakai
-  `date(scanned_at, 'localtime') = date('now', 'localtime')`.
-- `devices.last_seen` disimpan RFC3339 UTC.
+- `scan_events.scanned_at` disimpan sebagai **string RFC3339 UTC** (dari
+  `captured_at` perangkat). Filter "hari ini" memakai
+  `todayRangeUTC()`: tengah malam lokal server → +24 jam, diubah ke UTC dan
+  dibandingkan sebagai string (`$gte`/`$lt`).
+- `devices.last_seen` disimpan RFC3339 UTC; ditampilkan sebagai `HH:MM` lokal.
 
 ## 6. Konvensi & pola
 
@@ -269,13 +323,23 @@ Catatan penyimpanan waktu:
 2. Daftarkan route di `StaffHandler()`.
 3. Bila dipakai UI juga, ekspor pembungkusnya dan pakai dari `partials.go`.
 
-**Menambah kolom tabel**
+**Menambah field dokumen**
 
-1. Tambahkan `ALTER TABLE`/kolom pada `migrate` di `internal/store/database.go`
-   (perhatikan DB yang sudah ada; `CREATE TABLE IF NOT EXISTS` tidak mengubah
-   tabel lama).
-2. Sesuaikan `INSERT`/`SELECT` terkait di `api/server.go`.
+1. Tulis field baru pada `InsertOne`/`UpdateOne` terkait di `api/server.go`
+   (atau `store/users.go`). Dokumen lama tidak otomatis punya field itu —
+   pastikan pembaca menoleransi nilai nol, atau backfill dengan skrip `mongosh`.
+2. Tambahkan field pada struct decode (`bson:"…"`) dan, bila perlu, index di
+   `migrate()` pada `internal/store/database.go`.
 3. Bila tampil di UI, tambahkan field struct data fragment + template.
+4. Perbarui [database.md](database.md).
+
+**Menambah halaman log/filter baru**
+
+Ikuti pola `/logs`: kontainer form dengan `hx-get` + `hx-trigger="load, every
+15s, keyup changed delay:300ms, change"`, fragment dengan ringkasan
+`hx-swap-oob`, dan query ber-scope role yang menerima nilai filter dari
+`r.URL.Query()`. Escape input pencarian dengan `regexp.QuoteMeta` sebelum
+dipakai di `$regex`.
 
 ## 8. Jebakan yang mudah menimbulkan bug
 
@@ -288,8 +352,10 @@ Catatan penyimpanan waktu:
    `Principal` di context; memasangnya tanpa `RequireSession` akan 401.
 4. **Jangan tambahkan inline script.** CSP hanya mengizinkan `script-src 'self'`;
    `htmx.config.allowEval = false` juga menutup jalur eval.
-5. **Waktu lokal vs UTC.** Selalu pakai pola `date(…, 'localtime')` untuk
-   perbandingan "hari ini", karena `scanned_at` disimpan dalam UTC/RFC3339.
+5. **Waktu lokal vs UTC.** Pakai `todayRangeUTC()` untuk "hari ini" dan simpan
+   waktu selalu sebagai RFC3339 UTC (`time.Now().UTC().Format(time.RFC3339)`).
+   Format lain (mis. offset `+08:00`) merusak perbandingan string. Batas hari
+   mengikuti zona waktu **server**.
 6. **`.env` tidak boleh ber-BOM.** PowerShell 5.1 `Set-Content -Encoding utf8`
    menulis BOM dan membuat parser `godotenv` air gagal memuat seluruh file.
    Pakai `UTF8Encoding($false)` atau `-Encoding ascii`.
@@ -298,3 +364,14 @@ Catatan penyimpanan waktu:
 8. **`.env` dimuat saat startup Go.** Nilai environment dari shell tidak
    ditimpa oleh `.env`; `air` juga memuat file tersebut melalui
    `env_files` di `.air.toml`.
+9. **Ping tanpa `device_id` menandai `ESP32-GED-A1`.** Perangkat yang lupa
+   mengirim ID akan membuat perangkat A1 tampak online.
+10. **Opsi filter kelas di view masih hardcoded** (`views/pages/mahasiswa.html`,
+    `views/pages/logs.html`). Menambah kelas di database tidak otomatis
+    menambah opsi filter.
+11. **Jangan menimpa filter scoping role.** Saat menambah filter dari input
+    pengguna, gabungkan dengan filter role (mis. cek nilai ada di
+    `principal.ClassIDs`), jangan menulis ulang key yang sama. `AllScanEvents`
+    saat ini melanggar aturan ini untuk `class_id` (lihat `HANDOFF.md`).
+12. **Keanggotaan kelas = `students.class_id`.** `class_students` ditulis
+    tetapi tidak dibaca; jangan mengandalkannya tanpa memperbarui query.

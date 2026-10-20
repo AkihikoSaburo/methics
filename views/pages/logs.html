@@ -1,0 +1,37 @@
+{{define "content"}}
+<section class="page-heading">
+  <div><p class="eyebrow">Pemindaian</p><h1>Log pemindaian</h1><p class="page-subtitle">Seluruh riwayat scan wajah perangkat, termasuk hasil verifikasi, status, dan catatan peninjauan.</p></div>
+  <div class="heading-actions"><button class="button" id="printReport" type="button"><i data-lucide="printer"></i>Cetak</button></div>
+</section>
+<section class="student-summary wide" id="logsSummary" aria-label="Ringkasan log pemindaian">
+  <div class="summary-line"><span class="metric-icon"><i data-lucide="scan-face"></i></span><span><strong id="logTotal">-</strong><small>Total pemindaian</small></span></div>
+  <div class="summary-line"><span class="metric-icon"><i data-lucide="circle-check-big"></i></span><span><strong id="logVerified">-</strong><small>Terverifikasi</small></span></div>
+  <div class="summary-line"><span class="metric-icon orange"><i data-lucide="scan-search"></i></span><span><strong id="logReview">-</strong><small>Perlu ditinjau</small></span></div>
+  <div class="summary-line"><span class="metric-icon red"><i data-lucide="shield-x"></i></span><span><strong id="logRejected">-</strong><small>Ditolak</small></span></div>
+</section>
+<section class="panel">
+  <div class="panel-header" style="align-items:center;padding-bottom:15px">
+    <div><h2 class="panel-title">Riwayat pemindaian</h2><p class="panel-caption">200 event terbaru dalam cakupan role. Filter diproses di server.</p></div>
+    <form class="view-tools" id="logFilters"
+          hx-get="/partials/logs" hx-target="#logsRegion" hx-swap="innerHTML"
+          hx-trigger="load, every 15s, keyup changed delay:300ms, change">
+      <label class="search"><i data-lucide="search"></i><input id="logSearch" name="q" type="search" placeholder="Cari nama atau NIM..." aria-label="Cari log"></label>
+      <label class="select-wrap"><select id="logStatus" name="status" aria-label="Filter status">
+        <option value="all">Semua status</option>
+        <option value="Hadir">Hadir</option>
+        <option value="Perlu ditinjau">Perlu ditinjau</option>
+        <option value="Ditolak">Ditolak</option>
+      </select><i data-lucide="chevron-down"></i></label>
+      <label class="select-wrap"><select id="logClass" name="class" aria-label="Filter kelas">
+        <option value="all">Semua kelas</option>
+        <option value="IK24-A">IK24-A</option>
+        <option value="IK24-B">IK24-B</option>
+        <option value="IK24-C">IK24-C</option>
+      </select><i data-lucide="chevron-down"></i></label>
+    </form>
+  </div>
+  <div id="logsRegion" aria-live="polite">
+    <div class="role-note" style="padding:18px 4px">Memuat log pemindaian...</div>
+  </div>
+</section>
+{{end}}
