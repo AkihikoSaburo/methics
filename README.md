@@ -1,4 +1,4 @@
-![svc by algorithmics](https://proxy-assets.etherthink.xyz/etherthink/methiccs.webp)
+![svc by algorithmics](https://proxy-assets.etherthink.xyz/etherthink/methicss.webp)
 # Algorithmics Face Recognation
 
 Sistem absensi mahasiswa berbasis pengenalan wajah untuk Institut Teknologi Bacharuddin Jusuf Habibie.
