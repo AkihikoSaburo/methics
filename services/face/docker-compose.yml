@@ -1,0 +1,23 @@
+services:
+  face-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: face-recognition-api
+    ports:
+      - "8000:8000"
+    environment:
+      # Model paths (relative to /app inside container)
+      - DET_MODEL_PATH=models/face_detection/yolo-facev2s.onnx
+      - REC_MODEL_PATH=models/face_recognition/arcface_r50_fp16.onnx
+      # Thresholds
+      - CONF_THRESHOLD=0.35
+      - IOU_THRESHOLD=0.45
+      - SIM_THRESHOLD=0.45
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

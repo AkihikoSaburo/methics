@@ -1,0 +1,15 @@
+# Core dependencies for YOLO Face Detection & ArcFace Recognition Pipeline
+numpy>=1.23.0,<2.3.0
+opencv-python>=4.7.0
+onnxruntime>=1.16.0
+huggingface_hub>=0.20.0
+
+# FastAPI server
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+
+# Optional GPU support:
+# Jika memiliki GPU NVIDIA dan CUDA toolkit yang sesuai:
+# pip uninstall onnxruntime
+# pip install onnxruntime-gpu
