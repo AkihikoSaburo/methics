@@ -1,0 +1,40 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Git & IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Virtual environments & packages
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local data & outputs
+output/
+debug_output/
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.avi
+*.log
+
+# Development & debug files
+debug_*.py
+environment.yml
+README.md
+.DS_Store

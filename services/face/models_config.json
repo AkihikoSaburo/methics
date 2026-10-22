@@ -1,0 +1,38 @@
+{
+  "version": "1.0",
+  "hf_repo_id": "AkihikoSaburo/methics",
+  "defaults": {
+    "face_detection": "face_detection/yolo-facev2s.onnx",
+    "face_recognition": "face_recognition/arcface_r50_fp16.onnx"
+  },
+  "models": {
+    "face_detection/yolo-facev2s.onnx": {
+      "name": "YOLO-FaceV2 Small",
+      "category": "face_detection",
+      "architecture": "yolo-facev2",
+      "input_size": 640,
+      "conf_threshold": 0.35,
+      "iou_threshold": 0.45,
+      "description": "Fast and lightweight face detector suitable for real-time webcam and edge devices."
+    },
+    "face_detection/yolo-facev2m.onnx": {
+      "name": "YOLO-FaceV2 Medium",
+      "category": "face_detection",
+      "architecture": "yolo-facev2",
+      "input_size": 640,
+      "conf_threshold": 0.40,
+      "iou_threshold": 0.45,
+      "description": "Higher accuracy face detector with enhanced feature extraction."
+    },
+    "face_recognition/arcface_r50_fp16.onnx": {
+      "name": "ArcFace ResNet-50 (FP16)",
+      "category": "face_recognition",
+      "architecture": "insightface",
+      "input_size": [112, 112],
+      "norm_type": "insightface",
+      "embedding_dim": 512,
+      "sim_threshold": 0.45,
+      "description": "Standard 512-d ArcFace recognition model with ResNet-50 backbone."
+    }
+  }
+}
