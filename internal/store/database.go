@@ -119,9 +119,19 @@ func (db *Database) migrate(ctx context.Context) error {
 		{Keys: bson.D{{Key: "class_id", Value: 1}, {Key: "scanned_at", Value: -1}}},
 		{Keys: bson.D{{Key: "student_id", Value: 1}, {Key: "scanned_at", Value: -1}}},
 		{Keys: bson.D{{Key: "status", Value: 1}}},
+		// image_key: pengecekan hak akses foto (GET /api/v1/images/...).
+		{Keys: bson.D{{Key: "image_key", Value: 1}}, Options: options.Index().SetSparse(true)},
 	})
 	if err != nil {
 		return fmt.Errorf("index scan_events: %w", err)
+	}
+
+	_, err = db.Collection("face_templates").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "image_key", Value: 1}},
+		Options: options.Index().SetSparse(true),
+	})
+	if err != nil {
+		return fmt.Errorf("index face_templates image_key: %w", err)
 	}
 
 	return nil

@@ -1,7 +1,8 @@
 # Arsitektur Algorithmics Face Recognation
 
 > Status: **arsitektur yang berlaku saat ini** (Go SSR + htmx, satu binary,
-> MongoDB). Terakhir diselaraskan dengan kode: 21 Oktober 2026.
+> MongoDB, foto opsional di S3 Garage). Terakhir diselaraskan dengan kode:
+> 26 Oktober 2026.
 > Dokumen ini menggantikan draf rencana pemisahan frontend/Nuxt yang ditolak —
 > lihat §9 untuk catatannya.
 
@@ -14,7 +15,8 @@ kedua.
 - **Bahasa/runtime**: Go (satu binary) + MongoDB.
 - **Frontend**: `html/template` server-rendered + htmx untuk navigasi/aksi
   tanpa reload penuh.
-- **Layanan pendukung**: face service Python (internal, tidak diekspos).
+- **Layanan pendukung**: face service Python (internal, tidak diekspos) dan
+  object storage S3 **Garage** untuk foto wajah (opsional, privat).
 - **Klien**: browser staf (admin/dosen), perangkat ESP32-CAM (scan wajah —
   firmware belum ada), dan ESP8266 (heartbeat — firmware ada di `devices/`).
 
@@ -31,9 +33,10 @@ API.
 | Halaman & fragment | `internal/controller/` | render `views/pages` (shell) dan `views/fragments` (htmx) |
 | Keamanan | `internal/security/middleware.go` | `RequireSession`, `RequireRole`, `Principal`, security headers/CSP |
 | Penyimpanan | `internal/store/database.go`, `users.go` | koneksi, index, seed MongoDB; akun staf (bcrypt) |
+| Foto wajah | `internal/api/images.go`, `internal/storage/s3.go` | unggah/stream/retensi foto di Garage (S3 SigV4, pustaka standar) |
 | Tampilan | `views/` | `layouts/base.html`, `pages/*`, `fragments/*` |
 | Aset statis | `static/` | `css/`, `js/app.js`, `js/lib/ui.js`, vendor lokal |
-| Face service | `services/face/` | Python: `/health`, `/enroll`, `/verify` (embedding, bukan gambar) — **belum ada di repo**, kontrak di `face-service.md` |
+| Face service | `services/face/` | Python (stateless): `/health`, `/detect` → embedding ArcFace 512-d; dipanggil oleh `internal/api/face.go` |
 | Firmware | `devices/esp8266/` | heartbeat ESP8266 ke `/api/v1/devices/ping` |
 
 Vendor frontend di-host lokal dan versi-terpin: htmx 2.0.11, Lucide 1.59.0,
@@ -60,8 +63,10 @@ DOM); ikon Lucide disegarkan setelah swap fragment.
 
 ```text
 ESP32 ──POST /api/v1/scans (bearer DEVICE_TOKEN + HMAC + timestamp)──► Go
-                                                                       ├── Python /verify
-                                                                       ├── MongoDB: scan_events
+                                                                       ├── Python /detect → embedding
+                                                                       ├── Go: cosine vs MongoDB face_templates
+                                                                       ├── Garage: scans/... (opsional, maks 3 s)
+                                                                       ├── MongoDB: scan_events (+ image_key)
                                                                        └── MongoDB: devices.last_seen
 ```
 
@@ -78,8 +83,18 @@ Dashboard menganggap perangkat online bila `last_seen` < 2 menit.
 
 ```text
 Admin ──POST /partials/mahasiswa/{nim}/face-template (multipart)──► Go
-                                                                   └── Python /enroll → MongoDB: face_templates
+                                                                   ├── Python /detect → Go simpan embedding → MongoDB: face_templates
+                                                                   └── Garage: enroll/... (opsional; foto lama dihapus)
 ```
+
+### Foto wajah (staf)
+
+```text
+Staf ──GET /api/v1/images/{key} (session)──► Go: cek key di MongoDB + kelas dosen ──► Garage (GET) ──► stream ke browser
+Go (tiap jam) ──► hapus foto scan lewat masa retensi di Garage + $unset image_key
+```
+
+Browser tidak pernah mengakses Garage langsung; bucket tetap privat.
 
 ### API staf (integrasi)
 
@@ -105,13 +120,31 @@ HMAC ada di `API.md`.
   aplikasi mobile resmi), `/api/v1` sudah menjadi jalur JSON yang stabil —
   pemisahan bisa dilakukan saat itu, dengan alasan konkret, bukan sekarang.
 
-### ADR-2 — Inference wajah tetap di Python, Go hanya orkestrasi (Diterima)
+### ADR-2 — Inference wajah di Python, penyimpanan & pencocokan di Go (Diterima, direvisi 26 Okt 2026)
 
-- **Keputusan**: model/encoding wajah tinggal di `services/face`. Go
-  memvalidasi perangkat/role, memanggil `/verify` atau `/enroll`, dan menyimpan
-  hasil.
+- **Keputusan**: model deteksi & embedding wajah tinggal di `services/face`
+  (Python, ONNX). Go memvalidasi perangkat/role, memanggil `POST /detect`,
+  menyimpan embedding, dan mencocokkannya.
 - **Konsekuensi**: service Python tidak pernah diekspos ke jaringan publik;
-  komunikasi memakai `FACE_SERVICE_TOKEN`.
+  Go mengirim `FACE_SERVICE_TOKEN` sebagai Bearer (belum diperiksa oleh
+  `api.py`).
+
+Revisi: face service yang dibangun tim (`services/face/api.py`) bersifat
+stateless (deteksi + embedding saja). Go menyimpan embedding di
+`face_templates` dan melakukan pencocokan 1:N dengan cosine similarity
+(`internal/api/face.go`). Dengan begitu hanya Go yang mengakses MongoDB dan
+hanya Go yang menjadi API publik untuk dashboard maupun ESP32.
+
+### ADR-7 — Foto wajah di object storage S3 (Garage), bukan MongoDB (Diterima, 26 Okt 2026)
+
+- **Konteks**: pencocokan hanya butuh embedding, tetapi foto diperlukan untuk
+  enrollment ulang saat model diganti, peninjauan scan, dan audit.
+- **Keputusan**: simpan foto di bucket Garage privat; MongoDB hanya menyimpan
+  kuncinya (`image_key`). Klien S3 ditulis dengan pustaka standar (SigV4)
+  agar tidak menambah dependensi.
+- **Konsekuensi**: penyimpanan foto bersifat *best effort* — Garage mati tidak
+  menghentikan absensi. Foto scan punya retensi (30/90 hari); foto
+  enrollment disimpan selama template masih ada.
 
 ### ADR-3 — htmx memakai fragment server-rendered, bukan JSON + DOM (Diterima)
 
@@ -160,8 +193,11 @@ HMAC ada di `API.md`.
    `GET /api/v1/health` publik.
 3. **Go → Face service**: jaringan internal, bearer `FACE_SERVICE_TOKEN`;
    port Python tidak diekspos.
-4. **Go/Python → MongoDB**: jaringan internal; di production wajib user
-   aplikasi + `authorization: enabled` (panduan di `README.md`).
+4. **Go → MongoDB**: jaringan internal; di production wajib user aplikasi +
+   `authorization: enabled` (panduan di `README.md`). Face service Python
+   tidak mengakses MongoDB.
+5. **Go → Garage (S3)**: jaringan internal, kunci akses khusus bucket
+   (bukan `admin_token`). Browser tidak mengakses Garage.
 
 ## 6. Ringkasan kontrak API
 
@@ -172,6 +208,7 @@ Acuan payload/skema ada di `API.md`.
 | Staf baca | `GET /api/v1/dashboard`, `/classes`, `/reports` | session |
 | Staf tulis | `POST /api/v1/students`, `POST /api/v1/students/{nim}/face-template` | session + CSRF (admin) |
 | Perangkat — scan | `POST /api/v1/scans` | device token + HMAC + timestamp |
+| Staf baca foto | `GET /api/v1/images/{key...}` | session (dosen: hanya kelasnya) |
 | Perangkat — heartbeat | `GET\|POST /api/v1/devices/ping` | device token (hanya production) |
 | Publik | `GET /api/v1/health` | — |
 | Fragment (staf) | `GET/POST /partials/*` | session (+ CSRF untuk POST) |
@@ -193,10 +230,13 @@ Variabel lingkungan (dari `cmd/server/main.go`):
 | `CSRF_SECRET` | wajib ≥32 karakter (semua mode) |
 | `DEVICE_TOKEN` | wajib ≥32 karakter (semua mode) |
 | `FACE_SERVICE_URL`, `FACE_SERVICE_TOKEN` | koneksi ke Python (token ≥32 di production) |
+| `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | penyimpanan foto di Garage (kosong semua = nonaktif) |
+| `IMAGE_RETENTION_DAYS`, `IMAGE_REVIEW_RETENTION_DAYS` | retensi foto scan (default 30 / 90 hari) |
 | `BOOTSTRAP_ADMIN_*`, `BOOTSTRAP_LECTURER_*` | pembuatan akun awal |
 
-`FACE_DISTANCE_THRESHOLD` (default `0.50`) dibaca oleh face service Python,
-bukan oleh Go. Templat lengkap: `.env.example`. Zona waktu server menentukan
+`FACE_SIM_THRESHOLD` (default `0.45`, ambang cosine similarity) dan
+`FACE_SERVICE_TIMEOUT_SECONDS` (default `15`) dibaca oleh Go;
+`FACE_SERVICE_URL` default `http://127.0.0.1:8000`. Templat lengkap: `.env.example`. Zona waktu server menentukan
 batas "hari ini" pada ringkasan dan laporan.
 
 Catatan hardening: HSTS **belum** dipasang (lihat §10). Header yang sudah ada:
@@ -206,7 +246,9 @@ same-origin`, dan CSP.
 ## 8. Invarian
 
 - Otorisasi hanya di server Go, dari DB — bukan dari role/query/header klien.
-- Tidak ada gambar atau template wajah yang dikirim ke browser.
+- Template wajah (embedding) tidak pernah dikirim ke browser; foto hanya
+  lewat `GET /api/v1/images/...` setelah cek role/kelas.
+- Kegagalan penyimpanan foto tidak boleh menggagalkan scan atau enrollment.
 - Endpoint perangkat terpisah dari endpoint staf.
 - CSP tidak boleh memasukkan `unsafe-inline` untuk `script-src`.
 - Tidak ada akun login mahasiswa tanpa keputusan produk baru.
@@ -239,20 +281,21 @@ Ini adalah pekerjaan backend yang masih outstanding (lihat juga `HANDOFF.md` §B
 3. **Belum ada anti-replay nonce** pada `POST /api/v1/scans`.
 4. **Liveness** masih klaim perangkat (`liveness_passed`), bukan deteksi
    biologis tervalidasi.
-5. **Threshold `0.50` belum dikalibrasi**; `/verify` masih memindai semua
-   template (belum ada pengindeksan kandidat per kelas).
-6. **Audit & privasi**: belum ada consent/retention workflow, audit enrollment
-   memadai, atau enkripsi backup.
+5. **Ambang cosine `0.45` belum dikalibrasi**; pencocokan di Go memindai
+   semua template tiap scan (belum ada pembatasan kandidat per kelas/cache).
+6. **Audit & privasi**: belum ada alur persetujuan (consent), audit enrollment
+   memadai, enkripsi backup, atau penghapusan foto enrollment saat mahasiswa
+   dihapus. Retensi foto scan sudah otomatis.
 7. **Hardening HTTP**: HSTS dan audit logging belum ada.
-8. **Bug scoping** di `AllScanEvents`: filter `class` menimpa pembatasan kelas
-   dosen pada halaman log.
+8. **Port RPC Garage (3901)** terbuka di semua interface pada konfigurasi
+   pengembangan; batasi dengan firewall atau ganti `rpc_secret`.
 9. **Ping/health melakukan upsert perangkat** tanpa token (ping di
    non-production, health di semua mode) → ID perangkat baru bisa dibuat
    dari luar.
 10. **Kredensial di firmware ESP8266** (Wi-Fi + `DEVICE_TOKEN`) tertulis di
    sketch; pindahkan ke `secrets.h` dan rotasi token.
-11. **Face service belum ada di repo** → enrollment & scan berakhir `502`
-    sampai service dibangun.
+11. **Face service tanpa autentikasi** (CORS `*`, token Go belum diperiksa)
+    → wajib dijalankan di `127.0.0.1`/jaringan internal.
 
 ## 11. Berkas acuan
 
@@ -266,4 +309,6 @@ Ini adalah pekerjaan backend yang masih outstanding (lihat juga `HANDOFF.md` §B
 - `internal/store/database.go` — koneksi, index, seed MongoDB.
 - `database.md` — skema koleksi & operasi.
 - `devices.md` — firmware & protokol perangkat.
-- `face-service.md` — kontrak face service.
+- `face-service.md` — integrasi face service dan penyimpanan foto (§8).
+- `internal/api/images.go`, `internal/storage/s3.go` — foto wajah di Garage.
+- `diagram.excalidraw` — diagram tahapan proyek & alur sistem.

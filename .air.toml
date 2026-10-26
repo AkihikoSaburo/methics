@@ -35,8 +35,8 @@ env_files = [".env"]
   # dari disk, jadi cukup refresh browser tanpa restart server.
   include_ext = ["go", "html", "tmpl", "tpl"]
 
-  # data/ (SQLite) dan tmp/ tidak perlu dipantau; docs/ dan services/ (Python)
-  # tidak memengaruhi build Go.
+  # tmp/ (hasil build) dan data/ (lokal, di-gitignore) tidak perlu dipantau;
+  # docs/ dan services/ (Python) tidak memengaruhi build Go.
   exclude_dir = ["tmp", "data", "docs", "services", ".venv", "__pycache__", "node_modules"]
 
   # Menyimpan file _test.go tidak mengubah binary server, jadi tidak perlu restart.

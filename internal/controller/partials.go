@@ -18,7 +18,7 @@ import (
 
 // Partials merender fragment HTML (htmx) untuk pembaruan sebagian halaman.
 // Datanya diambil dari query/logika ber-scope role di api.Server agar tidak ada
-// duplikasi SQL maupun aturan validasi antara endpoint JSON dan fragment.
+// duplikasi query maupun aturan validasi antara endpoint JSON dan fragment.
 type Partials struct {
 	server    *api.Server
 	templates *template.Template
@@ -353,10 +353,19 @@ func (p *Partials) enrollFace(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		errMessage = err.Error()
 	default:
-		if _, err := p.server.EnrollFace(ctx, nim, image, filename); err != nil {
+		if result, err := p.server.EnrollFace(ctx, nim, image, filename); err != nil {
 			switch {
 			case errors.Is(err, api.ErrStudentNotFound):
 				errMessage = "Mahasiswa tidak ditemukan."
+			case errors.Is(err, api.ErrInvalidImage):
+				errMessage = "Gambar tidak dapat dibaca; unggah foto JPEG/PNG yang valid."
+			case errors.Is(err, api.ErrNoFace):
+				errMessage = "Tidak ada wajah yang terdeteksi pada foto. Gunakan foto wajah yang jelas dan menghadap kamera."
+			case errors.Is(err, api.ErrMultipleFaces):
+				errMessage = "Foto berisi lebih dari satu wajah. Gunakan foto yang hanya berisi wajah mahasiswa tersebut."
+			case errors.Is(err, api.ErrFaceAlreadyEnrolled):
+				conflict, _ := result["conflictNim"].(string)
+				errMessage = fmt.Sprintf("Wajah ini sudah terdaftar atas NIM %s; enrollment dibatalkan.", conflict)
 			case errors.Is(err, api.ErrFaceService):
 				errMessage = "Enrollment gagal; pastikan service Python dan model wajah aktif."
 			default:

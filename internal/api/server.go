@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -9,16 +8,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"dash.algorithmics/internal/security"
+	"dash.algorithmics/internal/storage"
 	"dash.algorithmics/internal/store"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -30,12 +30,25 @@ type Config struct {
 	FaceServiceURL   string
 	FaceServiceToken string
 	DeviceToken      string
+	// SimThreshold adalah ambang cosine similarity ArcFace untuk menyatakan
+	// wajah cocok (FACE_SIM_THRESHOLD, default 0.45 = SIM_THRESHOLD face service).
+	SimThreshold float64
+	// FaceServiceTimeout membatasi lama satu panggilan ke face service.
+	FaceServiceTimeout time.Duration
+	// ImageStorage adalah koneksi S3 (Garage) untuk foto wajah; kosong =
+	// foto tidak disimpan.
+	ImageStorage storage.Config
+	// ImageRetentionDays: masa simpan foto scan berstatus Hadir (hari).
+	ImageRetentionDays int
+	// ImageReviewRetentionDays: masa simpan foto scan Perlu ditinjau/Ditolak.
+	ImageReviewRetentionDays int
 }
 
 type Server struct {
 	db     *store.Database
 	config Config
 	client *http.Client
+	images ImageStore
 }
 
 type principal struct {
@@ -67,13 +80,22 @@ type ScanEvent struct {
 	Confidence   float64
 	ReviewReason string
 	DeviceID     string
+	// ImageURL menunjuk foto scan di GET /api/v1/images/...; kosong bila
+	// foto tidak disimpan atau sudah melewati masa retensi.
+	ImageURL string
 }
 
 func New(db *store.Database, config Config) *Server {
+	if config.SimThreshold <= 0 || config.SimThreshold > 1 {
+		config.SimThreshold = 0.45
+	}
+	if config.FaceServiceTimeout <= 0 {
+		config.FaceServiceTimeout = 15 * time.Second
+	}
 	return &Server{
 		db:     db,
 		config: config,
-		client: &http.Client{Timeout: 8 * time.Second},
+		client: &http.Client{Timeout: config.FaceServiceTimeout},
 	}
 }
 
@@ -84,7 +106,8 @@ func (s *Server) StaffHandler() http.Handler {
 	mux.HandleFunc("GET /api/v1/reports", s.reports)
 	mux.HandleFunc("POST /api/v1/students", s.createStudent)
 	mux.HandleFunc("POST /api/v1/students/{nim}/face-template", s.enrollFace)
-	return securityHeaders(mux)
+	mux.HandleFunc("GET /api/v1/images/{key...}", s.serveImage)
+	return mux
 }
 
 func (s *Server) DeviceHandler() http.Handler {
@@ -93,21 +116,11 @@ func (s *Server) DeviceHandler() http.Handler {
 	mux.HandleFunc("GET /api/v1/devices/ping", s.devicePing)
 	mux.HandleFunc("POST /api/v1/devices/ping", s.devicePing)
 	mux.HandleFunc("POST /api/v1/scans", s.receiveScan)
-	return securityHeaders(mux)
+	return mux
 }
 
 func (s *Server) StaticHandler(staticDir string) http.Handler {
-	return securityHeaders(http.StripPrefix("/static/", http.FileServer(http.Dir(staticDir))))
-}
-
-func (s *Server) Handler(staticDir string) http.Handler {
-	mux := http.NewServeMux()
-	mux.Handle("/api/v1/scans", s.DeviceHandler())
-	mux.Handle("/api/v1/health", s.DeviceHandler())
-	mux.Handle("/api/v1/devices/", s.DeviceHandler())
-	mux.Handle("/api/v1/", s.StaffHandler())
-	mux.Handle("/static/", s.StaticHandler(staticDir))
-	return mux
+	return http.StripPrefix("/static/", http.FileServer(http.Dir(staticDir)))
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -436,6 +449,10 @@ func (s *Server) AllScanEvents(ctx context.Context, role string, roleClasses []s
 		filter["status"] = statusFilter
 	}
 	if classFilter != "" && classFilter != "all" {
+		classFilter = strings.ToUpper(classFilter)
+		if role == "dosen" && !slices.Contains(roleClasses, classFilter) {
+			return []ScanEvent{}, nil
+		}
 		filter["class_id"] = classFilter
 	}
 
@@ -484,6 +501,7 @@ func (s *Server) fetchScanEvents(ctx context.Context, filter bson.M, limit int64
 		Status       string  `bson:"status"`
 		Confidence   float64 `bson:"confidence"`
 		ReviewReason string  `bson:"review_reason"`
+		ImageKey     string  `bson:"image_key"`
 	}
 	var docs []rawScanDoc
 	if err := cur.All(ctx, &docs); err != nil {
@@ -563,6 +581,7 @@ func (s *Server) fetchScanEvents(ctx context.Context, filter bson.M, limit int64
 			Confidence:   doc.Confidence,
 			ReviewReason: doc.ReviewReason,
 			DeviceID:     doc.DeviceID,
+			ImageURL:     ImageURL(doc.ImageKey),
 		})
 	}
 	return result, nil
@@ -609,6 +628,7 @@ func scanEventsToMaps(events []ScanEvent) []map[string]any {
 			"confidence":   event.Confidence,
 			"reviewReason": event.ReviewReason,
 			"deviceId":     event.DeviceID,
+			"imageUrl":     event.ImageURL,
 		})
 	}
 	return result
@@ -683,7 +703,10 @@ func (s *Server) CreateStudent(ctx context.Context, name, nim, classID string) (
 	return id, nil
 }
 
-// EnrollFace mengirim gambar ke layanan verifikasi wajah untuk NIM tertentu.
+// EnrollFace mendeteksi wajah pada foto lewat face service (POST /detect),
+// lalu menyimpan embedding-nya sebagai template mahasiswa dengan NIM tersebut.
+// Error yang mungkin: ErrStudentNotFound, ErrInvalidImage, ErrNoFace,
+// ErrMultipleFaces, ErrFaceAlreadyEnrolled (map berisi conflictNim), ErrFaceService.
 func (s *Server) EnrollFace(ctx context.Context, nim string, image []byte, filename string) (map[string]any, error) {
 	nim = strings.ToUpper(strings.TrimSpace(nim))
 	var student struct {
@@ -693,11 +716,29 @@ func (s *Server) EnrollFace(ctx context.Context, nim string, image []byte, filen
 	if err != nil {
 		return nil, ErrStudentNotFound
 	}
-	var response map[string]any
-	if err := s.callFaceService(ctx, "/enroll", map[string]string{"student_id": student.ID}, "image", filename, image, &response); err != nil {
-		return nil, ErrFaceService
+	result, err := s.enrollEmbedding(ctx, student.ID, image, filename)
+	if errors.Is(err, ErrFaceAlreadyEnrolled) {
+		if otherID, ok := result["conflictStudentId"].(string); ok {
+			var other struct {
+				NIM string `bson:"nim"`
+			}
+			if s.db.Collection("students").FindOne(ctx, bson.M{"_id": otherID}).Decode(&other) == nil {
+				result["conflictNim"] = other.NIM
+			}
+		}
+		return result, err
 	}
-	return response, nil
+	if err != nil {
+		return nil, err
+	}
+	if s.images != nil {
+		key := s.storeEnrollmentImage(ctx, student.ID, image)
+		result["imageStored"] = key != ""
+		if key != "" {
+			result["imageUrl"] = ImageURL(key)
+		}
+	}
+	return result, nil
 }
 
 // ReadImagePart membaca file gambar (maks 8 MB) dari field multipart "image",
@@ -999,6 +1040,15 @@ func (s *Server) enrollFace(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, ErrStudentNotFound):
 			writeError(w, http.StatusNotFound, "student_not_found", "Mahasiswa tidak ditemukan.")
+		case errors.Is(err, ErrInvalidImage):
+			writeError(w, http.StatusBadRequest, "invalid_image", "Gambar tidak dapat dibaca; kirim JPEG/PNG yang valid.")
+		case errors.Is(err, ErrNoFace):
+			writeError(w, http.StatusUnprocessableEntity, "no_face", "Tidak ada wajah yang terdeteksi pada foto.")
+		case errors.Is(err, ErrMultipleFaces):
+			writeError(w, http.StatusUnprocessableEntity, "multiple_faces", "Foto enrollment harus berisi tepat satu wajah.")
+		case errors.Is(err, ErrFaceAlreadyEnrolled):
+			conflict, _ := response["conflictNim"].(string)
+			writeError(w, http.StatusConflict, "face_already_enrolled", "Wajah ini sudah terdaftar atas NIM "+conflict+".")
 		case errors.Is(err, ErrFaceService):
 			writeError(w, http.StatusBadGateway, "face_service_error", "Enrollment gagal; pastikan service Python dan model wajah aktif.")
 		default:
@@ -1032,6 +1082,7 @@ func (s *Server) receiveScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "stale_capture", "captured_at wajib RFC3339 dan berjarak maksimal 5 menit dari waktu server.")
 		return
 	}
+	livenessPassed := livenessRaw == "true"
 	if livenessRaw != "true" && livenessRaw != "false" {
 		writeError(w, http.StatusBadRequest, "invalid_liveness", "liveness_passed wajib bernilai true atau false.")
 		return
@@ -1051,14 +1102,16 @@ func (s *Server) receiveScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	scannedAt := capturedAt.UTC()
-	var verification struct {
-		Verified   bool    `json:"verified"`
-		StudentID  string  `json:"studentId"`
-		Confidence float64 `json:"confidence"`
-		Reason     string  `json:"reason"`
-	}
-	if err = s.callFaceService(r.Context(), "/verify", map[string]string{"class_id": classID}, "image", filename, image, &verification); err != nil {
-		writeError(w, http.StatusBadGateway, "face_service_error", "Verifikasi tidak tersedia; scan tidak dicatat sebagai hadir.")
+	verification, err := s.verifyCapture(r.Context(), image, filename)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrInvalidImage):
+			writeError(w, http.StatusBadRequest, "invalid_image", "Gambar tidak dapat dibaca; kirim JPEG/PNG yang valid.")
+		case errors.Is(err, ErrFaceService):
+			writeError(w, http.StatusBadGateway, "face_service_error", "Verifikasi tidak tersedia; scan tidak dicatat sebagai hadir.")
+		default:
+			writeError(w, http.StatusInternalServerError, "database_error", "Gagal memuat template wajah.")
+		}
 		return
 	}
 	studentID := verification.StudentID
@@ -1074,7 +1127,7 @@ func (s *Server) receiveScan(w http.ResponseWriter, r *http.Request) {
 		if enrolled == 0 {
 			status = "Perlu ditinjau"
 			reason = "Mahasiswa terverifikasi tetapi bukan anggota kelas pada perangkat."
-		} else if !strings.EqualFold(r.FormValue("liveness_passed"), "true") {
+		} else if !livenessPassed {
 			status = "Perlu ditinjau"
 			reason = "Cocok wajah; bukti liveness belum tersedia atau tidak lolos."
 		} else {
@@ -1082,17 +1135,24 @@ func (s *Server) receiveScan(w http.ResponseWriter, r *http.Request) {
 			reason = ""
 		}
 	}
-	_, err = s.db.Collection("scan_events").InsertOne(r.Context(), bson.M{
+	event := bson.M{
 		"student_id":      studentID,
 		"class_id":        classID,
 		"device_id":       deviceID,
 		"scanned_at":      scannedAt.Format(time.RFC3339),
 		"face_verified":   faceVerified,
-		"liveness_passed": strings.EqualFold(r.FormValue("liveness_passed"), "true"),
+		"liveness_passed": livenessPassed,
 		"confidence":      verification.Confidence,
 		"status":          status,
 		"review_reason":   reason,
-	})
+	}
+	if s.images != nil {
+		ext, contentType := imageExtension(image)
+		if key := s.uploadImage(r.Context(), scanImageKey(deviceID, scannedAt, ext), contentType, image); key != "" {
+			event["image_key"] = key
+		}
+	}
+	_, err = s.db.Collection("scan_events").InsertOne(r.Context(), event)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", "Gagal menyimpan event scan.")
 		return
@@ -1170,29 +1230,48 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 	face := s.faceHealth(r.Context())
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "faceVerification": face})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "faceVerification": face, "imageStorage": s.imageStorageHealth(r.Context())})
 }
 
+// faceHealth membaca GET /health face service (services/face/api.py), yang
+// mengembalikan {"status": "ok"|"initializing", "model_loaded": bool,
+// "det_model": "...", "rec_model": "..."}.
 func (s *Server) faceHealth(ctx context.Context) map[string]any {
+	offline := map[string]any{"online": false, "provider": "Python face service"}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(s.config.FaceServiceURL, "/")+"/health", nil)
 	if err != nil {
-		return map[string]any{"online": false, "provider": "Python service"}
+		return offline
 	}
 	if s.config.FaceServiceToken != "" {
 		request.Header.Set("Authorization", "Bearer "+s.config.FaceServiceToken)
 	}
 	response, err := s.client.Do(request)
 	if err != nil {
-		return map[string]any{"online": false, "provider": "Python service"}
+		return offline
 	}
 	defer response.Body.Close()
 	var data struct {
-		ModelReady bool `json:"modelReady"`
+		Status      string `json:"status"`
+		ModelLoaded bool   `json:"model_loaded"`
+		DetModel    string `json:"det_model"`
+		RecModel    string `json:"rec_model"`
 	}
 	if response.StatusCode != http.StatusOK || json.NewDecoder(response.Body).Decode(&data) != nil {
-		return map[string]any{"online": false, "provider": "Python service"}
+		return offline
 	}
-	return map[string]any{"online": data.ModelReady, "provider": "Python face_recognition"}
+	result := map[string]any{
+		"online":   data.ModelLoaded,
+		"provider": "Python YOLO-FaceV2 + ArcFace",
+	}
+	if data.DetModel != "" {
+		result["detectionModel"] = data.DetModel
+	}
+	if data.RecModel != "" {
+		result["recognitionModel"] = data.RecModel
+	}
+	return result
 }
 
 func (s *Server) lastDeviceSeen(ctx context.Context) (*time.Time, error) {
@@ -1246,44 +1325,6 @@ func (s *Server) validScanSignature(r *http.Request, deviceID, classID, captured
 	return hmac.Equal([]byte(provided), []byte(expected))
 }
 
-func (s *Server) callFaceService(ctx context.Context, endpoint string, fields map[string]string, fileField, filename string, image []byte, output any) error {
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	for key, value := range fields {
-		if err := writer.WriteField(key, value); err != nil {
-			return err
-		}
-	}
-	part, err := writer.CreateFormFile(fileField, filename)
-	if err != nil {
-		return err
-	}
-	if _, err = part.Write(image); err != nil {
-		return err
-	}
-	if err = writer.Close(); err != nil {
-		return err
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.config.FaceServiceURL, "/")+endpoint, &body)
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Content-Type", writer.FormDataContentType())
-	if s.config.FaceServiceToken != "" {
-		request.Header.Set("Authorization", "Bearer "+s.config.FaceServiceToken)
-	}
-	response, err := s.client.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		message, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
-		return fmt.Errorf("face service returned %d: %s", response.StatusCode, strings.TrimSpace(string(message)))
-	}
-	return json.NewDecoder(response.Body).Decode(output)
-}
-
 func readImagePart(w http.ResponseWriter, r *http.Request) ([]byte, string, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<20)
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
@@ -1316,22 +1357,6 @@ func secureEqual(actual, expected string) bool {
 	return subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) == 1
 }
 
-func placeholders(count int) string {
-	items := make([]string, count)
-	for index := range items {
-		items[index] = "?"
-	}
-	return strings.Join(items, ",")
-}
-
-func stringArgs(values []string) []any {
-	args := make([]any, 0, len(values))
-	for _, value := range values {
-		args = append(args, value)
-	}
-	return args
-}
-
 func formatTime(value *time.Time) string {
 	if value == nil {
 		return ""
@@ -1349,22 +1374,32 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
 }
 
-func securityHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Referrer-Policy", "same-origin")
-		w.Header().Set("Cache-Control", "no-store")
-		next.ServeHTTP(w, r)
-	})
-}
-
 func ParseConfig() Config {
 	return Config{
-		Environment:      env("APP_ENV", "development"),
-		FaceServiceURL:   env("FACE_SERVICE_URL", "http://127.0.0.1:8001"),
-		FaceServiceToken: os.Getenv("FACE_SERVICE_TOKEN"),
-		DeviceToken:      os.Getenv("DEVICE_TOKEN"),
+		Environment:        env("APP_ENV", "development"),
+		FaceServiceURL:     env("FACE_SERVICE_URL", "http://127.0.0.1:8000"),
+		FaceServiceToken:   os.Getenv("FACE_SERVICE_TOKEN"),
+		DeviceToken:        os.Getenv("DEVICE_TOKEN"),
+		SimThreshold:       envFloat("FACE_SIM_THRESHOLD", 0.45),
+		FaceServiceTimeout: time.Duration(envFloat("FACE_SERVICE_TIMEOUT_SECONDS", 15) * float64(time.Second)),
+		ImageStorage: storage.Config{
+			Endpoint:        strings.TrimSpace(os.Getenv("S3_ENDPOINT")),
+			Region:          env("S3_REGION", "garage"),
+			Bucket:          strings.TrimSpace(os.Getenv("S3_BUCKET")),
+			AccessKeyID:     strings.TrimSpace(os.Getenv("S3_ACCESS_KEY_ID")),
+			SecretAccessKey: strings.TrimSpace(os.Getenv("S3_SECRET_ACCESS_KEY")),
+		},
+		ImageRetentionDays:       int(envFloat("IMAGE_RETENTION_DAYS", 30)),
+		ImageReviewRetentionDays: int(envFloat("IMAGE_REVIEW_RETENTION_DAYS", 90)),
 	}
+}
+
+func envFloat(key string, fallback float64) float64 {
+	value, err := strconv.ParseFloat(strings.TrimSpace(os.Getenv(key)), 64)
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 func env(key, fallback string) string {

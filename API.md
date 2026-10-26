@@ -18,6 +18,7 @@ Python bersifat internal di belakang Go (kontraknya di
 | Fragment | `GET/POST /partials/*` (§5) | session staf (+ CSRF untuk POST) | HTML |
 | API staf | `GET /api/v1/dashboard`, `/classes`, `/reports` | session staf | JSON |
 | API staf | `POST /api/v1/students`, `/students/{nim}/face-template` | session administrator + CSRF | JSON |
+| API staf | `GET /api/v1/images/{key...}` | session staf (dosen: hanya kelasnya) | gambar |
 | Perangkat | `POST /api/v1/scans` | bearer `DEVICE_TOKEN` + HMAC + timestamp | JSON |
 | Perangkat | `GET\|POST /api/v1/devices/ping` | bearer `DEVICE_TOKEN` (hanya production) | JSON |
 | Publik | `GET /api/v1/health` | — | JSON |
@@ -69,6 +70,8 @@ Semua error dari `/api/v1/*` berbentuk:
 | 400 | `invalid_class`, `unknown_class` | kelas tidak ada |
 | 409 | `student_exists` | NIM sudah terdaftar |
 | 404 | `student_not_found` | NIM tidak ditemukan saat enrollment |
+| 422 | `no_face`, `multiple_faces` | foto enrollment tidak berisi tepat satu wajah |
+| 409 | `face_already_enrolled` | wajah pada foto enrollment sudah terdaftar atas NIM lain |
 | 400 | `invalid_image` | bukan multipart, field `image` hilang, kosong, atau > 8 MiB |
 | 401 | `invalid_device` | bearer token perangkat salah (scan) |
 | 401 | `invalid_token` | bearer token perangkat salah (ping, production) |
@@ -84,13 +87,24 @@ Semua error dari `/api/v1/*` berbentuk:
 ### `GET /api/v1/health` — publik
 
 ```json
-{ "status": "ok", "faceVerification": { "online": false, "provider": "Python service" } }
+{
+  "status": "ok",
+  "faceVerification": {
+    "online": true,
+    "provider": "Python YOLO-FaceV2 + ArcFace",
+    "detectionModel": "face_detection/yolo-facev2s.onnx",
+    "recognitionModel": "face_recognition/arcface_r50_fp16.onnx"
+  },
+  "imageStorage": { "enabled": true, "online": true }
+}
 ```
 
-`faceVerification.online` = face service menjawab `GET /health` dengan
-`200` dan `modelReady: true`. `provider` bernilai `Python face_recognition`
-bila service menjawab `200` dengan JSON valid, dan `Python service` bila
-tidak terjangkau. Opsional `?device_id=<id>` memperbarui `devices.last_seen`
+`imageStorage.enabled` = `S3_*` terisi; `online` = `HEAD` bucket berhasil
+dalam 3 detik.
+
+`faceVerification.online` = face service menjawab `GET /health` dalam
+3 detik dengan `200` dan `model_loaded: true`. Bila tidak terjangkau:
+`{"online": false, "provider": "Python face service"}`. Opsional `?device_id=<id>` memperbarui `devices.last_seen`
 (upsert, **tanpa token** — lihat catatan keamanan di `docs/devices.md` §5).
 
 ### `GET /api/v1/dashboard` — staf
@@ -184,15 +198,28 @@ Error: `400 invalid_json | missing_fields | invalid_class`, `409 student_exists`
 
 ### `POST /api/v1/students/{nim}/face-template` — administrator + CSRF
 
-`multipart/form-data` dengan file `image` (≤ 8 MiB). Go meneruskan ke
-face service `POST /enroll` dengan `student_id` = `_id` mahasiswa. Respons
-`201`:
+`multipart/form-data` dengan file `image` (≤ 8 MiB). Go mengirim foto ke
+face service `POST /detect`, mewajibkan tepat satu wajah, menolak wajah yang
+sudah terdaftar atas NIM lain, lalu menyimpan embedding 512-d ke
+`face_templates` (enrollment ulang menimpa template lama). Respons `201`:
 
 ```json
-{ "nim": "IK24001", "faceEnrolled": true, "result": { "…": "body dari face service" } }
+{
+  "nim": "IK24001",
+  "faceEnrolled": true,
+  "result": {
+    "studentId": "student-ik24001", "dimension": 512, "detectionConfidence": 0.93, "processingTimeMs": 85.4,
+    "imageStored": true, "imageUrl": "/api/v1/images/enroll/student-ik24001/20261026T060000Z-3f9a1c2b4d5e.jpg"
+  }
+}
 ```
 
-Error: `400 invalid_image`, `404 student_not_found`, `502 face_service_error`.
+`imageStored`/`imageUrl` hanya muncul bila penyimpanan foto aktif. Gagal
+menyimpan foto (Garage mati) **tidak** menggagalkan enrollment:
+`imageStored: false`, template tetap tersimpan.
+
+Error: `400 invalid_image`, `404 student_not_found`, `422 no_face`,
+`422 multiple_faces`, `409 face_already_enrolled`, `502 face_service_error`.
 
 ### `POST /api/v1/scans` — perangkat
 
@@ -214,13 +241,16 @@ Pesan HMAC = enam baris digabung `\n`, kunci = `DEVICE_TOKEN`:
 
 Urutan validasi: token → gambar → field wajib → `captured_at` (±5 menit) →
 `liveness_passed` → HMAC & `X-Device-Timestamp` (±2 menit) → perangkat
-terdaftar → kelas ada → face service `/verify`.
+terdaftar → kelas ada → face service `POST /detect` → pencocokan cosine
+similarity di Go terhadap seluruh `face_templates` (ambang
+`FACE_SIM_THRESHOLD`, default 0.45). `confidence` pada respons = skor
+kemiripan terbaik.
 
 Penentuan status:
 
 | Kondisi | `status` | `reviewReason` |
 | --- | --- | --- |
-| tidak cocok / tidak ada kandidat | `Ditolak` | `reason` dari face service |
+| tidak ada wajah / kemiripan < ambang / belum ada template | `Ditolak` | alasan dari Go, mis. "Wajah tidak cocok … (kemiripan 0.31 < 0.45)" |
 | cocok, bukan anggota `class_id` | `Perlu ditinjau` | Mahasiswa terverifikasi tetapi bukan anggota kelas pada perangkat. |
 | cocok, anggota kelas, `liveness_passed=false` | `Perlu ditinjau` | Cocok wajah; bukti liveness belum tersedia atau tidak lolos. |
 | cocok, anggota kelas, `liveness_passed=true` | `Hadir` | — |
@@ -240,6 +270,20 @@ Event disimpan ke `scan_events` dan `devices.last_seen` diperbarui. Respons
 
 `student` bernilai `null` bila wajah tidak cocok. Bila face service gagal,
 respons `502` dan **tidak ada** event yang dicatat.
+
+Bila penyimpanan foto aktif, capture diunggah ke Garage (batas 3 detik)
+sebelum event disimpan, dan kuncinya dicatat di `scan_events.image_key`.
+Gagal unggah hanya dicatat di log; event tetap disimpan tanpa foto.
+
+### `GET /api/v1/images/{key...}` — staf
+
+Mengalirkan foto enrollment (`enroll/...`) atau scan (`scans/...`) dari
+Garage lewat Go; browser tidak pernah mengakses Garage langsung. Kunci harus
+tercatat di `face_templates.image_key` atau `scan_events.image_key`.
+Administrator boleh melihat semua foto; dosen hanya foto dari kelasnya.
+Error: `401`, `403 forbidden`, `404 image_not_found` (termasuk foto yang sudah
+dihapus karena retensi), `404 image_storage_disabled`, `502 image_storage_error`.
+Halaman **Log** menampilkan tautan "Lihat" pada kolom Foto.
 
 Penting: `liveness_passed` adalah klaim perangkat yang ditandatangani, bukan
 deteksi biologis. HMAC melindungi integritas pesan, bukan membuktikan bahwa
@@ -306,9 +350,11 @@ ditugaskan melihat data kosong.
 
 ## 7. Privasi biometrik
 
-- Jangan kirim gambar atau template wajah ke browser; halaman hanya menerima
-  label status.
-- Gambar enrollment/scan hanya diteruskan sementara ke face service; yang
-  disimpan adalah embedding di `face_templates`.
+- Template wajah (embedding) tidak pernah dikirim ke browser.
+- Foto enrollment dan scan disimpan di bucket Garage privat bila `S3_*`
+  diisi, dan hanya bisa dilihat staf lewat `GET /api/v1/images/...` dengan
+  pembatasan kelas. Foto scan dihapus otomatis setelah
+  `IMAGE_RETENTION_DAYS` (Hadir) / `IMAGE_REVIEW_RETENTION_DAYS` (lainnya);
+  foto enrollment lama dihapus saat enrollment ulang.
 - Lindungi template dengan kontrol akses ketat, enkripsi backup, retensi
   terbatas, serta prosedur persetujuan dan penghapusan.

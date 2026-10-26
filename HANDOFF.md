@@ -2,15 +2,19 @@
 
 Dokumen ini adalah titik awal untuk AI/engineer berikutnya. Baca dokumen ini lebih dulu agar tidak perlu memetakan seluruh repository sebelum melanjutkan pekerjaan. Nama produk pada UI: **Algorithmics Face Recognation**; nama institusi/workspace: **Institut Teknologi Bacharuddin Jusuf Habibie (ITBJH)**.
 
-Status dokumen: diperbarui **21 Oktober 2026** — dokumentasi diselaraskan dengan kode setelah migrasi **SQLite → MongoDB**, penambahan halaman **Log pemindaian** (`/logs`), endpoint **heartbeat perangkat** (`/api/v1/devices/ping`), dan firmware **ESP8266**. Dokumen baru: `docs/database.md`, `docs/devices.md`, `docs/face-service.md`, dan `.env.example`.
+Status dokumen: diperbarui **26 Oktober 2026 (sore)** — penyimpanan foto wajah opsional di object storage S3 (**Garage**, `internal/storage/s3.go` + `internal/api/images.go`) dengan retensi otomatis dan tampilan foto di halaman Log; bug scoping filter kelas di `AllScanEvents` diperbaiki; code cleaning (fungsi mati dan pembungkus header keamanan ganda dihapus).
+
+Pembaruan 26 Oktober 2026 (pagi) — face service Python (`services/face/`, YOLO-FaceV2 + ArcFace) dihubungkan ke backend Go: Go memanggil `POST /detect`, menyimpan embedding di MongoDB, dan melakukan pencocokan cosine sendiri (`internal/api/face.go`), sehingga Go menjadi satu-satunya API untuk dashboard dan ESP32.
+
+Pembaruan 21 Oktober 2026 — dokumentasi diselaraskan dengan kode setelah migrasi **SQLite → MongoDB**, penambahan halaman **Log pemindaian** (`/logs`), endpoint **heartbeat perangkat** (`/api/v1/devices/ping`), dan firmware **ESP8266**. Dokumen baru: `docs/database.md`, `docs/devices.md`, `docs/face-service.md`, dan `.env.example`.
 
 Riwayat sebelumnya: 18 Oktober 2026 — penyelarasan nama produk dan pembaruan UI login/navigasi; code cleaning (seluruh `*_test.go` dihapus, kredensial demo dibersihkan), diverifikasi dengan `go vet ./...`.
 
-Repository Git: `github.com:soulightric/methics` (branch `main`). Modul Go: `dash.algorithmics`. Beberapa berkas terbaru **belum di-commit**, termasuk `README.md`, `devices/`, `views/pages/logs.html`, `views/fragments/logs.html`, dan `views/fragments/mahasiswa_form.html` — periksa `git status` sebelum melanjutkan.
+Repository Git: `github.com:soulightric/methics` (branch `main`). Modul Go: `dash.algorithmics`. Periksa `git status` sebelum melanjutkan.
 
 ## Ringkasan Produk
 
-**Algorithmics Face Recognation** adalah sistem absensi mahasiswa berbasis scan wajah untuk ITBJH. Perangkat ESP32-CAM mengirim capture ke backend Go. Go meneruskan capture ke face service Python untuk pencocokan template wajah, memvalidasi hasil, lalu mencatat event absensi di **MongoDB**.
+**Algorithmics Face Recognation** adalah sistem absensi mahasiswa berbasis scan wajah untuk ITBJH. Perangkat ESP32-CAM mengirim capture ke backend Go. Go meminta embedding wajah dari face service Python, mencocokkannya dengan template di **MongoDB**, lalu mencatat event absensi. Foto capture dan foto enrollment dapat disimpan di bucket **Garage** (S3) untuk peninjauan dan audit.
 
 Tiga kelas seed:
 
@@ -26,23 +30,24 @@ Sudah berjalan:
 
 - Halaman server-rendered: `/`, `/mahasiswa`, `/kelas`, `/laporan`, `/logs`, `/akses`, plus `/login`.
 - Login staf dengan bcrypt, session SCS, CSRF, rate limit login, security headers/CSP, panic recovery.
-- Otorisasi berbasis role dari session + pembatasan data dosen ke `users.class_ids` pada semua halaman dan API staf (dengan satu bug pada filter kelas halaman log — lihat Batasan no. 1).
-- API dashboard, kelas, laporan; pendaftaran mahasiswa; proxy enrollment wajah ke Python.
+- Otorisasi berbasis role dari session + pembatasan data dosen ke `users.class_ids` pada semua halaman dan API staf (termasuk filter kelas halaman log dan endpoint foto).
+- API dashboard, kelas, laporan; pendaftaran mahasiswa; enrollment wajah (Python `/detect` → embedding disimpan Go).
 - Endpoint scan perangkat dengan bearer device token, HMAC-SHA256, timestamp, batas ukuran gambar, dan pencatatan status `Hadir`/`Perlu ditinjau`/`Ditolak`.
 - Heartbeat perangkat `GET|POST /api/v1/devices/ping` + firmware ESP8266 (`devices/esp8266/esp8266_ping/`) untuk status "Terhubung" di dashboard.
 - Halaman Log pemindaian (`/logs`): 200 event terbaru seluruh waktu, filter status/kelas/pencarian di server, ringkasan seluruh waktu.
 - MongoDB: koneksi, index, seed kelas/mahasiswa/perangkat, store akun staf.
+- Penyimpanan foto wajah di Garage (opsional, `S3_*`): foto enrollment (`enroll/…`) dan capture scan (`scans/…`), endpoint `GET /api/v1/images/{key...}` ber-otorisasi, kolom **Foto** di halaman Log, job retensi tiap jam, status di `/api/v1/health`.
 
 Belum ada / masih terbatas:
 
-- **Face service Python tidak ada di repo.** `services/face/` hanya berisi `README..txt` (placeholder). Kontrak dan kerangka implementasi ada di `docs/face-service.md`. Tanpa service ini, enrollment dan scan selalu gagal dengan `502 face_service_error`.
 - **Firmware kamera ESP32-CAM** untuk `POST /api/v1/scans` belum ada; yang ada hanya heartbeat ESP8266.
 - UI/API manajemen akun staf dan penugasan kelas (halaman `/akses` masih matriks statis).
 - CRUD kelas dan perangkat; opsi filter kelas di `views/pages/mahasiswa.html` dan `views/pages/logs.html` masih hardcoded `IK24-A`/`IK24-B`/`IK24-C`.
 - Rotasi/revokasi token per perangkat dan audit enrollment.
 - Liveness detection nyata.
+- Foto enrollment belum ditampilkan di UI (tersimpan, bisa dibuka lewat `GET /api/v1/images/enroll/...`); enrollment ulang otomatis dari foto tersimpan belum ada.
 - Session store dan login limiter masih in-memory (tidak cocok untuk multi-instance tanpa perubahan).
-- Test otomatis.
+- Test yang membutuhkan MongoDB (unit test saat ini hanya untuk face service, pencocokan, foto, dan klien S3).
 
 ## Arsitektur MVC
 
@@ -58,11 +63,12 @@ Go server-rendered memakai `html/template`:
 - **API/controller aplikasi dan integrasi:** `internal/api/server.go`
 - **Session, CSRF, principal dan security middleware:** `internal/security/middleware.go`
 - **Login/logout controller:** `internal/controller/auth.go`
+- **Foto wajah (S3 Garage):** `internal/api/images.go` (unggah, otorisasi, retensi) dan `internal/storage/s3.go` (klien S3 SigV4, pustaka standar)
 - **Koneksi MongoDB, index, seed:** `internal/store/database.go`
 - **Akun staf, bcrypt, bootstrap helpers:** `internal/store/users.go`
 - **Firmware perangkat:** `devices/esp8266/esp8266_ping/esp8266_ping.ino`
-- **Python verifier:** belum ada (`services/face/`, lihat `docs/face-service.md`)
-- **Test Go:** tidak ada saat ini
+- **Face service Python:** `services/face/` (FastAPI stateless, YOLO-FaceV2 + ArcFace 512-d); klien & pencocokan di Go: `internal/api/face.go` (lihat `docs/face-service.md`)
+- **Test Go:** `internal/api/face_test.go`, `internal/api/images_test.go`, `internal/storage/s3_test.go` (tanpa MongoDB)
 
 Route halaman dan fragment:
 
@@ -70,7 +76,7 @@ Route halaman dan fragment:
 - `GET /mahasiswa`: roster, pendaftaran mahasiswa, dan enrollment wajah. Tombol daftar/enroll hanya dirender untuk administrator; data tetap dibatasi role oleh API.
 - `GET /kelas`: ringkasan kehadiran dan enrollment per kelas. Dosen hanya menerima kelas yang ditugaskan.
 - `GET /laporan`: rekap status scan, kehadiran per kelas, dan riwayat scan. Dibatasi role.
-- `GET /logs`: log pemindaian seluruh waktu dengan filter status, kelas, dan pencarian. Dibatasi role.
+- `GET /logs`: log pemindaian seluruh waktu dengan filter status, kelas, dan pencarian, plus tautan foto capture. Dibatasi role.
 - `GET /akses`: matriks hak akses. Administrator saja; dosen dialihkan ke `/`.
 - `GET /static/*`: CSS/JS statis.
 - `GET /partials/dashboard|kelas|laporan|mahasiswa|logs`, `GET /partials/mahasiswa/form`, `POST /partials/mahasiswa/students`, `POST /partials/mahasiswa/{nim}/face-template`: fragment htmx (detail di `API.md` §5).
@@ -97,34 +103,38 @@ Keputusan frontend: **tetap Go server-rendered (bukan SPA framework)** dan adops
 5. CSRF middleware (`itbjh_csrf`) melindungi semua POST staf; form memakai `csrf_token`, request htmx mengirim `X-CSRF-Token`. Login dilimit 10 percobaan per IP per 5 menit. Security headers/CSP dan panic recovery membungkus server.
 6. Halaman memuat & menyegarkan datanya lewat htmx dari `/partials/*` yang dirender server dari query ber-scope role. Dosen dibatasi ke `users.class_ids`; administrator melihat semua.
 7. Administrator mendaftarkan mahasiswa dan mengirim foto enrollment lewat UI htmx; controller memakai domain method yang sama dengan endpoint JSON `POST /api/v1/students` dan `POST /api/v1/students/{nim}/face-template`.
-8. Go meneruskan foto enrollment ke Python `/enroll` (`student_id` + `image`). Python seharusnya mendeteksi tepat satu wajah, membuat encoding 128 dimensi, dan menyimpannya ke koleksi `face_templates`; gambar mentah tidak disimpan.
+8. Go mengirim foto enrollment ke Python `POST /detect`. Go mewajibkan tepat satu wajah, menolak wajah yang sudah terdaftar atas NIM lain (cosine ≥ `FACE_SIM_THRESHOLD`), lalu menyimpan embedding ArcFace 512-d ke koleksi `face_templates`. Bila `S3_*` diisi, foto enrollment disimpan ke Garage (`face_templates.image_key`); foto lama dihapus saat enrollment ulang.
 9. Perangkat mengirim heartbeat ke `/api/v1/devices/ping` (memperbarui `devices.last_seen`) dan scan ke `POST /api/v1/scans` memakai bearer device token, timestamp, HMAC signature, metadata kelas/perangkat/liveness, dan file gambar. Route perangkat terpisah dan tidak memakai session/CSRF browser.
-10. Go memvalidasi token, gambar, field, `captured_at`, HMAC/timestamp, perangkat, dan kelas; lalu meneruskan gambar ke Python `/verify` (`class_id` + `image`).
-11. Python mengembalikan `verified`, `studentId`, `confidence`, `reason`. Go memeriksa keanggotaan kelas (`students.class_id`). Event tersimpan di `scan_events`; status `Hadir` hanya jika cocok, anggota kelas, dan flag liveness true. Flag liveness belum merupakan deteksi biologis.
+10. Go memvalidasi token, gambar, field, `captured_at`, HMAC/timestamp, perangkat, dan kelas; lalu mengirim gambar ke Python `POST /detect` untuk mendapatkan embedding wajah.
+11. Python mengembalikan wajah terdeteksi beserta embedding-nya. Go memilih wajah dengan confidence tertinggi, menghitung cosine similarity ke semua `face_templates`, lalu memeriksa keanggotaan kelas (`students.class_id`). Status `Hadir` hanya jika cocok (≥ ambang), anggota kelas, dan flag liveness true. Flag liveness belum merupakan deteksi biologis.
+12. Bila `S3_*` diisi, capture diunggah ke Garage (batas 3 detik) dan kuncinya disimpan di `scan_events.image_key`; gagal unggah tidak menggagalkan scan. Job retensi menghapus foto scan setelah `IMAGE_RETENTION_DAYS` (Hadir, default 30) atau `IMAGE_REVIEW_RETENTION_DAYS` (lainnya, default 90).
 
 Diagram ringkas:
 
 ```text
 Browser -> Go SSR pages (htmx /partials/*) + /api/v1
 ESP8266 -> Go /api/v1/devices/ping -> MongoDB devices.last_seen
-ESP32   -> Go /api/v1/scans -> Python /verify -> MongoDB face_templates
-                            -> MongoDB scan_events
+ESP32   -> Go /api/v1/scans -> Python /detect (embedding) -> Go cosine vs MongoDB face_templates
+                            -> Garage scans/... (opsional) -> MongoDB scan_events (+ image_key)
 Administrator -> Go /partials/mahasiswa/students -> MongoDB students
-Administrator -> Go face-template -> Python /enroll -> MongoDB face_templates
+Administrator -> Go face-template -> Python /detect -> Go simpan embedding -> MongoDB face_templates
+                                  -> Garage enroll/... (opsional)
+Staf -> Go /api/v1/images/{key} (cek role/kelas) -> Garage
 ```
 
 ## Kontrak API Penting
 
 Detail lengkap ada di `API.md`. Ringkasan:
 
-- `GET /api/v1/health`: publik; status backend dan Python. `faceVerification.online` hanya true bila Python `/health` mengembalikan `modelReady: true`. Query opsional `device_id` memperbarui `last_seen` perangkat (tanpa token).
+- `GET /api/v1/health`: publik; status backend, Python, dan penyimpanan foto. `faceVerification.online` hanya true bila Python `/health` menjawab dalam 3 detik dengan `model_loaded: true`; `imageStorage.online` bila `HEAD` bucket berhasil. Query opsional `device_id` memperbarui `last_seen` perangkat (tanpa token).
 - `GET /api/v1/dashboard`, `/classes`, `/reports`: session staf wajib; dibatasi role.
 - `POST /api/v1/students`: JSON `{ "name": "...", "nim": "...", "classId": "IK24-A" }`; session admin + CSRF.
 - `POST /api/v1/students/{nim}/face-template`: multipart field `image`; session admin + CSRF.
 - `POST /api/v1/scans`: multipart `device_id`, `class_id`, `captured_at` RFC3339, `liveness_passed` boolean, `image`; device bearer token + HMAC.
 - `GET|POST /api/v1/devices/ping`: heartbeat; token hanya diperiksa di production; upsert perangkat.
+- `GET /api/v1/images/{key...}`: foto enrollment/scan dari Garage; session staf, dosen hanya kelasnya.
 - `GET/POST /login`, `POST /logout`: login session staf, CSRF berlaku untuk POST.
-- Python hanya internal: `GET /health`, `POST /enroll`, `POST /verify`. Jangan ekspos port Python ke jaringan publik.
+- Python hanya internal; Go memakai `GET /health` dan `POST /detect`. Jangan ekspos port Python (default `8000`) ke jaringan publik — `api.py` belum punya autentikasi dan memakai CORS `*`.
 
 Format pesan HMAC-SHA256 device, enam baris UTF-8 yang digabung newline:
 
@@ -148,8 +158,10 @@ Basis data utama **MongoDB** (detail field, index, waktu, dan operasi di `docs/d
 - `class_students`: relasi kelas-mahasiswa (ditulis, belum dibaca query)
 - `users`: akun staf (`_id`, `username`, `display_name`, `role`, `password_hash`, `class_ids`, `active`, `created_at`)
 - `devices`: `_id`, `name`, `last_seen` (RFC3339 UTC)
-- `face_templates`: `student_id` (unik), `encoding`, `created_at` — ditulis face service
-- `scan_events`: `student_id`, `class_id`, `device_id`, `scanned_at` (RFC3339 UTC), `face_verified`, `liveness_passed`, `confidence`, `status`, `review_reason`
+- `face_templates`: `student_id` (unik), `encoding` (512-d), `dimension`, `detection_confidence`, `image_key` (opsional), `created_at`, `updated_at` — ditulis Go
+- `scan_events`: `student_id`, `class_id`, `device_id`, `scanned_at` (RFC3339 UTC), `face_verified`, `liveness_passed`, `confidence` (cosine similarity), `status`, `review_reason`, `image_key` (opsional)
+
+Foto tidak disimpan di MongoDB, melainkan di bucket Garage (`S3_BUCKET`); MongoDB hanya menyimpan kuncinya.
 
 Batas "hari ini" dihitung dari zona waktu lokal **server** (`todayRangeUTC`). Pada environment production, aktifkan otentikasi MongoDB sesuai panduan di `README.md`.
 
@@ -160,37 +172,46 @@ Templat lengkap: `.env.example`. Go membaca:
 - `APP_ENV` (`development` default; `production` mewajibkan `FACE_SERVICE_TOKEN`, mengaktifkan cookie Secure, dan mewajibkan token pada ping perangkat).
 - `HTTP_ADDR` (default `:8080`), `STATIC_DIR` (default `static`), `VIEW_DIR` (default `views`).
 - `MONGODB_URI` (default `mongodb://10.100.1.11:27017`), `MONGODB_DATABASE` (default `attendance`).
-- `FACE_SERVICE_URL` (default `http://127.0.0.1:8001`), `FACE_SERVICE_TOKEN`.
+- `FACE_SERVICE_URL` (default `http://127.0.0.1:8000`), `FACE_SERVICE_TOKEN` (dikirim sebagai Bearer; belum diperiksa oleh `api.py`), `FACE_SIM_THRESHOLD` (default `0.45`), `FACE_SERVICE_TIMEOUT_SECONDS` (default `15`).
+- `S3_ENDPOINT` (mis. `http://10.100.1.11:3900`), `S3_REGION` (default `garage`), `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` — semua kosong = foto tidak disimpan; terisi sebagian = server menolak start. `IMAGE_RETENTION_DAYS` (default `30`), `IMAGE_REVIEW_RETENTION_DAYS` (default `90`); `0` = tanpa batas.
 - `DEVICE_TOKEN` (wajib, ≥ 32 karakter; bearer + kunci HMAC perangkat).
 - `CSRF_SECRET` (wajib, ≥ 32 karakter).
 - Bootstrap akun (saat belum ada administrator aktif): `BOOTSTRAP_ADMIN_USERNAME`, `BOOTSTRAP_ADMIN_PASSWORD`, opsional `BOOTSTRAP_LECTURER_USERNAME`, `BOOTSTRAP_LECTURER_PASSWORD`, `BOOTSTRAP_LECTURER_CLASSES`.
 
-Face service Python (bila dibangun) membaca `FACE_SERVICE_TOKEN`, `FACE_DISTANCE_THRESHOLD` (default `0.50`), `MONGODB_URI`, dan `MONGODB_DATABASE`. Go **tidak** membaca `FACE_DISTANCE_THRESHOLD`.
+Face service Python membaca konfigurasinya sendiri (`services/face/src/config.py`: `DET_MODEL_PATH`, `REC_MODEL_PATH`, `CONF_THRESHOLD`, `SIM_THRESHOLD`, `API_PORT`, dst.) dan tidak terhubung ke MongoDB.
 
 ## Menjalankan
 
 ```powershell
+# Terminal 1 — face service (services/face, lihat services/face/README.md)
+conda activate face_rec
+uvicorn api:app --host 127.0.0.1 --port 8000
+
+# Terminal 2 — backend Go (root proyek)
 copy .env.example .env   # isi secret
 go vet ./...
+go test ./...
 go run ./cmd/server      # atau: air
 ```
 
 Buka `http://localhost:8080`. Tidak ada akun demo bawaan. Session store in-memory; restart Go akan logout semua sesi.
 
-Tidak ada test otomatis (`go test ./...` hanya melaporkan "no test files"). Sebelumnya test memakai fake Python server (`httptest`) untuk `/health`, `/enroll`, dan `/verify`, serta mencakup scoping role, HMAC/token scan, status liveness, enrollment hanya admin, rate limit login, bcrypt/role akun, dan render halaman — tetapi ditulis untuk versi SQLite, sehingga perlu ditulis ulang untuk MongoDB bila dipulihkan dari arsip cadangan di luar folder proyek.
+Test otomatis: `go test ./...` menjalankan unit test integrasi face service (server tiruan dengan skema `services/face/api.py`), logika pencocokan, logika foto, dan klien S3 (vektor uji resmi AWS SigV4 + S3 tiruan). Belum ada test yang membutuhkan MongoDB atau Garage asli.
+
+Log startup menyebut status penyimpanan foto: `image storage: bucket "…" siap`, `… PERINGATAN …` (Garage/kunci bermasalah), atau `… nonaktif`. `.env` hanya dibaca saat start, jadi restart `air` setelah mengubahnya.
 
 Untuk menguji alur scan tanpa perangkat keras, pakai klien uji Python di `docs/devices.md` §4 (membutuhkan face service yang berjalan).
 
 ## Batasan dan Risiko yang Harus Diingat
 
-1. **Bug otorisasi pada log pemindaian.** Di `api.Server.AllScanEvents`, filter `class` dari query menimpa filter `$in` kelas dosen, sehingga dosen dapat membuka log kelas yang tidak ditugaskan lewat `/partials/logs?class=<kelas lain>`. Perbaiki sebelum dipakai dosen sungguhan (validasi `class` terhadap `principal.ClassIDs`).
-2. **Kredensial perangkat tertulis di firmware.** `devices/esp8266/esp8266_ping/esp8266_ping.ino` memuat SSID, password Wi-Fi, dan `DEVICE_TOKEN` yang sama dengan `.env`. Folder `devices/` belum di-commit; pindahkan rahasia ke `secrets.h` yang di-gitignore dan **ganti `DEVICE_TOKEN`** sebelum commit/push (`docs/devices.md` §2).
+1. **Foto wajah adalah data biometrik.** Bucket Garage harus privat; gunakan kunci khusus bucket (`garage key create methics-app`), bukan `admin_token` atau akun root server. Retensi foto diatur lewat `IMAGE_*_RETENTION_DAYS`; foto enrollment belum terhapus otomatis bila mahasiswa dihapus (fitur hapus mahasiswa belum ada). Pastikan ada persetujuan mahasiswa (UU PDP).
+2. **Kredensial perangkat tertulis di firmware.** `devices/esp8266/esp8266_ping/esp8266_ping.ino` memuat SSID, password Wi-Fi, dan `DEVICE_TOKEN` yang sama dengan `.env`. Sketch ini **sudah ter-commit** (commit `9af21ce`), sehingga token dan password Wi-Fi ada di riwayat Git: **ganti `DEVICE_TOKEN`** dan password Wi-Fi, lalu pindahkan rahasia ke `secrets.h` yang di-gitignore (`docs/devices.md` §2).
 3. **Ping & health dapat membuat perangkat baru.** `/api/v1/devices/ping` (tanpa token di non-production) dan `/api/v1/health?device_id=` (tanpa token di semua mode) melakukan upsert ke `devices`. ID yang terbentuk dengan cara ini lolos pengecekan "perangkat terdaftar" pada scan. Ping tanpa `device_id` juga selalu menandai `ESP32-GED-A1`.
 4. **Login/session dan CSRF sudah dipasang, tetapi perlu deployment hardening.** Production memerlukan secret acak ≥ 32 karakter, TLS, session store bersama untuk multi-instance, dan pengelolaan/rotasi akun staf. HSTS belum dipasang.
 5. **Mahasiswa tanpa login adalah keputusan produk saat ini.** Jangan menambahkan kembali `STUDENT_TOKEN`, opsi role mahasiswa, atau akses dashboard mandiri tanpa keputusan eksplisit baru.
 6. **Liveness belum benar-benar diukur.** `liveness_passed` berasal dari perangkat dan hanya integritas pesannya dilindungi HMAC. HMAC tidak mencegah foto/video replay bila perangkat mengklaim liveness palsu, dan belum ada nonce anti-replay.
-7. **Threshold `0.50` belum dikalibrasi**; ukur false acceptance/rejection sebelum produksi. Go mengirim `class_id` ke `/verify`, tetapi pencocokan per kelas bergantung pada implementasi Python; Go tetap memeriksa keanggotaan kelas.
-8. Belum ada secret per perangkat, rotasi/revokasi token, UI manajemen akun/penugasan staf, audit enrollment, consent/retention workflow, enkripsi backup, atau penghapusan biometrik lewat UI.
+7. **Ambang cosine `0.45` belum dikalibrasi**; ukur false acceptance/rejection dengan data kampus sebelum produksi. Pencocokan memindai semua template (1:N) di Go setiap scan; Go lalu memeriksa keanggotaan kelas. Mengganti model recognition membuat template lama tidak sebanding → enrollment ulang.
+8. Belum ada secret per perangkat, rotasi/revokasi token, UI manajemen akun/penugasan staf, audit enrollment, alur persetujuan (consent), enkripsi backup, atau penghapusan biometrik lewat UI (retensi foto scan sudah otomatis).
 9. **Batas "hari ini" mengikuti zona waktu server.** Jalankan server dengan zona waktu kampus (WITA, `Asia/Makassar`). `scanned_at` wajib RFC3339 UTC agar perbandingan string benar.
 10. **URI MongoDB dicetak ke log saat startup**, termasuk password bila URI memuatnya.
 11. **Index `users.username` case-sensitive**, sedangkan login case-insensitive; hindari akun yang hanya berbeda huruf besar/kecil.
@@ -198,13 +219,13 @@ Untuk menguji alur scan tanpa perangkat keras, pakai klien uji Python di `docs/d
 13. Data seed berisi nama contoh; belum ada template wajah demo. Jangan menyimpulkan verifikasi wajah aktif hanya karena profil mahasiswa ada.
 14. Google Fonts dan logo institusi masih dimuat dari internet; untuk lingkungan tertutup, vendor aset tersebut lalu sesuaikan CSP. Jangan menambahkan inline script (CSP `script-src 'self'`).
 15. **Opsi filter kelas masih statis** di `views/pages/mahasiswa.html` dan `views/pages/logs.html`. Dialog pendaftaran sudah memakai opsi ber-scope dari server (`ClassRows`).
-16. Sisa kode era SQLite: helper `placeholders` dan `stringArgs` di `internal/api/server.go` tidak lagi dipakai; komentar `data/ (SQLite)` di `.air.toml` sudah usang.
+16. **Port RPC Garage (3901) terbuka di semua interface** pada `garage.toml` pengembangan, dan `rpc_secret`-nya pernah dibagikan di luar server. Batasi port 3901 dengan firewall atau ganti `rpc_secret`.
 
 ## Langkah Lanjutan yang Disarankan
 
-1. Perbaiki bug scoping kelas di `AllScanEvents` (risiko no. 1).
-2. Amankan kredensial firmware (secrets.h + rotasi `DEVICE_TOKEN`), lalu commit berkas yang belum ter-commit.
-3. Implementasikan face service Python sesuai `docs/face-service.md`; uji `/health`, enrollment dengan gambar bersetuju, lalu match dan mismatch end-to-end; kalibrasi threshold.
+1. Uji penyimpanan foto ke Garage dari mesin pengembang (cek log startup dan `/api/v1/health`), lalu tampilkan foto enrollment di halaman Mahasiswa dan tambahkan enrollment ulang otomatis dari foto tersimpan.
+2. Rotasi `DEVICE_TOKEN` dan password Wi-Fi yang sudah ter-commit; pindahkan rahasia firmware ke `secrets.h`.
+3. Uji end-to-end dengan face service asli: enrollment beberapa mahasiswa (foto bersetuju), lalu scan cocok/tidak cocok lewat klien uji di `docs/devices.md` §4; kalibrasi `FACE_SIM_THRESHOLD`. Tambahkan pemeriksaan Bearer token di `services/face/api.py`.
 4. Batasi ping/health agar hanya memperbarui perangkat terdaftar (tanpa upsert), dan wajibkan token di semua mode.
 5. Tambahkan UI/API administrasi akun staf dan penugasan kelas di halaman `/akses`; akun login mahasiswa tetap tidak dibuat.
 6. Tambahkan CRUD kelas/perangkat dan ganti opsi kelas hardcoded di view dengan data dari server.
@@ -224,7 +245,8 @@ Dokumentasi:
 - `docs/code-guide.md` — penjelasan kode per lapisan, alur request, resep, jebakan.
 - `docs/database.md` — skema MongoDB, index, seed, waktu, operasi, backup.
 - `docs/devices.md` — firmware ESP8266, protokol ping/scan, klien uji.
-- `docs/face-service.md` — kontrak & kerangka face service Python.
+- `docs/face-service.md` — integrasi face service Python dan penyimpanan foto (S3 Garage).
+- `docs/diagram.excalidraw` — diagram tahapan proyek, arsitektur, alur enrollment & scan.
 - `docs/SRS.md` — kebutuhan fungsional & non-fungsional dengan status implementasi.
 - `.env.example` — templat konfigurasi.
 

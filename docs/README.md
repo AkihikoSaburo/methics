@@ -12,9 +12,9 @@ mulai dari **[HANDOFF.md](../HANDOFF.md)**, lalu kembali ke sini untuk detail.
 | [code-guide.md](code-guide.md) | Penjelasan kode per lapisan + resep tugas umum + jebakan | Developer yang mengubah kode |
 | [database.md](database.md) | Koleksi MongoDB, index, seed, aturan waktu, operasi `mongosh`, backup | Developer & operator |
 | [devices.md](devices.md) | Firmware ESP8266, protokol ping & scan, klien uji, troubleshooting | Pengembang perangkat |
-| [face-service.md](face-service.md) | Kontrak & kerangka face service Python (belum ada di repo) | Pengembang ML/Python |
+| [face-service.md](face-service.md) | Integrasi Go ↔ face service Python (enrollment, pencocokan, konfigurasi) dan penyimpanan foto di Garage (§8) | Pengembang backend & ML |
 | [SRS.md](SRS.md) | Kebutuhan fungsional & non-fungsional dengan status implementasi | Penyusun SRS / kebutuhan formal |
-| [diagram.excalidraw](diagram.excalidraw) | Diagram arsitektur (buka di excalidraw.com) | Semua |
+| [diagram.excalidraw](diagram.excalidraw) | Tahapan proyek, arsitektur, alur enrollment & scan (buka di excalidraw.com atau ekstensi VS Code) | Semua |
 
 ## Peta cepat
 
@@ -28,7 +28,10 @@ internal/store/             database.go (koneksi MongoDB, index, seed), users.go
 views/                      layouts/, pages/, partials/, fragments/, login.html
 static/css|js               aset; htmx + Lucide di-vendor lokal
 devices/esp8266/            firmware heartbeat ESP8266 (Arduino)
-services/face/              tempat face service Python — BELUM diimplementasi
+services/face/              face service Python (YOLO-FaceV2 + ArcFace, FastAPI)
+internal/api/face.go        klien face service + pencocokan cosine di Go
+internal/api/images.go      foto wajah: unggah, otorisasi & stream, retensi
+internal/storage/s3.go      klien S3 (Garage) dengan pustaka standar
 docs/                       dokumentasi (Anda di sini)
 .env.example                templat konfigurasi lokal
 ```
@@ -44,6 +47,7 @@ docs/                       dokumentasi (Anda di sini)
 | membuat firmware kamera | [devices.md](devices.md) §4 |
 | menguji scan tanpa perangkat keras | [devices.md](devices.md) §4 (klien uji Python) |
 | membangun face service | [face-service.md](face-service.md) |
+| menyimpan/melihat foto wajah (Garage) | [face-service.md](face-service.md) §8, [API.md](../API.md) `GET /api/v1/images` |
 | tahu apa yang belum dikerjakan | [HANDOFF.md](../HANDOFF.md) §Langkah Lanjutan, [SRS.md](SRS.md) §7 |
 
 ## Konvensi penulisan dokumen

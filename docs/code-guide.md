@@ -4,7 +4,7 @@ Dokumen ini menjelaskan **bagaimana kode disusun dan mengapa**, agar perubahan
 berikutnya konsisten dengan pola yang ada. Untuk gambaran besar, lihat
 [architecture.md](architecture.md). Untuk kontrak API, lihat [API.md](../API.md).
 Untuk skema data, lihat [database.md](database.md). Terakhir diselaraskan dengan
-kode: 21 Oktober 2026.
+kode: 26 Oktober 2026.
 
 ## 1. Prinsip yang dipegang
 
@@ -17,13 +17,20 @@ kode: 21 Oktober 2026.
 3. **Otorisasi di server, dari database.** Role dan daftar kelas dosen diambil
    ulang dari DB setiap request (`security.RequireSession`). Query/header role
    dari klien tidak pernah dipercaya.
-4. **Tidak ada data biometrik ke browser.** Hanya label status yang dikirim.
+4. **Tidak ada template biometrik ke browser.** Embedding tidak pernah dikirim;
+   foto hanya dialirkan lewat endpoint ber-otorisasi (`/api/v1/images/...`).
 
 ## 2. Peta direktori
 
 ```text
 cmd/server/main.go            entry point: env, routing, middleware, bootstrap, shutdown
 internal/api/server.go        endpoint JSON + query ber-scope role + domain method + error sentinel
+internal/api/face.go          klien face service, enrollment embedding, pencocokan cosine 1:N
+internal/api/face_test.go     unit test klien & pencocokan (tanpa MongoDB)
+internal/api/images.go        foto wajah di S3: unggah, otorisasi & stream, retensi
+internal/api/images_test.go   unit test kunci objek, unggah gagal, storage nonaktif
+internal/storage/s3.go        klien S3 minimal (SigV4, gaya path) untuk Garage
+internal/storage/s3_test.go   vektor uji AWS SigV4 + round-trip ke S3 tiruan
 internal/controller/
   web.go                      render halaman penuh (shell) + login page
   partials.go                 render fragment htmx (/partials/*)
@@ -35,7 +42,7 @@ internal/security/middleware.go
 internal/store/
   database.go                 Open (connect+ping MongoDB), migrate (index), seed (kelas/mahasiswa/perangkat)
   users.go                    User, CreateUser, EnsureUser, AuthenticateUser, UserByID
-services/face/                BELUM ADA — kontrak di docs/face-service.md
+services/face/                face service Python (FastAPI: /health, /detect → embedding ArcFace 512-d)
 devices/esp8266/esp8266_ping/ firmware heartbeat ESP8266 (Arduino)
 views/
   layouts/base.html           kerangka halaman (head, sidebar, topbar, content)
@@ -99,8 +106,11 @@ POST /api/v1/scans
   → cek device_id & class_id tidak kosong, captured_at RFC3339 ±5 menit, liveness_passed true/false
   → validScanSignature      (HMAC-SHA256 atas X-Device-Timestamp ±2 menit + fields + hash gambar)
   → cek devices._id ada, classes._id ada
-  → callFaceService POST /verify  (Python; field class_id + image; bearer FACE_SERVICE_TOKEN; timeout 8 s)
+  → verifyCapture: POST /detect ke Python (file image; timeout 15 s)
+      → ambil wajah dengan confidence tertinggi
+      → cosine similarity terhadap semua face_templates (≥ FACE_SIM_THRESHOLD → kandidat)
   → tentukan status: Hadir / Perlu ditinjau / Ditolak
+  → (bila S3_* diisi) unggah capture ke Garage, maks 3 s → image_key
   → InsertOne scan_events + UpdateOne devices.last_seen
   → 202 JSON {status, student, faceVerified, confidence, reviewReason}
 ```
@@ -109,14 +119,14 @@ Urutan penentuan status (di `receiveScan`) penting dan berlapis:
 
 | Kondisi | Status | Alasan dicatat |
 | --- | --- | --- |
-| Wajah tidak cocok | `Ditolak` | alasan dari Python |
+| Wajah tidak cocok | `Ditolak` | alasan dari Go (mis. kemiripan di bawah ambang) |
 | Cocok tapi bukan anggota kelas di perangkat | `Perlu ditinjau` | "…bukan anggota kelas pada perangkat." |
 | Cocok, anggota kelas, tapi `liveness_passed != true` | `Perlu ditinjau` | "…bukti liveness belum tersedia atau tidak lolos." |
 | Cocok + anggota kelas + liveness true | `Hadir` | kosong |
 
 "Anggota kelas" dicek dengan `students.class_id == class_id` (bukan
-`class_students`). Bila `/verify` gagal, respons `502` dan event **tidak**
-disimpan.
+`class_students`). Bila face service gagal, respons `502` dan event **tidak**
+disimpan. Bila unggah foto gagal, event **tetap** disimpan tanpa `image_key`.
 
 ### 3.4 Heartbeat perangkat
 
@@ -145,6 +155,9 @@ Lihat risiko di [devices.md](devices.md) §5.
   username sudah ada — kelasnya tidak diperbarui). Tidak ada akun demo bawaan.
 - `store.Open(MONGODB_URI, MONGODB_DATABASE)` — gagal konek/ping dalam 8 detik
   menghentikan proses.
+- `setupImageStorage` mengaktifkan penyimpanan foto bila `S3_*` diisi:
+  konfigurasi tidak lengkap menghentikan proses, bucket yang belum terjangkau
+  hanya memberi peringatan. Job retensi foto berjalan tiap jam.
 - Dua cabang routing:
   - `protected` (di balik session + CSRF): halaman (`/`, `/mahasiswa`,
     `/kelas`, `/laporan`, `/logs`, `/akses`), login/logout, `/api/v1/` staf,
@@ -160,10 +173,10 @@ Lihat risiko di [devices.md](devices.md) §5.
 
 Dua peran dalam satu berkas:
 
-**a. Handler HTTP** — `StaffHandler()` (`/api/v1/dashboard|classes|reports|students…`),
-`DeviceHandler()` (`/api/v1/health|scans|devices/ping`), `StaticHandler()`. Semua
-membungkus mux dengan `securityHeaders`. Ada juga `Handler(staticDir)` yang
-menggabungkan semuanya tanpa session — tidak dipakai oleh `main.go`.
+**a. Handler HTTP** — `StaffHandler()` (`/api/v1/dashboard|classes|reports|students…|images/…`),
+`DeviceHandler()` (`/api/v1/health|scans|devices/ping`), `StaticHandler()`.
+Header keamanan dipasang sekali oleh `security.SecurityHeaders` yang
+membungkus seluruh router di `main.go`.
 
 **b. Query & domain** — fungsi ber-scope role yang menerima `principal{role, classes}`:
 
@@ -178,15 +191,14 @@ menggabungkan semuanya tanpa session — tidak dipakai oleh `main.go`.
 | `countStudents`, `countTemplates`, `countScans` | agregat dashboard |
 | `lastDeviceSeen` | dasar status online perangkat |
 | `faceHealth` | cek `/health` layanan Python |
+| `imageStorageHealth` | cek `HEAD` bucket S3 (di `images.go`) |
 
 Pola berulang untuk scoping dosen: bila `role == "dosen"`, filter diberi
 `bson.M{"class_id": bson.M{"$in": classes}}` (atau `_id` untuk koleksi
 `classes`); bila daftar kelas kosong, langsung kembalikan hasil kosong (tanpa
 menyentuh DB). Data "hari ini" difilter dengan rentang string dari
-`todayRangeUTC()`.
-
-Sisa era SQLite: helper `placeholders` dan `stringArgs` tidak dipakai lagi dan
-aman dihapus.
+`todayRangeUTC()`. Filter dari input pengguna (mis. `class` di halaman log)
+diperiksa terhadap daftar kelas dosen, bukan menimpa filter role.
 
 **c. API publik untuk controller.** Fungsi ber-scope diekspor sebagai pembungkus
 bertipe supaya `internal/controller/partials.go` bisa memakainya:
@@ -207,6 +219,8 @@ api.ReadImagePart(w, r)
 
 ```go
 ErrMissingFields, ErrStudentExists, ErrInvalidClass, ErrStudentNotFound, ErrFaceService
+ErrInvalidImage, ErrNoFace, ErrMultipleFaces, ErrFaceAlreadyEnrolled   // face.go
+ErrImageNotFound, ErrImageForbidden                                    // images.go
 ```
 
 **e. Tipe bertipe** — `ClassRow`, `ScanEvent`, `RosterEntry`. Fungsi
@@ -256,15 +270,45 @@ lama** tetap sama meski internalnya bertipe.
   `administrator`/`dosen`, `_id` hex acak), `EnsureUser` (cek username
   case-insensitive), `AuthenticateUser` (username case-insensitive lewat regex
   yang di-escape; perbandingan hash dummy untuk menyamakan waktu saat user
-  tidak ada), `UserByID` (menolak akun nonaktif), `UserClassIDs`,
-  `CountUsersByRole` (hanya akun aktif).
+  tidak ada), `UserByID` (menolak akun nonaktif), `CountUsersByRole` (hanya
+  akun aktif).
 
-### `services/face/` (belum ada)
+### `internal/api/face.go`
 
-Implementasi Python tidak ada di repo. Go hanya bergantung pada kontrak
-`GET /health` → `{modelReady}`, `POST /enroll` (`student_id`, `image`), dan
-`POST /verify` (`class_id`, `image`) → `{verified, studentId, confidence,
-reason}`. Detail dan kerangka implementasi: [face-service.md](face-service.md).
+- `detectFaces` memanggil `POST /detect` pada face service dan mengembalikan
+  `faceServiceError{Status}` untuk respons non-2xx (400 → `ErrInvalidImage`).
+- `enrollEmbedding` (dipanggil `EnrollFace`): wajib tepat satu wajah
+  (`ErrNoFace`/`ErrMultipleFaces`), tolak wajah yang mirip template mahasiswa
+  lain (`ErrFaceAlreadyEnrolled`), lalu upsert ke `face_templates`.
+- `verifyCapture` (dipanggil `receiveScan`): pilih wajah dengan confidence
+  tertinggi, hitung `cosineSimilarity` ke semua template lewat
+  `bestTemplateMatch`, kembalikan `FaceMatch{Verified, StudentID, Confidence,
+  Reason}`.
+- Template dengan dimensi berbeda diabaikan. Ambang: `Config.SimThreshold`
+  (`FACE_SIM_THRESHOLD`).
+
+### `internal/api/images.go` dan `internal/storage/s3.go`
+
+- `ImageStore` adalah antarmuka (Put/Get/Delete/HeadBucket); implementasinya
+  `storage.S3`. `Server.images == nil` berarti penyimpanan foto nonaktif dan
+  semua fungsi foto menjadi no-op.
+- `uploadImage` memakai batas 3 detik dan **tidak pernah** menggagalkan
+  pemanggil: gagal unggah hanya dicatat di log dan mengembalikan kunci kosong.
+- `storeEnrollmentImage` mengganti `face_templates.image_key` dan menghapus
+  foto enrollment lama.
+- `serveImage` (`GET /api/v1/images/{key...}`): kunci harus tercatat di
+  MongoDB; `authorizeImage` membatasi dosen ke kelasnya.
+- `PurgeExpiredImages` / `RunImageRetention`: hapus foto scan yang lewat
+  `IMAGE_RETENTION_DAYS` / `IMAGE_REVIEW_RETENTION_DAYS`, lalu `$unset`
+  `image_key`. Event absensinya tidak dihapus.
+- `storage.S3` ditulis dengan pustaka standar (AWS Signature V4, gaya path)
+  supaya tidak menambah dependensi; diuji dengan vektor resmi AWS.
+
+### `services/face/` (Python)
+
+FastAPI stateless milik tim ML (YOLO-FaceV2 + ArcFace). Go hanya memakai
+`GET /health` dan `POST /detect`. Detail: [face-service.md](face-service.md)
+dan `services/face/README.md`.
 
 ### `devices/esp8266/esp8266_ping/esp8266_ping.ino`
 
@@ -283,9 +327,10 @@ class_students {class_id, student_id}              (unik gabungan; belum dibaca 
 users          {_id, username (unik), display_name, role, password_hash,
                 active, class_ids: [...], created_at}
 devices        {_id: "ESP32-GED-A1", name, last_seen}
-face_templates {student_id (unik), encoding, created_at}   (ditulis face service)
+face_templates {student_id (unik), encoding, dimension, detection_confidence,
+                image_key?, created_at, updated_at}          (ditulis Go)
 scan_events    {student_id, class_id, device_id, scanned_at, face_verified,
-                liveness_passed, confidence, status, review_reason}
+                liveness_passed, confidence, status, review_reason, image_key?}
 ```
 
 Catatan penyimpanan waktu:
@@ -371,7 +416,12 @@ dipakai di `$regex`.
     menambah opsi filter.
 11. **Jangan menimpa filter scoping role.** Saat menambah filter dari input
     pengguna, gabungkan dengan filter role (mis. cek nilai ada di
-    `principal.ClassIDs`), jangan menulis ulang key yang sama. `AllScanEvents`
-    saat ini melanggar aturan ini untuk `class_id` (lihat `HANDOFF.md`).
+    `principal.ClassIDs`), jangan menulis ulang key yang sama (contoh benar:
+    filter `class` di `AllScanEvents`).
 12. **Keanggotaan kelas = `students.class_id`.** `class_students` ditulis
     tetapi tidak dibaca; jangan mengandalkannya tanpa memperbarui query.
+13. **Foto bukan bagian wajib alur absensi.** Jangan membuat scan/enrollment
+    gagal karena S3; ikuti pola `uploadImage` (log + lanjut).
+14. **Ganti model recognition = enrollment ulang.** Embedding lama tidak
+    sebanding dengan model baru; foto enrollment di Garage bisa dipakai untuk
+    membuat ulang template (belum diotomasi).

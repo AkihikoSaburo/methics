@@ -1,207 +1,205 @@
-# Face Service (Python)
+# Face Service (Python) dan Integrasinya dengan Go
 
-> Status: **[BELUM ADA DI REPO]**. Folder `services/face/` saat ini hanya
-> berisi `README..txt` (placeholder). Berkas `services/face/main.py` dan
-> `services/face/requirements.txt` yang dirujuk dokumen lama **tidak ada**.
-> Dokumen ini menjadi **kontrak** yang harus dipenuhi implementasi Python agar
-> cocok dengan backend Go (`internal/api/server.go`).
+> Status: **[TERSEDIA]**. Layanan ada di `services/face/` (FastAPI + ONNX
+> Runtime: YOLO-FaceV2 untuk deteksi, ArcFace R50 untuk embedding 512-d,
+> model diunduh dari Hugging Face `AkihikoSaburo/methics`). Cara menjalankan
+> layanannya sendiri ada di `services/face/README.md`.
 
-## 1. Peran
+## 1. Pembagian tugas: satu API publik
 
-Backend Go tidak melakukan inferensi wajah (ADR-2 di `architecture.md`). Go
-hanya:
-
-- meneruskan foto enrollment ke `POST /enroll`,
-- meneruskan capture perangkat ke `POST /verify`,
-- membaca `GET /health` untuk status dashboard,
-- menghitung dokumen `face_templates` untuk status "wajah terdaftar".
-
-Face service bertanggung jawab mendeteksi wajah, membuat embedding, menyimpan
-template ke MongoDB, dan mencocokkan capture.
-
-## 2. Konfigurasi sisi Go
-
-| Variabel | Default | Keterangan |
-| --- | --- | --- |
-| `FACE_SERVICE_URL` | `http://127.0.0.1:8001` | base URL; garis miring di akhir dibuang |
-| `FACE_SERVICE_TOKEN` | kosong | bila diisi, Go mengirim `Authorization: Bearer <token>` ke semua endpoint. **Wajib ≥ 32 karakter** saat `APP_ENV=production` |
-
-Timeout HTTP klien Go: **8 detik** per panggilan (termasuk `/health`, yang
-dipanggil setiap kali dashboard dimuat — jadi service yang lambat
-memperlambat dashboard).
-
-## 3. Kontrak endpoint
-
-Semua request dari Go memakai bearer token di atas (bila dikonfigurasi).
-Service sebaiknya menolak request tanpa token yang benar dengan `401`.
-
-### `GET /health`
-
-Respons yang diharapkan Go (`200`):
-
-```json
-{ "modelReady": true }
+```text
+Browser / ESP32 ──► Go (satu-satunya API publik, :8080)
+                     │  POST /detect (multipart image)
+                     ├──────────────────────────────► Python face service (:8000, internal)
+                     │◄──────────── {num_faces, faces[].embedding (512-d), confidence}
+                     │
+                     ├── simpan embedding  → MongoDB face_templates   (enrollment)
+                     └── cosine similarity → bandingkan dengan face_templates (scan)
 ```
 
-Go menganggap service **online** hanya bila status `200` dan `modelReady`
-bernilai `true`. Status selain 200, JSON tak valid, atau timeout → offline.
+Face service bersifat **stateless**: ia tidak menyimpan apa pun dan tidak
+terhubung ke MongoDB. Go yang:
 
-### `POST /enroll`
+- menyimpan template wajah (embedding) di koleksi `face_templates`,
+- melakukan pencocokan 1:N (cosine similarity) saat scan,
+- menentukan status `Hadir` / `Perlu ditinjau` / `Ditolak`.
 
-Request (`multipart/form-data`):
+Akibatnya perangkat ESP32 dan dashboard cukup berbicara dengan **satu** API
+(Go). Face service tidak perlu dan tidak boleh diekspos ke jaringan publik.
 
-| Field | Isi |
+Kode Go: `internal/api/face.go` (klien + pencocokan), dipanggil dari
+`EnrollFace` dan `receiveScan` di `internal/api/server.go`. Foto wajah
+opsional disimpan di Garage (S3), lihat §8.
+
+## 2. Endpoint Python yang dipakai Go
+
+| Endpoint | Dipakai untuk | Field/respons yang dibaca Go |
+| --- | --- | --- |
+| `GET /health` | status di dashboard & `/api/v1/health` | `model_loaded`, `det_model`, `rec_model` |
+| `POST /detect` | enrollment dan scan | request: file `image`; respons: `num_faces`, `faces[].confidence`, `faces[].embedding`, `processing_time_ms` |
+
+Endpoint lain (`/compare`, `/embed`, `/detect/visualize`, `/models*`) tidak
+dipakai Go dan tetap bisa dipakai tim untuk eksperimen lewat Swagger
+(`http://127.0.0.1:8000/docs`).
+
+Status HTTP dari `/detect`:
+
+| Status Python | Perlakuan Go |
 | --- | --- |
-| `student_id` | `_id` mahasiswa, mis. `student-ik24001` (bukan NIM) |
-| `image` | foto enrollment (≤ 8 MiB, sudah dicek Go) |
+| `200` | diproses |
+| `400` (gambar tidak bisa di-decode) | `400 invalid_image` ke klien |
+| lainnya / timeout / tidak terjangkau | `502 face_service_error`; scan **tidak** dicatat |
 
-Yang diharapkan dilakukan service:
+## 3. Enrollment (administrator)
 
-1. Tolak bila wajah tidak terdeteksi atau lebih dari satu wajah (respons non-2xx).
-2. Buat embedding 128 dimensi.
-3. Upsert ke koleksi `face_templates` dengan `student_id` (index unik — satu
-   template per mahasiswa), `encoding`, `created_at`.
-4. **Jangan simpan gambar mentah.**
+`POST /partials/mahasiswa/{nim}/face-template` (UI) atau
+`POST /api/v1/students/{nim}/face-template` (JSON):
 
-Respons: status 2xx dengan body JSON objek apa pun. Go meneruskannya apa
-adanya sebagai `result` pada `POST /api/v1/students/{nim}/face-template`.
-Status non-2xx → Go membalas `502 face_service_error` (JSON) atau pesan
-"Enrollment gagal; pastikan service Python dan model wajah aktif." (UI).
+1. Go mengirim foto ke `POST /detect`.
+2. Wajib **tepat satu** wajah: 0 wajah → `422 no_face`, lebih dari satu →
+   `422 multiple_faces`.
+3. Embedding dibandingkan dengan template mahasiswa **lain**. Bila kemiripan
+   ≥ ambang, enrollment ditolak (`409 face_already_enrolled`, menyebut NIM
+   pemilik wajah) untuk mencegah satu wajah terdaftar di dua NIM (titip absen).
+4. Embedding di-*upsert* ke `face_templates` (satu template per mahasiswa;
+   enrollment ulang menimpa template lama).
 
-### `POST /verify`
-
-Request (`multipart/form-data`):
-
-| Field | Isi |
-| --- | --- |
-| `class_id` | kelas yang dikirim perangkat (huruf besar) |
-| `image` | capture perangkat |
-
-Respons `200` yang di-decode Go:
+Dokumen `face_templates`:
 
 ```json
 {
-  "verified": true,
-  "studentId": "student-ik24001",
-  "confidence": 0.91,
-  "reason": ""
+  "student_id": "student-ik24001",
+  "encoding": [0.0123, -0.0456, "… 512 angka …"],
+  "dimension": 512,
+  "detection_confidence": 0.93,
+  "created_at": "2026-10-26T04:00:00Z",
+  "updated_at": "2026-10-26T04:00:00Z"
 }
 ```
 
-| Field | Tipe | Arti |
-| --- | --- | --- |
-| `verified` | bool | jarak terbaik ≤ ambang |
-| `studentId` | string | `_id` mahasiswa kandidat (`""` bila tidak ada) |
-| `confidence` | number | disarankan `1 - distance` |
-| `reason` | string | alasan penolakan (dipakai sebagai `review_reason` bila `Ditolak`) |
+## 4. Verifikasi saat scan (perangkat)
 
-Go menganggap wajah cocok hanya bila `verified == true` **dan** `studentId`
-tidak kosong, lalu menentukan status sendiri (anggota kelas + liveness). Field
-`class_id` boleh dipakai service untuk membatasi kandidat ke anggota kelas,
-tetapi Go tetap memeriksa keanggotaan kelas secara independen.
+`POST /api/v1/scans` (setelah token, HMAC, timestamp, perangkat, dan kelas
+lolos validasi):
 
-Status non-2xx atau timeout → Go membalas `502 face_service_error` ke
-perangkat dan **tidak** mencatat event.
+1. Go mengirim capture ke `POST /detect`.
+2. Wajah dengan `confidence` deteksi tertinggi dipakai (bila ada beberapa).
+   Tidak ada wajah → `Ditolak` dengan alasan "Wajah tidak terdeteksi".
+3. Embedding dibandingkan dengan **semua** template (1:N). Template dengan
+   dimensi berbeda (mis. dari model lama) dilewati.
+4. Skor terbaik ≥ ambang → kandidat cocok; `confidence` pada event = cosine
+   similarity. Di bawah ambang → `Ditolak` dengan skor pada alasan.
+5. Go lalu menerapkan aturan yang sama seperti sebelumnya: anggota kelas +
+   `liveness_passed=true` → `Hadir`, selain itu `Perlu ditinjau`.
 
-## 4. Konfigurasi sisi Python (yang disarankan)
+## 5. Konfigurasi
+
+Sisi Go (`.env`):
 
 | Variabel | Default | Keterangan |
 | --- | --- | --- |
-| `FACE_SERVICE_TOKEN` | — | sama dengan Go |
-| `FACE_DISTANCE_THRESHOLD` | `0.50` | ambang jarak Euclid `face_recognition` |
-| `MONGODB_URI` | `mongodb://10.100.1.11:27017` | sama dengan Go |
-| `MONGODB_DATABASE` | `attendance` | sama dengan Go |
+| `FACE_SERVICE_URL` | `http://127.0.0.1:8000` | base URL face service (port default `api.py`) |
+| `FACE_SIM_THRESHOLD` | `0.45` | ambang cosine similarity; samakan dengan `SIM_THRESHOLD` di Python |
+| `FACE_SERVICE_TIMEOUT_SECONDS` | `15` | batas waktu satu panggilan `/detect` (health memakai 3 detik) |
+| `FACE_SERVICE_TOKEN` | kosong | dikirim sebagai `Authorization: Bearer`; **belum diperiksa oleh `api.py`** (lihat §7) |
 
-Catatan: `FACE_DISTANCE_THRESHOLD` dibaca oleh service Python, **bukan** oleh
-Go — Go tidak membaca variabel ini.
+Sisi Python: lihat `services/face/src/config.py` (`DET_MODEL_PATH`,
+`REC_MODEL_PATH`, `CONF_THRESHOLD`, `SIM_THRESHOLD`, `API_PORT`, dst.).
 
-## 5. Kerangka implementasi
+## 6. Menjalankan bersama (pengembangan)
 
-Kerangka minimal (FastAPI + `face_recognition` + `pymongo`) yang memenuhi
-kontrak di atas. Ini titik awal, belum diuji di mesin pengembang:
+```powershell
+# Terminal 1 — face service (dari services/face)
+conda activate face_rec
+uvicorn api:app --host 127.0.0.1 --port 8000
 
-```python
-# services/face/main.py
-import os
-from datetime import datetime, timezone
-
-import face_recognition
-import numpy as np
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from pymongo import MongoClient
-
-TOKEN = os.environ.get("FACE_SERVICE_TOKEN", "")
-THRESHOLD = float(os.environ.get("FACE_DISTANCE_THRESHOLD", "0.50"))
-db = MongoClient(os.environ.get("MONGODB_URI", "mongodb://10.100.1.11:27017"))[
-    os.environ.get("MONGODB_DATABASE", "attendance")
-]
-app = FastAPI()
-
-
-def require_token(authorization: str = Header(default="")):
-    if TOKEN and authorization != f"Bearer {TOKEN}":
-        raise HTTPException(status_code=401, detail="invalid token")
-
-
-def encode(upload: UploadFile) -> list[np.ndarray]:
-    image = face_recognition.load_image_file(upload.file)
-    return face_recognition.face_encodings(image)
-
-
-@app.get("/health", dependencies=[Depends(require_token)])
-def health():
-    db.command("ping")
-    return {"modelReady": True}
-
-
-@app.post("/enroll", dependencies=[Depends(require_token)])
-def enroll(student_id: str = Form(...), image: UploadFile = File(...)):
-    encodings = encode(image)
-    if len(encodings) != 1:
-        raise HTTPException(status_code=422, detail="harus tepat satu wajah")
-    db.face_templates.update_one(
-        {"student_id": student_id},
-        {"$set": {"encoding": encodings[0].tolist(), "created_at": datetime.now(timezone.utc)}},
-        upsert=True,
-    )
-    return {"studentId": student_id, "enrolled": True}
-
-
-@app.post("/verify", dependencies=[Depends(require_token)])
-def verify(class_id: str = Form(""), image: UploadFile = File(...)):
-    encodings = encode(image)
-    if not encodings:
-        return {"verified": False, "studentId": "", "confidence": 0, "reason": "Wajah tidak terdeteksi."}
-    templates = list(db.face_templates.find({}, {"student_id": 1, "encoding": 1}))
-    if not templates:
-        return {"verified": False, "studentId": "", "confidence": 0, "reason": "Belum ada template wajah."}
-    known = np.array([t["encoding"] for t in templates])
-    distances = face_recognition.face_distance(known, encodings[0])
-    best = int(np.argmin(distances))
-    distance = float(distances[best])
-    if distance > THRESHOLD:
-        return {"verified": False, "studentId": "", "confidence": 1 - distance, "reason": "Wajah tidak cocok."}
-    return {"verified": True, "studentId": templates[best]["student_id"], "confidence": 1 - distance, "reason": ""}
+# Terminal 2 — backend Go (dari root proyek)
+air        # atau: go run ./cmd/server
 ```
 
-`requirements.txt` yang sesuai: `fastapi`, `uvicorn[standard]`,
-`python-multipart`, `face-recognition`, `numpy`, `pymongo` (pin versinya).
-`face-recognition` membutuhkan `dlib`, CMake, dan toolchain C/C++ (di Windows:
-Visual Studio C++ Build Tools, atau gunakan WSL/Linux).
-
-Menjalankan:
+Cek integrasi:
 
 ```bash
-python -m uvicorn services.face.main:app --host 127.0.0.1 --port 8001
+curl http://localhost:8080/api/v1/health
+# {"faceVerification":{"online":true,"provider":"Python YOLO-FaceV2 + ArcFace",
+#   "detectionModel":"face_detection/yolo-facev2s.onnx",
+#   "recognitionModel":"face_recognition/arcface_r50_fp16.onnx"},"status":"ok"}
 ```
 
-Bind ke `127.0.0.1` atau jaringan internal saja; **jangan** ekspos port
-service ke jaringan publik.
+Lalu lakukan enrollment dari halaman **Mahasiswa**, dan uji scan dengan
+klien Python di `docs/devices.md` §4 (tanpa perangkat keras).
 
-## 6. Hal yang belum diputuskan
+Pada request pertama setelah start, model sudah dimuat oleh `lifespan`
+FastAPI. Bila model belum ada di `services/face/models/`, layanan akan
+mengunduhnya dari Hugging Face saat start (butuh internet).
 
-- Kalibrasi ambang (`0.50`) terhadap data kampus: ukur FAR/FRR.
-- Pembatasan kandidat per kelas memakai `class_id` (saat ini 1:N ke semua
-  template).
-- Liveness / anti-spoof: belum ada di sisi service.
-- Enkripsi template saat disimpan, audit enrollment, consent, dan retensi.
+## 7. Keamanan dan hal yang perlu diperhatikan
+
+- **Face service tidak memiliki autentikasi** dan memakai CORS `*`. Jalankan
+  dengan `--host 127.0.0.1` atau di jaringan internal saja; pada
+  `docker-compose.yml`, ganti `"8000:8000"` menjadi `"127.0.0.1:8000:8000"`
+  bila Go berjalan di mesin yang sama.
+- Mode `APP_ENV=production` tetap mewajibkan `FACE_SERVICE_TOKEN` ≥ 32
+  karakter di Go. Token itu sudah dikirim, tetapi baru berguna setelah
+  `api.py` memeriksanya (mis. dependency FastAPI yang membandingkan header
+  `Authorization`).
+- **Ambang `0.45` belum dikalibrasi** dengan data kampus. Ukur FAR/FRR
+  dengan beberapa foto per mahasiswa sebelum dipakai sungguhan.
+- Pencocokan memuat seluruh template tiap scan (O(N)); cukup untuk ratusan
+  hingga beberapa ribu mahasiswa. Untuk skala lebih besar, batasi kandidat
+  per kelas atau tambahkan cache.
+- Mengganti model recognition (`/models/switch` atau `REC_MODEL_PATH`)
+  membuat embedding lama tidak sebanding → lakukan enrollment ulang. Template
+  berdimensi berbeda otomatis diabaikan, tetapi model berbeda dengan dimensi
+  sama **tidak** terdeteksi.
+- Liveness/anti-spoof belum ada di Python maupun Go; `liveness_passed` masih
+  klaim perangkat.
+- Python tidak menyimpan foto. Go menyimpan foto di Garage hanya bila
+  `S3_*` diisi (lihat §8). Embedding maupun foto adalah data biometrik
+  sensitif.
+
+## 8. Penyimpanan foto (S3 Garage)
+
+Pencocokan hanya memakai embedding, jadi foto tidak dibutuhkan untuk
+absensi. Foto tetap disimpan untuk tiga keperluan:
+
+1. **Enrollment ulang otomatis** saat model recognition diganti (embedding
+   model lama tidak sebanding dengan model baru).
+2. **Peninjauan** scan `Perlu ditinjau` oleh dosen/admin.
+3. **Audit dan sanggahan** (mahasiswa protes, dugaan titip absen).
+
+Alur:
+
+| Kejadian | Kunci objek | Dicatat di | Masa simpan |
+| --- | --- | --- | --- |
+| Enrollment berhasil | `enroll/{student_id}/{waktu}-{acak}.jpg` | `face_templates.image_key` | sampai enrollment ulang (foto lama dihapus) |
+| Scan `Hadir` | `scans/{yyyy}/{mm}/{dd}/{waktu}-{device}-{acak}.jpg` | `scan_events.image_key` | `IMAGE_RETENTION_DAYS` (30) |
+| Scan `Perlu ditinjau` / `Ditolak` | sama | sama | `IMAGE_REVIEW_RETENTION_DAYS` (90) |
+| Request gagal validasi / face service error | — | — | tidak disimpan |
+
+- Unggah diberi batas 3 detik. Bila Garage mati, absensi dan enrollment
+  tetap berjalan tanpa foto; kesalahannya dicatat di log.
+- Job retensi berjalan saat start lalu tiap jam: foto kedaluwarsa dihapus
+  dari bucket dan `image_key` di-`$unset`; event absensinya tetap ada.
+- Foto dilihat lewat `GET /api/v1/images/{key}` (sesi staf; dosen hanya
+  kelasnya). Bucket tidak perlu dan tidak boleh dibuka publik.
+- Klien S3 ada di `internal/storage/s3.go` (pustaka standar, AWS Signature
+  V4, gaya path); logika foto di `internal/api/images.go`.
+- `GET /api/v1/health` menampilkan `imageStorage.enabled/online`; log start
+  menulis `image storage: bucket "…" siap` atau peringatan.
+
+Menyiapkan Garage (di server):
+
+```bash
+garage bucket create methics-faces
+garage key create methics-app            # catat Key ID dan Secret key
+garage bucket allow --read --write methics-faces --key methics-app
+```
+
+Lalu isi `S3_ENDPOINT=http://10.100.1.11:3900`, `S3_REGION=garage` (sama
+dengan `s3_region` di `garage.toml`), `S3_BUCKET=methics-faces`,
+`S3_ACCESS_KEY_ID`, dan `S3_SECRET_ACCESS_KEY` di `.env`. Jangan memakai
+`admin_token` atau akun root server untuk aplikasi.
+
+Belum ada: penghapusan foto saat data mahasiswa dihapus (aplikasi belum punya
+fitur hapus mahasiswa) dan enrollment ulang otomatis dari foto tersimpan.

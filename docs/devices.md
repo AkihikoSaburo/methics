@@ -60,7 +60,8 @@ termasuk paket board.
 ### ⚠️ Jangan commit kredensial
 
 Sketch saat ini menulis SSID, password Wi-Fi, dan `DEVICE_TOKEN` langsung di
-kode. Folder `devices/` **belum** ter-commit ke Git, jadi sebelum meng-commit:
+kode, dan sketch itu **sudah ter-commit** (commit `9af21ce`), sehingga nilainya
+tersimpan di riwayat Git. Langkah perbaikan:
 
 1. Pindahkan nilai rahasia ke `secrets.h` di folder sketch:
 
@@ -76,8 +77,9 @@ kode. Folder `devices/` **belum** ter-commit ke Git, jadi sebelum meng-commit:
    `const char* WIFI_SSID = WIFI_SSID_VALUE;` (dst.).
 2. Tambahkan `devices/**/secrets.h` ke `.gitignore` dan sediakan
    `secrets.example.h` berisi placeholder.
-3. Karena token yang sekarang sudah tersimpan di berkas, **ganti
-   `DEVICE_TOKEN`** di `.env` dan perangkat setelah dipindahkan.
+3. **Ganti `DEVICE_TOKEN`** di `.env` dan perangkat, serta password Wi-Fi,
+   karena nilai lama sudah ada di riwayat Git. Menghapus berkas dari commit
+   berikutnya tidak menghapusnya dari riwayat.
 
 ## 3. Endpoint heartbeat
 
@@ -181,7 +183,9 @@ print(response.status_code, response.text)
 ```
 
 Scan baru berhasil dicatat bila face service aktif; bila tidak, backend
-membalas `502 face_service_error` dan **tidak** menyimpan event.
+membalas `502 face_service_error` dan **tidak** menyimpan event. Bila
+penyimpanan foto (`S3_*`) aktif, capture juga disimpan ke Garage dan bisa
+dibuka dari kolom **Foto** di halaman Log.
 
 ### Catatan implementasi ESP32
 
@@ -222,3 +226,4 @@ membalas `502 face_service_error` dan **tidak** menyimpan event.
 | Scan `400 stale_capture` | `captured_at` lebih dari 5 menit dari jam server |
 | Scan `403 unknown_device` | `device_id` belum ada di koleksi `devices` |
 | Scan `502 face_service_error` | face service mati / `FACE_SERVICE_URL` salah |
+| Kolom Foto di Log berisi `-` | penyimpanan foto nonaktif (`S3_*` kosong), Garage tidak terjangkau (lihat log `image storage: …`), scan dibuat sebelum `S3_*` diisi, atau foto sudah lewat masa retensi |

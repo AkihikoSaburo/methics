@@ -128,15 +128,6 @@ func (db *Database) UserByID(ctx context.Context, id string) (User, error) {
 	}, nil
 }
 
-func (db *Database) UserClassIDs(ctx context.Context, userID string) ([]string, error) {
-	var doc userDoc
-	err := db.Collection("users").FindOne(ctx, bson.M{"_id": userID}).Decode(&doc)
-	if err != nil {
-		return nil, err
-	}
-	return doc.ClassIDs, nil
-}
-
 func (db *Database) CountUsersByRole(ctx context.Context, role string) (int, error) {
 	count, err := db.Collection("users").CountDocuments(ctx, bson.M{
 		"role":   role,

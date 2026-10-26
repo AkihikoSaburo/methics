@@ -167,14 +167,6 @@ func Recover(next http.Handler) http.Handler {
 	})
 }
 
-func RoleFromRequest(r *http.Request) string {
-	principal, ok := PrincipalFromContext(r.Context())
-	if !ok {
-		return ""
-	}
-	return principal.Role
-}
-
 func unauthorized(w http.ResponseWriter, r *http.Request, apiRequest bool) {
 	if apiRequest || strings.HasPrefix(r.URL.Path, "/api/") {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized", "Silakan login untuk melanjutkan.")

@@ -106,13 +106,17 @@ yang lalu (diambil satu dokumen dengan `last_seen` terbaru).
 | Field | Tipe | Keterangan |
 | --- | --- | --- |
 | `student_id` | string | → `students._id`, **unik** (satu template per mahasiswa) |
-| `encoding` | — | embedding wajah 128 dimensi |
-| `created_at` | — | waktu enrollment |
+| `encoding` | array double | embedding ArcFace 512 dimensi (ternormalisasi L2) |
+| `dimension` | int | panjang `encoding` |
+| `detection_confidence` | double | confidence deteksi wajah saat enrollment |
+| `created_at` | date | enrollment pertama (UTC) |
+| `updated_at` | date | enrollment terakhir (UTC) |
+| `image_key` | string, opsional | kunci foto enrollment di bucket S3 (Garage); hanya ada bila penyimpanan foto aktif |
 
-Go **tidak menulis** koleksi ini; Go hanya menghitung dokumennya untuk status
-"wajah terdaftar". Penulisnya adalah face service Python (`/enroll`). Format
-pasti `encoding`/`created_at` ditentukan oleh implementasi Python — lihat
-`docs/face-service.md`.
+Ditulis oleh **Go** (`enrollEmbedding` di `internal/api/face.go`) dari
+embedding yang dikembalikan face service `POST /detect`; face service
+sendiri tidak mengakses MongoDB. Saat scan, Go memuat semua dokumen koleksi
+ini dan menghitung cosine similarity. Lihat `docs/face-service.md`.
 
 ### `scan_events`
 
@@ -124,9 +128,10 @@ pasti `encoding`/`created_at` ditentukan oleh implementasi Python — lihat
 | `scanned_at` | string | `captured_at` perangkat, diubah ke **RFC3339 UTC** |
 | `face_verified` | bool | face service menyatakan cocok dan ada `studentId` |
 | `liveness_passed` | bool | klaim perangkat (bukan deteksi biologis) |
-| `confidence` | number | dari face service (`1 - distance`) |
+| `confidence` | number | cosine similarity terbaik terhadap `face_templates` (0 bila tidak ada wajah) |
 | `status` | string | `Hadir` / `Perlu ditinjau` / `Ditolak` |
 | `review_reason` | string | alasan untuk status selain `Hadir` |
+| `image_key` | string, opsional | kunci foto capture di bucket S3; dihapus (`$unset`) saat foto melewati masa retensi |
 
 ## 3. Index
 
@@ -143,6 +148,8 @@ Dibuat oleh `migrate()`:
 | `scan_events` | `{class_id: 1, scanned_at: -1}` | — |
 | `scan_events` | `{student_id: 1, scanned_at: -1}` | — |
 | `scan_events` | `{status: 1}` | — |
+| `scan_events` | `{image_key: 1}` | sparse |
+| `face_templates` | `{image_key: 1}` | sparse |
 
 ## 4. Waktu dan "hari ini"
 

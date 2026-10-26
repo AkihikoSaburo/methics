@@ -24,6 +24,8 @@ Riwayat revisi:
 | Versi | Tanggal | Perubahan | Oleh |
 | --- | --- | --- | --- |
 | 0.1 | ISI: | Kerangka awal dari kode yang ada | ISI: |
+| 0.4 | 2026-10-26 | Penyimpanan foto wajah di object storage S3 (Garage) dengan retensi; tambah FR-BIO-11, IF-SW-06, NFR-REL-07; bug cakupan log (FR-LOG-01) diperbaiki; status privasi & test diperbarui; matriks dihitung ulang | ISI: |
+| 0.3 | 2026-10-26 | Face service Python (YOLO-FaceV2 + ArcFace) terhubung ke Go; penyimpanan & pencocokan embedding di Go; status biometrik diperbarui; tambah FR-BIO-10 | ISI: |
 | 0.2 | 2026-10-21 | Selaras dengan MongoDB; tambah log pemindaian (FR-LOG), heartbeat perangkat (FR-DEV-16); status biometrik diturunkan ke `[SEBAGIAN]` karena face service belum ada di repo; matriks dihitung ulang | ISI: |
 
 ## 1. Pendahuluan
@@ -89,9 +91,10 @@ Bagian 7 matriks keterlacakan; Bagian 8 daftar hal yang harus diputuskan.
 Sistem baru yang menggantikan pencatatan absensi manual. Terdiri dari:
 
 ```text
-Perangkat ESP32-CAM ──► Backend Go ──► Layanan verifikasi wajah (Python)
-Perangkat ESP8266 ───►     │                      │
-(heartbeat)                └──► Basis data (MongoDB) ◄┘
+Perangkat ESP32-CAM ──► Backend Go ──► Layanan verifikasi wajah (Python, stateless)
+Perangkat ESP8266 ───►     │
+(heartbeat)                ├──► Basis data (MongoDB): template, absensi
+                           └──► Object storage S3 (Garage): foto wajah (opsional)
 Staf (browser) ──────► Backend Go (halaman + API)
 ```
 
@@ -123,7 +126,8 @@ diekspos ke jaringan luar.
 - **Basis data:** MongoDB (default `mongodb://10.100.1.11:27017`, database `attendance`). `ISI:` versi & topologi produksi (single node / replica set).
 - **Perangkat:** ESP32-CAM untuk scan (firmware belum ada) dan ESP8266 untuk heartbeat (firmware ada). `ISI:` jumlah perangkat & lokasi.
 - **Jaringan:** `ISI:` LAN kampus / VPN / TLS reverse proxy.
-- **Layanan wajah:** Python 3.10–3.12 + `face-recognition`/dlib — **belum ada di repo** (kontrak di `docs/face-service.md`).
+- **Object storage:** Garage (S3-compatible), mis. `http://10.100.1.11:3900`, bucket `methics-faces`; opsional.
+- **Layanan wajah:** Python 3.10 + FastAPI + ONNX Runtime (YOLO-FaceV2, ArcFace R50), model dari Hugging Face `AkihikoSaburo/methics` (`services/face/`).
 
 ### 2.5 Batasan desain
 
@@ -133,7 +137,7 @@ diekspos ke jaringan luar.
 | CO-02 | CSP `script-src 'self'`; tidak ada script inline maupun CDN skrip. |
 | CO-03 | Aset skrip pihak ketiga di-vendor lokal dan versi-terpin. |
 | CO-04 | Backend tidak melakukan inference wajah; itu tugas layanan Python. |
-| CO-05 | Browser tidak pernah menerima gambar/template wajah. |
+| CO-05 | Browser tidak pernah menerima template wajah; foto hanya dikirim ke staf berwenang lewat endpoint ber-otorisasi. |
 | CO-06 | Autentikasi staf memakai session cookie; perangkat memakai token + HMAC. |
 
 ### 2.6 Asumsi & ketergantungan
@@ -141,9 +145,10 @@ diekspos ke jaringan luar.
 | ID | Asumsi/Ketergantungan |
 | --- | --- |
 | AS-01 | Jam perangkat ESP32 tersinkron dengan server (toleransi ±2 menit untuk request, ±5 menit untuk capture). |
-| AS-02 | Layanan wajah berjalan dan dapat dijangkau backend (saat ini belum diimplementasi). |
+| AS-02 | Layanan wajah berjalan dan dapat dijangkau backend melalui jaringan internal. |
 | AS-03 | `ISI:` ketersediaan jaringan di lokasi perangkat. |
 | AS-04 | `ISI:` data mahasiswa (NIM, nama, kelas) berasal dari sumber tepercaya. |
+| AS-05 | Object storage Garage dapat dijangkau backend bila penyimpanan foto diaktifkan; bila tidak, absensi tetap berjalan tanpa foto. |
 
 ## 3. Kebutuhan Fungsional
 
@@ -207,7 +212,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | FR-STU-04 | Administrator dapat menambah mahasiswa (nama, NIM, kelas) | W | `[TERSEDIA]` |
 | FR-STU-05 | Kesalahan validasi ditampilkan pada form (inline), bukan halaman error | W | `[TERSEDIA]` |
 | FR-STU-06 | NIM unik; penambahan dengan NIM ganda ditolak dengan pesan jelas | W | `[TERSEDIA]` |
-| FR-STU-07 | Administrator dapat melakukan enrollment wajah mahasiswa | W | `[SEBAGIAN]` (UI & proxy Go ada; face service belum ada) |
+| FR-STU-07 | Administrator dapat melakukan enrollment wajah mahasiswa | W | `[TERSEDIA]` |
 | FR-STU-08 | Enrollment gagal (wajah tidak terdeteksi/service mati) memberi pesan yang dapat ditindaklanjuti | W | `[TERSEDIA]` |
 | FR-STU-09 | Administrator dapat mengubah data mahasiswa | S | `[BELUM]` |
 | FR-STU-10 | Administrator dapat menghapus/menonaktifkan mahasiswa | S | `[BELUM]` |
@@ -236,7 +241,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | FR-DEV-02 | Request dengan timestamp kedaluwarsa ditolak | W | `[TERSEDIA]` |
 | FR-DEV-03 | Hanya perangkat terdaftar yang diterima | W | `[SEBAGIAN]` (scan memeriksa `devices`, tetapi ping/health dapat mendaftarkan ID baru otomatis) |
 | FR-DEV-04 | Kelas pada scan harus valid | W | `[TERSEDIA]` |
-| FR-DEV-05 | Capture diverifikasi ke template wajah melalui layanan wajah | W | `[SEBAGIAN]` (sisi Go ada; face service belum ada) |
+| FR-DEV-05 | Capture diverifikasi ke template wajah melalui layanan wajah | W | `[TERSEDIA]` |
 | FR-DEV-06 | Capture > 8 MB atau bukan gambar ditolak | W | `[TERSEDIA]` |
 | FR-DEV-07 | Baris absensi dicatat dengan status dan alasan peninjauan | W | `[TERSEDIA]` |
 | FR-DEV-08 | Status ditentukan berlapis: cocok + anggota kelas + liveness → Hadir; selain kondisi tertentu → Perlu ditinjau/Ditolak | W | `[TERSEDIA]` |
@@ -253,15 +258,17 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 
 | ID | Kebutuhan | Pri | Status |
 | --- | --- | --- | --- |
-| FR-BIO-01 | Enrollment memerlukan tepat satu wajah terdeteksi | W | `[SEBAGIAN]` (kontrak; service belum ada) |
-| FR-BIO-02 | Disimpan sebagai embedding (bukan gambar mentah) | W | `[SEBAGIAN]` (Go tidak menyimpan gambar; service belum ada) |
-| FR-BIO-03 | Pencocokan 1:N dengan ambang batas jarak | W | `[SEBAGIAN]` (kontrak, default 0.50; service belum ada) |
-| FR-BIO-04 | Hasil cocok menghasilkan identitas kandidat + skor keyakinan | W | `[SEBAGIAN]` (Go membaca `studentId`/`confidence`; service belum ada) |
+| FR-BIO-01 | Enrollment memerlukan tepat satu wajah terdeteksi | W | `[TERSEDIA]` |
+| FR-BIO-02 | Disimpan sebagai embedding (bukan gambar mentah) | W | `[TERSEDIA]` (ArcFace 512-d) |
+| FR-BIO-03 | Pencocokan 1:N dengan ambang batas | W | `[TERSEDIA]` (cosine similarity di Go, default 0.45) |
+| FR-BIO-04 | Hasil cocok menghasilkan identitas kandidat + skor keyakinan | W | `[TERSEDIA]` |
 | FR-BIO-05 | Ambang batas dikalibrasi terhadap data nyata (FRR/FAR) | W | `[BELUM]` |
 | FR-BIO-06 | Pencocokan dapat dibatasi ke kandidat kelas terkait | S | `[BELUM]` |
 | FR-BIO-07 | Enrollment tercatat untuk audit (siapa, kapan, hasil) | W | `[BELUM]` |
-| FR-BIO-08 | Persetujuan (consent), masa retensi, dan prosedur penghapusan biometrik | W | `[BELUM]` |
+| FR-BIO-08 | Persetujuan (consent), masa retensi, dan prosedur penghapusan biometrik | W | `[SEBAGIAN]` (foto scan dihapus otomatis setelah 30/90 hari; consent & penghapusan per mahasiswa belum) |
 | FR-BIO-09 | Template biometrik dienkripsi saat disimpan | W | `[BELUM]` |
+| FR-BIO-10 | Satu wajah tidak dapat didaftarkan pada dua NIM berbeda | S | `[TERSEDIA]` |
+| FR-BIO-11 | Foto enrollment & scan disimpan di object storage privat dan hanya dapat dilihat staf berwenang (dosen: kelasnya) | S | `[TERSEDIA]` (Garage; tautan foto di halaman Log) |
 
 ### 3.9 API integrasi
 
@@ -279,7 +286,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 
 | ID | Kebutuhan | Pri | Status |
 | --- | --- | --- | --- |
-| FR-LOG-01 | Menampilkan riwayat scan seluruh waktu (200 terbaru) dalam cakupan role | S | `[SEBAGIAN]` (filter `class` dapat menembus cakupan dosen — bug) |
+| FR-LOG-01 | Menampilkan riwayat scan seluruh waktu (200 terbaru) dalam cakupan role | S | `[TERSEDIA]` |
 | FR-LOG-02 | Menyaring log berdasarkan status dan kelas | S | `[TERSEDIA]` |
 | FR-LOG-03 | Mencari log berdasarkan nama atau NIM mahasiswa | S | `[TERSEDIA]` |
 | FR-LOG-04 | Ringkasan jumlah total/terverifikasi/ditinjau/ditolak seluruh waktu | S | `[TERSEDIA]` |
@@ -304,10 +311,11 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 
 | ID | Antarmuka | Detail | Status |
 | --- | --- | --- | --- |
-| IF-SW-01 | Backend ↔ Layanan wajah | HTTP internal; `/health`, `/enroll`, `/verify`; bearer `FACE_SERVICE_TOKEN` | `[SEBAGIAN]` (klien Go ada; service belum ada) |
+| IF-SW-01 | Backend ↔ Layanan wajah | HTTP internal; `GET /health`, `POST /detect` (embedding 512-d) | `[TERSEDIA]` (layanan belum memeriksa token) |
 | IF-SW-02 | Backend ↔ Basis data | MongoDB (driver Go resmi v1.17) | `[TERSEDIA]` |
-| IF-SW-05 | Layanan wajah ↔ Basis data | MongoDB, koleksi `face_templates` | `[BELUM]` |
+| IF-SW-05 | Penyimpanan template wajah | Go menulis `face_templates`; layanan wajah stateless | `[TERSEDIA]` |
 | IF-SW-03 | Browser ↔ Backend | HTML/htmx + JSON `/api/v1` | `[TERSEDIA]` |
+| IF-SW-06 | Backend ↔ Object storage | S3 API (SigV4, gaya path) ke Garage; `PUT/GET/DELETE` objek, `HEAD` bucket | `[TERSEDIA]` (opsional) |
 | IF-SW-04 | `ISI:` Backend ↔ SIAKAD/SSO kampus | ISI: | TBD |
 
 ### 4.3 Antarmuka perangkat keras
@@ -334,7 +342,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | ID | Kebutuhan | Target | Status |
 | --- | --- | --- | --- |
 | NFR-PERF-01 | Batas ukuran gambar yang diterima | 8 MB | `[TERSEDIA]` |
-| NFR-PERF-02 | Timeout panggilan ke layanan wajah | 8 detik | `[TERSEDIA]` |
+| NFR-PERF-02 | Timeout panggilan ke layanan wajah | 15 detik (`FACE_SERVICE_TIMEOUT_SECONDS`); unggah foto 3 detik | `[TERSEDIA]` |
 | NFR-PERF-03 | Waktu muat halaman dashboard | `ISI:` (mis. < 2 s pada LAN) | TBD |
 | NFR-PERF-04 | Throughput scan bersamaan | `ISI:` (mis. N per menit) | TBD |
 | NFR-PERF-05 | Latensi checkout absensi | `ISI:` | TBD |
@@ -361,10 +369,10 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 
 | ID | Kebutuhan | Status |
 | --- | --- | --- |
-| NFR-PRIV-01 | Gambar/template wajah tidak dikirim ke browser | `[TERSEDIA]` |
-| NFR-PRIV-02 | Gambar mentah tidak disimpan permanen | `[TERSEDIA]` |
+| NFR-PRIV-01 | Template wajah tidak dikirim ke browser; foto hanya untuk staf berwenang | `[TERSEDIA]` |
+| NFR-PRIV-02 | Foto tidak disimpan permanen | `[SEBAGIAN]` (foto scan berretensi 30/90 hari; foto enrollment disimpan selama template ada; dapat dimatikan dengan mengosongkan `S3_*`) |
 | NFR-PRIV-03 | Persetujuan (consent) penggunaan biometrik | `[BELUM]` |
-| NFR-PRIV-04 | Masa retensi & penghapusan data biometrik | `[BELUM]` |
+| NFR-PRIV-04 | Masa retensi & penghapusan data biometrik | `[SEBAGIAN]` (retensi otomatis foto scan; penghapusan per mahasiswa belum) |
 | NFR-PRIV-05 | Enkripsi at-rest untuk template & backup | `[BELUM]` |
 | NFR-PRIV-06 | `ISI:` dasar hukum & kebijakan privasi institusi (mis. UU PDP) | TBD |
 
@@ -375,6 +383,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | NFR-REL-01 | Pematian anggun (graceful shutdown) | `[TERSEDIA]` (8 detik) |
 | NFR-REL-02 | Skema & seed idempoten saat startup | `[TERSEDIA]` |
 | NFR-REL-03 | Perilaku saat layanan wajah mati: scan tidak dicatat sebagai hadir | `[TERSEDIA]` |
+| NFR-REL-07 | Object storage mati tidak menghentikan absensi maupun enrollment | `[TERSEDIA]` |
 | NFR-REL-04 | Backup basis data terjadwal & teruji | `[BELUM]` |
 | NFR-REL-05 | Target ketersediaan | `ISI:` (mis. 99% jam kerja) | TBD |
 | NFR-REL-06 | Pemulihan setelah kegagalan (RTO/RPO) | `ISI:` | TBD |
@@ -385,7 +394,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | --- | --- | --- |
 | NFR-MAINT-01 | Satu sumber query/validasi untuk halaman dan API | `[TERSEDIA]` |
 | NFR-MAINT-02 | Dokumentasi arsitektur, kode, API, handoff | `[TERSEDIA]` |
-| NFR-MAINT-03 | Test otomatis (unit/integrasi) | `[BELUM]` (dihapus pada code cleaning) |
+| NFR-MAINT-03 | Test otomatis (unit/integrasi) | `[SEBAGIAN]` (unit test face service, pencocokan, foto, klien S3; belum ada test MongoDB) |
 | NFR-MAINT-04 | Logging terstruktur & observability | `[BELUM]` |
 | NFR-MAINT-05 | Migrasi skema berversi | `[BELUM]` |
 | NFR-MAINT-06 | CI (lint, build, test) | `[BELUM]` |
@@ -415,7 +424,8 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | CN-03 | Ambang pencocokan belum dikalibrasi | Risiko false accept/reject |
 | CN-04 | Session & rate limit in-memory | Tidak aman untuk multi-instance |
 | CN-05 | Satu token perangkat global | Bocor satu = bocor semua |
-| CN-07 | Face service belum diimplementasi | Enrollment & scan belum dapat diuji end-to-end |
+| CN-07 | Face service tanpa autentikasi | Harus berjalan di jaringan internal |
+| CN-08 | Foto wajah tersimpan di object storage | Bucket privat, kunci khusus bucket, port RPC Garage dibatasi |
 | CN-06 | `ISI:` kepatuhan lain (akreditasi, audit internal) | ISI: |
 
 ## 7. Matriks Keterlacakan (ringkas)
@@ -426,22 +436,22 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | Otorisasi | 7 | 5 | 0 | 2 | 0 |
 | Dashboard | 7 | 6 | 0 | 1 | 0 |
 | Kelas | 3 | 2 | 0 | 1 | 0 |
-| Mahasiswa & enrollment | 12 | 8 | 1 | 3 | 0 |
+| Mahasiswa & enrollment | 12 | 9 | 0 | 3 | 0 |
 | Laporan | 9 | 5 | 0 | 3 | 1 |
-| Perangkat & absensi otomatis | 16 | 9 | 2 | 5 | 0 |
-| Pengenalan wajah | 9 | 0 | 4 | 5 | 0 |
+| Perangkat & absensi otomatis | 16 | 10 | 1 | 5 | 0 |
+| Pengenalan wajah | 11 | 6 | 1 | 4 | 0 |
 | API integrasi | 7 | 4 | 2 | 1 | 0 |
-| Log pemindaian | 6 | 4 | 1 | 1 | 0 |
-| **Total** | **87** | **51** | **10** | **24** | **2** |
+| Log pemindaian | 6 | 5 | 0 | 1 | 0 |
+| **Total** | **89** | **60** | **4** | **23** | **2** |
 
-> Angka di atas dihitung dari tabel Bagian 3 pada dokumen ini (revisi 0.2,
-> 21 Oktober 2026); perbarui bila kebutuhan berubah.
+> Angka di atas dihitung dari tabel Bagian 3 pada dokumen ini (revisi 0.4,
+> 26 Oktober 2026); perbarui bila kebutuhan berubah.
 
 ## 8. Daftar Keputusan yang Diperlukan (TBD)
 
 1. ~~Basis data produksi~~ — **diputuskan: MongoDB** (lihat ADR-6). Sisa: topologi (replica set?) dan kebijakan backup.
 2. Target performa & ketersediaan (NFR-PERF-03/04, NFR-REL-05/06).
-3. Regulasi privasi yang mengikat & kebijakan retensi biometrik.
+3. Regulasi privasi yang mengikat & kebijakan retensi biometrik (default teknis saat ini: foto scan 30 hari untuk `Hadir`, 90 hari lainnya — perlu disahkan).
 4. Perlu integrasi SIAKAD/SSO kampus?
 5. Jumlah perangkat & lokasi pemasangan.
 6. Apakah mahasiswa perlu melihat rekap absensinya sendiri (media lain)?

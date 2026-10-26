@@ -20,6 +20,7 @@
         <th>Keyakinan</th>
         <th>Perangkat</th>
         <th>Catatan</th>
+        <th>Foto</th>
       </tr>
     </thead>
     <tbody id="logEvents">
@@ -36,10 +37,11 @@
         <td>{{confidence .Confidence}}</td>
         <td>{{if .DeviceID}}{{.DeviceID}}{{else}}-{{end}}</td>
         <td>{{if .ReviewReason}}{{.ReviewReason}}{{else}}-{{end}}</td>
+        <td>{{if .ImageURL}}<a href="{{.ImageURL}}" target="_blank" rel="noopener">Lihat</a>{{else}}-{{end}}</td>
       </tr>
       {{else}}
       <tr>
-        <td colspan="7">{{if $.EmptyText}}{{$.EmptyText}}{{else}}Belum ada log pemindaian.{{end}}</td>
+        <td colspan="8">{{if $.EmptyText}}{{$.EmptyText}}{{else}}Belum ada log pemindaian.{{end}}</td>
       </tr>
       {{end}}
     </tbody>

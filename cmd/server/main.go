@@ -15,6 +15,7 @@ import (
 
 	"dash.algorithmics/internal/api"
 	"dash.algorithmics/internal/controller"
+	"dash.algorithmics/internal/storage"
 	"dash.algorithmics/internal/store"
 	"github.com/gorilla/csrf"
 	"github.com/joho/godotenv"
@@ -56,6 +57,9 @@ func main() {
 	sessions := security.NewSessionManager(config.Environment == "production")
 	authController := controller.NewAuth(database, sessions, web)
 	apiServer := api.New(database, config)
+	retentionCtx, stopRetention := context.WithCancel(context.Background())
+	defer stopRetention()
+	setupImageStorage(retentionCtx, apiServer, config)
 	partials, err := controller.NewPartials(apiServer, viewDir)
 	if err != nil {
 		log.Fatalf("load fragment templates: %v", err)
@@ -85,11 +89,13 @@ func main() {
 		csrf.SameSite(csrf.SameSiteLaxMode),
 	)(protected)
 
+	// Endpoint perangkat berada di luar sesi & CSRF; autentikasinya token/HMAC.
+	deviceAPI := apiServer.DeviceHandler()
 	router := http.NewServeMux()
-	router.Handle("POST /api/v1/scans", apiServer.DeviceHandler())
-	router.Handle("GET /api/v1/health", apiServer.DeviceHandler())
-	router.Handle("GET /api/v1/devices/ping", apiServer.DeviceHandler())
-	router.Handle("POST /api/v1/devices/ping", apiServer.DeviceHandler())
+	router.Handle("POST /api/v1/scans", deviceAPI)
+	router.Handle("GET /api/v1/health", deviceAPI)
+	router.Handle("GET /api/v1/devices/ping", deviceAPI)
+	router.Handle("POST /api/v1/devices/ping", deviceAPI)
 	router.Handle("/", sessions.LoadAndSave(csrfHandler))
 	address := env("HTTP_ADDR", ":8080")
 	server := &http.Server{
@@ -146,6 +152,30 @@ func bootstrapStaff(database *store.Database) {
 			log.Fatalf("create bootstrap lecturer: %v", err)
 		}
 	}
+}
+
+// setupImageStorage mengaktifkan penyimpanan foto wajah di S3 (Garage) bila
+// S3_* diisi. Garage yang tidak terjangkau saat start hanya menghasilkan
+// peringatan: absensi tetap berjalan, foto tidak tersimpan sampai pulih.
+func setupImageStorage(ctx context.Context, apiServer *api.Server, config api.Config) {
+	cfg := config.ImageStorage
+	if cfg.Endpoint == "" && cfg.Bucket == "" && cfg.AccessKeyID == "" && cfg.SecretAccessKey == "" {
+		log.Printf("image storage: nonaktif (S3_* kosong); foto wajah tidak disimpan")
+		return
+	}
+	client, err := storage.NewS3(cfg)
+	if err != nil {
+		log.Fatalf("image storage: %v", err)
+	}
+	apiServer.SetImageStore(client)
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := client.HeadBucket(checkCtx); err != nil {
+		log.Printf("image storage: PERINGATAN bucket %q di %s belum bisa diakses: %v", cfg.Bucket, cfg.Endpoint, err)
+	} else {
+		log.Printf("image storage: bucket %q di %s siap", cfg.Bucket, cfg.Endpoint)
+	}
+	go apiServer.RunImageRetention(ctx, time.Hour)
 }
 
 func splitCSV(value string) []string {
