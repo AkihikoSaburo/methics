@@ -106,6 +106,10 @@ func (s *Server) StaffHandler() http.Handler {
 	mux.HandleFunc("GET /api/v1/reports", s.reports)
 	mux.HandleFunc("POST /api/v1/students", s.createStudent)
 	mux.HandleFunc("POST /api/v1/students/{nim}/face-template", s.enrollFace)
+	mux.HandleFunc("DELETE /api/v1/students/{nim}", s.deleteStudent)
+	mux.HandleFunc("GET /api/v1/staff", s.listStaff)
+	mux.HandleFunc("POST /api/v1/staff", s.createLecturer)
+	mux.HandleFunc("DELETE /api/v1/staff/{id}", s.deleteStaff)
 	mux.HandleFunc("GET /api/v1/images/{key...}", s.serveImage)
 	return mux
 }
@@ -435,8 +439,10 @@ func (s *Server) ScanStatusCounts(ctx context.Context, role string, classes []st
 	return s.scanStatusCounts(ctx, principal{role: role, classes: classes})
 }
 
-// AllScanEvents mengembalikan seluruh event scan (tanpa batas tanggal) dengan
-// filter opsional status dan kelas. Dibatasi 200 event terbaru.
+// AllScanEvents mengembalikan event scan seluruh waktu (200 terbaru) untuk
+// halaman Log, dengan filter opsional status, kelas, dan pencarian nama/NIM.
+// Filter kelas dari dosen yang bukan kelasnya menghasilkan daftar kosong, jadi
+// filter pengguna tidak pernah melonggarkan cakupan role.
 func (s *Server) AllScanEvents(ctx context.Context, role string, roleClasses []string, statusFilter, classFilter, search string) ([]ScanEvent, error) {
 	filter := bson.M{}
 	if role == "dosen" {
@@ -600,7 +606,8 @@ func (s *Server) AllScanStatusCounts(ctx context.Context, role string, classes [
 	return s.aggregateStatusCounts(ctx, filter)
 }
 
-// DeviceStatus melaporkan apakah perangkat ESP32 baru-baru ini mengirim data.
+// DeviceStatus melaporkan apakah ada perangkat dengan last_seen < 2 menit
+// (scan, heartbeat, atau health) dan jam terakhirnya dalam format lokal HH:MM.
 func (s *Server) DeviceStatus(ctx context.Context) (bool, string, error) {
 	lastSeen, err := s.lastDeviceSeen(ctx)
 	if err != nil {
@@ -645,6 +652,7 @@ type RosterEntry struct {
 	ScannedAt    *string
 	FaceVerified bool
 	FaceEnrolled bool
+	FaceImageURL string // URL foto enrollment (kosong bila tidak tersimpan di Garage)
 	DeviceID     string
 	Status       string
 }
@@ -652,6 +660,7 @@ type RosterEntry struct {
 var (
 	ErrMissingFields   = errors.New("missing fields")
 	ErrStudentExists   = errors.New("student exists")
+	ErrInvalidNIM      = errors.New("invalid nim")
 	ErrInvalidClass    = errors.New("invalid class")
 	ErrStudentNotFound = errors.New("student not found")
 	ErrFaceService     = errors.New("face service error")
@@ -662,6 +671,13 @@ func (s *Server) Roster(ctx context.Context, role string, classes []string) ([]R
 	return s.dashboardAttendance(ctx, principal{role: role, classes: classes})
 }
 
+// nimPattern: NIM berupa 9 digit angka, mis. 241011001 (2 digit angkatan +
+// 4 digit kode prodi + 3 digit nomor urut).
+var nimPattern = regexp.MustCompile(`^[0-9]{9}$`)
+
+// ValidNIM melaporkan apakah nim sesuai format 9 digit angka.
+func ValidNIM(nim string) bool { return nimPattern.MatchString(nim) }
+
 // CreateStudent memvalidasi dan menyimpan mahasiswa baru. Dipakai endpoint JSON
 // dan fragment htmx agar aturan validasi tetap satu sumber.
 func (s *Server) CreateStudent(ctx context.Context, name, nim, classID string) (string, error) {
@@ -670,6 +686,9 @@ func (s *Server) CreateStudent(ctx context.Context, name, nim, classID string) (
 	classID = strings.TrimSpace(strings.ToUpper(classID))
 	if name == "" || nim == "" || classID == "" {
 		return "", ErrMissingFields
+	}
+	if !ValidNIM(nim) {
+		return "", ErrInvalidNIM
 	}
 
 	classCount, err := s.db.Collection("classes").CountDocuments(ctx, bson.M{"_id": classID})
@@ -705,6 +724,8 @@ func (s *Server) CreateStudent(ctx context.Context, name, nim, classID string) (
 
 // EnrollFace mendeteksi wajah pada foto lewat face service (POST /detect),
 // lalu menyimpan embedding-nya sebagai template mahasiswa dengan NIM tersebut.
+// Bila penyimpanan foto aktif, foto enrollment juga disimpan ke Garage
+// (result["imageStored"]); kegagalan foto tidak menggagalkan enrollment.
 // Error yang mungkin: ErrStudentNotFound, ErrInvalidImage, ErrNoFace,
 // ErrMultipleFaces, ErrFaceAlreadyEnrolled (map berisi conflictNim), ErrFaceService.
 func (s *Server) EnrollFace(ctx context.Context, nim string, image []byte, filename string) (map[string]any, error) {
@@ -760,6 +781,7 @@ func rosterToMaps(entries []RosterEntry) []map[string]any {
 			"scannedAt":    scanTime,
 			"faceVerified": entry.FaceVerified,
 			"faceEnrolled": entry.FaceEnrolled,
+			"faceImageUrl": entry.FaceImageURL,
 			"deviceId":     entry.DeviceID,
 			"status":       entry.Status,
 		})
@@ -844,15 +866,23 @@ func (s *Server) dashboardAttendance(ctx context.Context, user principal) ([]Ros
 		studentIDs = append(studentIDs, st.ID)
 	}
 
+	// Hanya student_id dan image_key yang diambil; embedding 512-d tidak perlu
+	// untuk roster.
 	enrolledMap := make(map[string]bool)
-	ftCur, err := s.db.Collection("face_templates").Find(ctx, bson.M{"student_id": bson.M{"$in": studentIDs}})
+	faceImageMap := make(map[string]string)
+	ftCur, err := s.db.Collection("face_templates").Find(ctx, bson.M{"student_id": bson.M{"$in": studentIDs}},
+		options.Find().SetProjection(bson.M{"student_id": 1, "image_key": 1}))
 	if err == nil {
 		var ftList []struct {
 			StudentID string `bson:"student_id"`
+			ImageKey  string `bson:"image_key"`
 		}
 		if err := ftCur.All(ctx, &ftList); err == nil {
 			for _, ft := range ftList {
 				enrolledMap[ft.StudentID] = true
+				if ft.ImageKey != "" {
+					faceImageMap[ft.StudentID] = ImageURL(ft.ImageKey)
+				}
 			}
 		}
 	}
@@ -896,6 +926,7 @@ func (s *Server) dashboardAttendance(ctx context.Context, user principal) ([]Ros
 			ClassName:    classesMap[st.ClassID],
 			Status:       "Belum hadir",
 			FaceEnrolled: enrolledMap[st.ID],
+			FaceImageURL: faceImageMap[st.ID],
 		}
 		key := st.ID + "|" + st.ClassID
 		if scan, ok := latestScanMap[key]; ok {
@@ -1008,6 +1039,8 @@ func (s *Server) createStudent(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, ErrMissingFields):
 			writeError(w, http.StatusBadRequest, "missing_fields", "name, nim, dan classId wajib diisi.")
+		case errors.Is(err, ErrInvalidNIM):
+			writeError(w, http.StatusBadRequest, "invalid_nim", "NIM harus 9 digit angka, mis. 241011001.")
 		case errors.Is(err, ErrStudentExists):
 			writeError(w, http.StatusConflict, "student_exists", "NIM sudah terdaftar atau data tidak valid.")
 		case errors.Is(err, ErrInvalidClass):
@@ -1059,6 +1092,11 @@ func (s *Server) enrollFace(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"nim": nim, "faceEnrolled": true, "result": response})
 }
 
+// receiveScan: POST /api/v1/scans (perangkat). Urutan: token → gambar → field →
+// captured_at ±5 menit → liveness → HMAC + X-Device-Timestamp ±2 menit →
+// perangkat & kelas terdaftar → verifyCapture (Python /detect + cosine 1:N) →
+// status berlapis → foto ke Garage (opsional) → simpan scan_events. Face
+// service gagal → 502 dan event tidak dicatat. Kontrak: API.md, docs/devices.md §6.
 func (s *Server) receiveScan(w http.ResponseWriter, r *http.Request) {
 	if !s.validDeviceToken(r) {
 		writeError(w, http.StatusUnauthorized, "invalid_device", "Token perangkat tidak valid.")
@@ -1177,6 +1215,9 @@ func (s *Server) receiveScan(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// devicePing: GET|POST /api/v1/devices/ping (heartbeat). ID dari form, query,
+// header X-Device-Id, atau default ESP32-GED-A1; token hanya diperiksa di
+// production. Melakukan upsert devices (lihat risiko di docs/devices.md §7).
 func (s *Server) devicePing(w http.ResponseWriter, r *http.Request) {
 	deviceID := strings.TrimSpace(r.FormValue("device_id"))
 	if deviceID == "" {
@@ -1216,6 +1257,8 @@ func (s *Server) devicePing(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// health: GET /api/v1/health (publik) — status face service dan penyimpanan
+// foto. ?device_id= juga memperbarui last_seen perangkat (upsert, tanpa token).
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	deviceID := strings.TrimSpace(r.URL.Query().Get("device_id"))
 	if deviceID != "" {

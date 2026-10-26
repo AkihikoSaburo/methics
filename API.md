@@ -1,7 +1,8 @@
 # Kontrak API Algorithmics Face Recognation
 
 Acuan: `cmd/server/main.go` (routing), `internal/api/server.go` (handler JSON),
-`internal/controller/partials.go` (fragment htmx). Bila dokumen ini berbeda
+`internal/api/admin.go` (hapus mahasiswa, akun dosen), `internal/api/images.go`
+(foto), `internal/controller/partials.go` dan `admin_partials.go` (fragment htmx). Bila dokumen ini berbeda
 dengan kode, **kode yang berlaku** — lalu perbarui dokumen ini.
 
 Go adalah satu-satunya pintu masuk untuk browser dan perangkat. Face service
@@ -15,9 +16,10 @@ Python bersifat internal di belakang Go (kontraknya di
 | Halaman | `GET /`, `/mahasiswa`, `/kelas`, `/laporan`, `/logs` | session staf | HTML |
 | Halaman | `GET /akses` | session administrator (dosen dialihkan ke `/`) | HTML |
 | Auth | `GET /login`, `POST /login`, `POST /logout` | — / CSRF | HTML / redirect |
-| Fragment | `GET/POST /partials/*` (§5) | session staf (+ CSRF untuk POST) | HTML |
+| Fragment | `GET/POST/DELETE /partials/*` (§5) | session staf (+ CSRF untuk POST/DELETE) | HTML |
 | API staf | `GET /api/v1/dashboard`, `/classes`, `/reports` | session staf | JSON |
 | API staf | `POST /api/v1/students`, `/students/{nim}/face-template` | session administrator + CSRF | JSON |
+| API staf | `DELETE /api/v1/students/{nim}`, `GET\|POST /api/v1/staff`, `DELETE /api/v1/staff/{id}` | session administrator + CSRF | JSON |
 | API staf | `GET /api/v1/images/{key...}` | session staf (dosen: hanya kelasnya) | gambar |
 | Perangkat | `POST /api/v1/scans` | bearer `DEVICE_TOKEN` + HMAC + timestamp | JSON |
 | Perangkat | `GET\|POST /api/v1/devices/ping` | bearer `DEVICE_TOKEN` (hanya production) | JSON |
@@ -41,12 +43,13 @@ pengujian, dan perangkat. Keduanya memakai query & validasi yang sama di
 - Session cookie `itbjh_session`: HttpOnly, SameSite=Lax, umur 8 jam, idle
   30 menit, `Secure` bila `APP_ENV=production`. Disimpan **in-memory**.
 - CSRF (gorilla/csrf, cookie `itbjh_csrf`) berlaku untuk semua method tidak
-  aman di jalur staf, termasuk `POST /api/v1/*` staf. Kirim lewat field form
+  aman di jalur staf, termasuk `POST`/`DELETE /api/v1/*` staf. Kirim lewat field form
   `csrf_token` atau header `X-CSRF-Token`. Token tersedia di
   `<meta name="csrf-token">` pada halaman. Token salah → `403` (teks biasa).
 - Role dan kelas dosen dibaca ulang dari MongoDB di setiap request
   (`users.role`, `users.class_ids`). Role dari query/header klien tidak
-  pernah dipakai.
+  pernah dipakai. Akun yang dihapus atau dinonaktifkan langsung kehilangan
+  sesinya pada request berikutnya.
 
 ### Perangkat
 
@@ -67,9 +70,14 @@ Semua error dari `/api/v1/*` berbentuk:
 | 403 | `forbidden` | role tidak diizinkan (mis. dosen memanggil `POST /api/v1/students`) |
 | 400 | `invalid_json` | body JSON rusak / > 1 MiB |
 | 400 | `missing_fields` | field wajib kosong |
+| 400 | `invalid_nim` | NIM bukan 9 digit angka (format `241011001`) |
 | 400 | `invalid_class`, `unknown_class` | kelas tidak ada |
 | 409 | `student_exists` | NIM sudah terdaftar |
-| 404 | `student_not_found` | NIM tidak ditemukan saat enrollment |
+| 404 | `student_not_found` | NIM tidak ditemukan (enrollment / hapus) |
+| 400 | `invalid_input` | data akun dosen tidak valid (username, password, kelas) |
+| 409 | `username_taken` | username akun sudah dipakai |
+| 403 | `not_lecturer` | mencoba menghapus akun administrator lewat `/api/v1/staff/{id}` |
+| 404 | `user_not_found` | akun staf tidak ditemukan |
 | 422 | `no_face`, `multiple_faces` | foto enrollment tidak berisi tepat satu wajah |
 | 409 | `face_already_enrolled` | wajah pada foto enrollment sudah terdaftar atas NIM lain |
 | 400 | `invalid_image` | bukan multipart, field `image` hilang, kosong, atau > 8 MiB |
@@ -79,7 +87,9 @@ Semua error dari `/api/v1/*` berbentuk:
 | 400 | `stale_capture` | `captured_at` bukan RFC3339 atau > ±5 menit |
 | 400 | `invalid_liveness` | `liveness_passed` bukan `true`/`false` |
 | 403 | `unknown_device` | `device_id` tidak ada di koleksi `devices` |
-| 502 | `face_service_error` | face service gagal/timeout (8 detik) |
+| 502 | `face_service_error` | face service gagal/timeout (`FACE_SERVICE_TIMEOUT_SECONDS`, default 15 detik) |
+| 404 | `image_not_found`, `image_storage_disabled` | foto tidak tercatat/sudah dihapus, atau `S3_*` kosong |
+| 502 | `image_storage_error` | Garage tidak dapat dihubungi saat mengambil foto |
 | 500 | `database_error`, `enroll_error` | kegagalan internal |
 
 ## 4. API JSON
@@ -105,7 +115,7 @@ dalam 3 detik.
 `faceVerification.online` = face service menjawab `GET /health` dalam
 3 detik dengan `200` dan `model_loaded: true`. Bila tidak terjangkau:
 `{"online": false, "provider": "Python face service"}`. Opsional `?device_id=<id>` memperbarui `devices.last_seen`
-(upsert, **tanpa token** — lihat catatan keamanan di `docs/devices.md` §5).
+(upsert, **tanpa token** — lihat catatan keamanan di `docs/devices.md` §7).
 
 ### `GET /api/v1/dashboard` — staf
 
@@ -120,15 +130,16 @@ Administrator menerima semua kelas; dosen hanya `users.class_ids`. Data
   ],
   "integrations": {
     "esp32": { "online": true, "lastSeen": "08:11" },
-    "faceVerification": { "online": true, "provider": "Python face_recognition" }
+    "faceVerification": { "online": true, "provider": "Python YOLO-FaceV2 + ArcFace", "detectionModel": "…", "recognitionModel": "…" }
   },
   "attendance": [
     {
-      "student": { "id": "student-ik24001", "nim": "IK24001", "name": "Alya Putri" },
+      "student": { "id": "student-241011001", "nim": "241011001", "name": "Alya Putri" },
       "class": { "id": "IK24-A", "name": "Ilmu Komputer A" },
       "scannedAt": "2026-10-21T00:02:00Z",
       "faceVerified": true,
       "faceEnrolled": true,
+      "faceImageUrl": "/api/v1/images/enroll/student-241011001/20261026T060000Z-3f9a1c2b4d5e.jpg",
       "deviceId": "ESP32-GED-A1",
       "status": "Hadir"
     }
@@ -164,18 +175,20 @@ Administrator menerima semua kelas; dosen hanya `users.class_ids`. Data
   "classes": [ { "id": "IK24-A", "name": "Ilmu Komputer A", "studentCount": 2, "enrolled": 1, "present": 1, "attendanceRate": 50 } ],
   "events": [
     {
-      "student": { "nim": "IK24001", "name": "Alya Putri" },
+      "student": { "nim": "241011001", "name": "Alya Putri" },
       "class": { "id": "IK24-A", "name": "Ilmu Komputer A" },
       "scannedAt": "2026-10-21T00:02:00Z",
       "status": "Hadir",
       "confidence": 0.91,
       "reviewReason": "",
-      "deviceId": "ESP32-GED-A1"
+      "deviceId": "ESP32-GED-A1",
+      "imageUrl": "/api/v1/images/scans/2026/10/21/000200Z-ESP32-GED-A1-3f9a1c2b4d5e.jpg"
     }
   ]
 }
 ```
 
+`imageUrl` kosong bila foto tidak disimpan atau sudah lewat masa retensi.
 `summary` dan `statusBreakdown` dihitung untuk **hari ini**; `events` adalah
 **50 event terbaru tanpa batas tanggal**. `statusBreakdown` hanya memuat
 status yang jumlahnya > 0.
@@ -185,16 +198,37 @@ status yang jumlahnya > 0.
 Request `application/json` (maks 1 MiB):
 
 ```json
-{ "name": "Fajar Nugroho", "nim": "IK24006", "classId": "IK24-A" }
+{ "name": "Fajar Nugroho", "nim": "241011006", "classId": "IK24-A" }
 ```
 
-`nim` dan `classId` di-uppercase. Respons `201`:
+`nim` wajib **9 digit angka** (mis. `241011001`); `classId` di-uppercase. Respons `201`:
 
 ```json
-{ "id": "student-ik24006", "nim": "IK24006", "name": "Fajar Nugroho", "classId": "IK24-A", "faceEnrolled": false }
+{ "id": "student-241011006", "nim": "241011006", "name": "Fajar Nugroho", "classId": "IK24-A", "faceEnrolled": false }
 ```
 
-Error: `400 invalid_json | missing_fields | invalid_class`, `409 student_exists`.
+Error: `400 invalid_json | missing_fields | invalid_nim | invalid_class`, `409 student_exists`.
+
+### `DELETE /api/v1/students/{nim}` — administrator + CSRF
+
+Menghapus mahasiswa **beserta** template wajah, foto enrollment & foto scan di
+Garage, seluruh event scan, dan relasi `class_students`. Tidak bisa dibatalkan.
+Respons `200`: `{"nim":"241011001","name":"Alya Putri","deleted":true}`.
+Error: `403 forbidden`, `404 student_not_found`.
+
+Mahasiswa tidak di-seed, jadi mahasiswa yang dihapus tidak muncul lagi
+setelah restart.
+
+### `GET /api/v1/staff` · `POST /api/v1/staff` · `DELETE /api/v1/staff/{id}` — administrator + CSRF
+
+- `GET` → `{"staff":[{"id","username","displayName","role","active","classIds","createdAt"}]}` (tanpa hash password).
+- `POST` membuat **akun dosen**: JSON `{"username":"rina.wibowo","displayName":"Dr. Rina Wibowo","password":"…","classIds":["IK24-A"]}`.
+  Username disimpan huruf kecil (`^[a-z0-9._-]{3,32}$`), password ≥ 12
+  karakter di production (≥ 4 di development), minimal satu kelas yang ada.
+  Respons `201`. Error: `400 invalid_input`, `409 username_taken`.
+- `DELETE` menghapus **akun dosen** saja (`403 not_lecturer` untuk administrator,
+  `404 user_not_found`). Sesi dosen itu langsung berakhir karena
+  `RequireSession` memuat ulang user dari database setiap request.
 
 ### `POST /api/v1/students/{nim}/face-template` — administrator + CSRF
 
@@ -205,11 +239,11 @@ sudah terdaftar atas NIM lain, lalu menyimpan embedding 512-d ke
 
 ```json
 {
-  "nim": "IK24001",
+  "nim": "241011001",
   "faceEnrolled": true,
   "result": {
-    "studentId": "student-ik24001", "dimension": 512, "detectionConfidence": 0.93, "processingTimeMs": 85.4,
-    "imageStored": true, "imageUrl": "/api/v1/images/enroll/student-ik24001/20261026T060000Z-3f9a1c2b4d5e.jpg"
+    "studentId": "student-241011001", "dimension": 512, "detectionConfidence": 0.93, "processingTimeMs": 85.4,
+    "imageStored": true, "imageUrl": "/api/v1/images/enroll/student-241011001/20261026T060000Z-3f9a1c2b4d5e.jpg"
   }
 }
 ```
@@ -261,7 +295,7 @@ Event disimpan ke `scan_events` dan `devices.last_seen` diperbarui. Respons
 ```json
 {
   "status": "Hadir",
-  "student": { "id": "student-ik24001", "nim": "IK24001", "name": "Alya Putri" },
+  "student": { "id": "student-241011001", "nim": "241011001", "name": "Alya Putri" },
   "faceVerified": true,
   "confidence": 0.91,
   "reviewReason": ""
@@ -289,7 +323,7 @@ Penting: `liveness_passed` adalah klaim perangkat yang ditandatangani, bukan
 deteksi biologis. HMAC melindungi integritas pesan, bukan membuktikan bahwa
 wajah di gambar adalah orang hidup. Belum ada nonce anti-replay.
 
-Contoh klien uji: [docs/devices.md](docs/devices.md) §4.
+Contoh klien uji: [docs/devices.md](docs/devices.md) §6. Firmware perangkat yang memakai kontrak ini: `devices/esp32_scanner/` (lihat `docs/devices.md` §2).
 
 ### `GET|POST /api/v1/devices/ping` — perangkat
 
@@ -305,7 +339,8 @@ bearer hanya diperiksa saat `APP_ENV=production`. Upsert `devices`.
 
 Semua wajib session staf, membalas HTML, dan memakai query ber-scope role.
 Sesi tidak valid → `401` JSON (`app.js` lalu mengalihkan ke `/login`).
-POST wajib CSRF (`app.js` menambah header `X-CSRF-Token` otomatis).
+POST/DELETE wajib CSRF (`app.js` menambah header `X-CSRF-Token` otomatis).
+Filter `class` dari dosen yang bukan kelasnya menghasilkan data kosong.
 
 | Endpoint | Guna | Akses | Penyegaran |
 | --- | --- | --- | --- |
@@ -316,19 +351,22 @@ POST wajib CSRF (`app.js` menambah header `X-CSRF-Token` otomatis).
 | `GET /partials/mahasiswa/form` | form dialog pendaftaran | administrator | sekali saat halaman dimuat |
 | `POST /partials/mahasiswa/students` | tambah mahasiswa (form-urlencoded `name`, `nim`, `classId`) | administrator | — |
 | `POST /partials/mahasiswa/{nim}/face-template` | enrollment wajah (multipart `image`, dikirim otomatis saat file dipilih; `q`/`class` ikut lewat `hx-include` agar filter tetap) | administrator | — |
+| `DELETE /partials/mahasiswa/{nim}` | hapus mahasiswa + data wajah, foto, riwayat scan (konfirmasi `hx-confirm`; `q`/`class` lewat `hx-include`) → roster | administrator | — |
+| `GET /partials/akses/staff` | form buat dosen + tabel akun staf | administrator | sekali saat halaman `/akses` dimuat |
+| `POST /partials/akses/lecturers` | buat akun dosen (form `username`, `displayName`, `password`, `classIds` berulang) → fragment akun | administrator | — |
+| `DELETE /partials/akses/staff/{id}` | hapus akun dosen (konfirmasi) → fragment akun | administrator | — |
 | `GET /partials/logs?q=&status=&class=` | log pemindaian seluruh waktu, maks 200 baris (+ ringkasan via `hx-swap-oob`) | staf | `load, every 15s`, ketik, ganti filter |
 
 Konvensi:
 
 - **Sukses POST** → HTML (form bersih) + header `HX-Trigger` JSON, mis.
   `{"toast":{"message":"Mahasiswa X berhasil ditambahkan."},"student-dialog-close":true,"roster-changed":true}`.
+  Enrollment, hapus mahasiswa, dan aksi akun dosen mengembalikan fragmen yang
+  sama (roster / akun) dengan pesan sukses atau gagal di atas tabel.
+- **Hapus** memakai `hx-confirm` (dialog konfirmasi browser) sebelum request
+  `DELETE` dikirim.
 - **Gagal validasi** → **HTTP 200** dengan pesan inline di form/region, bukan
   status 4xx. Non-administrator → `403` teks biasa.
-- ⚠️ **Bug yang diketahui:** pada `/partials/logs`, parameter `class` menimpa
-  pembatasan kelas dosen di `AllScanEvents` (`filter["class_id"]` ditulis
-  ulang), sehingga dosen dapat melihat log kelas lain lewat
-  `?class=<kelas lain>`. Perbaikan: abaikan/ tolak `class` yang tidak ada di
-  `users.class_ids` untuk role dosen.
 - Ringkasan `/partials/logs` (total, terverifikasi, ditinjau, ditolak)
   dihitung untuk **seluruh waktu** dalam cakupan role dan **tidak** ikut
   filter; tabelnya mengikuti filter. Pencarian `q` mencocokkan nama atau NIM
@@ -339,7 +377,8 @@ Konvensi:
 | Kemampuan | administrator | dosen | mahasiswa |
 | --- | --- | --- | --- |
 | Ringkasan, kelas, laporan, log, roster | semua kelas | kelas di `users.class_ids` | tidak ada akses |
-| Daftarkan mahasiswa | ya | tidak | — |
+| Daftarkan & hapus mahasiswa | ya | tidak | — |
+| Buat & hapus akun dosen (halaman `/akses`) | ya | tidak | — |
 | Enrollment wajah | ya | tidak | — |
 | Halaman `/akses` | ya | dialihkan ke `/` | — |
 | Absensi | — | — | lewat scan perangkat |
@@ -356,5 +395,8 @@ ditugaskan melihat data kosong.
   pembatasan kelas. Foto scan dihapus otomatis setelah
   `IMAGE_RETENTION_DAYS` (Hadir) / `IMAGE_REVIEW_RETENTION_DAYS` (lainnya);
   foto enrollment lama dihapus saat enrollment ulang.
+- Menghapus mahasiswa (`DELETE /api/v1/students/{nim}` atau tombol di halaman
+  Mahasiswa) menghapus template, foto enrollment, foto scan, dan riwayat
+  scannya sekaligus.
 - Lindungi template dengan kontrol akses ketat, enkripsi backup, retensi
-  terbatas, serta prosedur persetujuan dan penghapusan.
+  terbatas, serta prosedur persetujuan.

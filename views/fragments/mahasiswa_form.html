@@ -11,7 +11,8 @@
     {{if .Error}}<p class="field-error" role="alert">{{.Error}}</p>{{end}}
     <label class="field">Nama lengkap<input name="name" required maxlength="120" autocomplete="name"
         placeholder="Nama mahasiswa" value="{{.Name}}"></label>
-    <label class="field">NIM<input name="nim" required maxlength="32" pattern="[A-Za-z0-9\-]+" placeholder="IK24006"
+    <label class="field">NIM<input name="nim" required minlength="9" maxlength="9" pattern="[0-9]{9}" inputmode="numeric"
+        title="9 digit angka, mis. 241011001" placeholder="241011001"
         value="{{.NIM}}"></label>
     <label class="field">Kelas<select name="classId" required>
         <option value="">Pilih kelas</option>

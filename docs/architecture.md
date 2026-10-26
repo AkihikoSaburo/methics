@@ -17,8 +17,9 @@ kedua.
   tanpa reload penuh.
 - **Layanan pendukung**: face service Python (internal, tidak diekspos) dan
   object storage S3 **Garage** untuk foto wajah (opsional, privat).
-- **Klien**: browser staf (admin/dosen), perangkat ESP32-CAM (scan wajah —
-  firmware belum ada), dan ESP8266 (heartbeat — firmware ada di `devices/`).
+- **Klien**: browser staf (admin/dosen) dan perangkat absensi ESP32 + ESP32-CAM
+  (scan wajah + heartbeat, `devices/esp32_scanner` & `devices/esp32cam_uart`);
+  ESP8266 hanya untuk uji heartbeat.
 
 Konsekuensi yang disengaja: halaman dan API berbagi satu sumber query/validasi
 (`internal/api`), sehingga aturan role tidak bisa berbeda antara tampilan dan
@@ -29,7 +30,7 @@ API.
 | Lapisan | Lokasi | Peran |
 | --- | --- | --- |
 | Entrypoint & routing | `cmd/server/main.go` | wiring route, middleware, bootstrap, env |
-| HTTP API & domain | `internal/api/server.go` | endpoint staf + perangkat, query ber-scope role, error sentinel |
+| HTTP API & domain | `internal/api/server.go`, `admin.go`, `face.go` | endpoint staf + perangkat, query ber-scope role, error sentinel; fitur administrator (hapus mahasiswa, akun dosen); klien face service |
 | Halaman & fragment | `internal/controller/` | render `views/pages` (shell) dan `views/fragments` (htmx) |
 | Keamanan | `internal/security/middleware.go` | `RequireSession`, `RequireRole`, `Principal`, security headers/CSP |
 | Penyimpanan | `internal/store/database.go`, `users.go` | koneksi, index, seed MongoDB; akun staf (bcrypt) |
@@ -37,7 +38,7 @@ API.
 | Tampilan | `views/` | `layouts/base.html`, `pages/*`, `fragments/*` |
 | Aset statis | `static/` | `css/`, `js/app.js`, `js/lib/ui.js`, vendor lokal |
 | Face service | `services/face/` | Python (stateless): `/health`, `/detect` → embedding ArcFace 512-d; dipanggil oleh `internal/api/face.go` |
-| Firmware | `devices/esp8266/` | heartbeat ESP8266 ke `/api/v1/devices/ping` |
+| Firmware | `devices/` | `esp32_scanner` (ESP32 utama → `/api/v1/scans`, `/devices/ping`), `esp32cam_uart` (kamera via UART), sketch uji |
 
 Vendor frontend di-host lokal dan versi-terpin: htmx 2.0.11, Lucide 1.59.0,
 dengan `htmx.config.allowEval = false`.
@@ -59,9 +60,10 @@ dan ikon navigasi tetap di DOM, sehingga tidak ikut dimuat ulang. Aksi dan
 pembaruan data memakai fragment HTML di `/partials/*` (bukan JSON + perakitan
 DOM); ikon Lucide disegarkan setelah swap fragment.
 
-### Perangkat (ESP32-CAM) — scan
+### Perangkat (ESP32 + ESP32-CAM) — scan
 
 ```text
+HC-SR04 → ESP32 ──UART "CAP"──► ESP32-CAM ──JPEG + CRC32──► ESP32 (tanpa Wi-Fi di kamera)
 ESP32 ──POST /api/v1/scans (bearer DEVICE_TOKEN + HMAC + timestamp)──► Go
                                                                        ├── Python /detect → embedding
                                                                        ├── Go: cosine vs MongoDB face_templates
@@ -85,6 +87,15 @@ Dashboard menganggap perangkat online bila `last_seen` < 2 menit.
 Admin ──POST /partials/mahasiswa/{nim}/face-template (multipart)──► Go
                                                                    ├── Python /detect → Go simpan embedding → MongoDB: face_templates
                                                                    └── Garage: enroll/... (opsional; foto lama dihapus)
+```
+
+### Administrasi (administrator)
+
+```text
+Admin ──DELETE /partials/mahasiswa/{nim} (hx-confirm)──► Go ──► Garage: hapus foto enroll/ & scans/ mahasiswa itu
+                                                         └──► MongoDB: hapus scan_events, face_templates, class_students, students
+Admin ──POST /partials/akses/lecturers──► Go: validasi username/password/kelas ──► MongoDB: users (role dosen, bcrypt)
+Admin ──DELETE /partials/akses/staff/{id}──► Go: hanya role dosen ──► MongoDB: hapus users (sesi dosen langsung tidak berlaku)
 ```
 
 ### Foto wajah (staf)
@@ -233,11 +244,17 @@ Variabel lingkungan (dari `cmd/server/main.go`):
 | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | penyimpanan foto di Garage (kosong semua = nonaktif) |
 | `IMAGE_RETENTION_DAYS`, `IMAGE_REVIEW_RETENTION_DAYS` | retensi foto scan (default 30 / 90 hari) |
 | `BOOTSTRAP_ADMIN_*`, `BOOTSTRAP_LECTURER_*` | pembuatan akun awal |
+| `BOOTSTRAP_RESET_PASSWORDS` | development saja: setel ulang password akun bootstrap setiap start |
 
 `FACE_SIM_THRESHOLD` (default `0.45`, ambang cosine similarity) dan
 `FACE_SERVICE_TIMEOUT_SECONDS` (default `15`) dibaca oleh Go;
 `FACE_SERVICE_URL` default `http://127.0.0.1:8000`. Templat lengkap: `.env.example`. Zona waktu server menentukan
 batas "hari ini" pada ringkasan dan laporan.
+
+`.env` dimuat dengan `godotenv.Overload`, jadi nilainya menimpa environment
+proses (lihat `code-guide.md` §8). Di production tanpa berkas `.env`, hanya
+environment proses yang dipakai. Password staf minimal 12 karakter di
+production dan 4 di development.
 
 Catatan hardening: HSTS **belum** dipasang (lihat §10). Header yang sudah ada:
 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy:
@@ -284,8 +301,8 @@ Ini adalah pekerjaan backend yang masih outstanding (lihat juga `HANDOFF.md` §B
 5. **Ambang cosine `0.45` belum dikalibrasi**; pencocokan di Go memindai
    semua template tiap scan (belum ada pembatasan kandidat per kelas/cache).
 6. **Audit & privasi**: belum ada alur persetujuan (consent), audit enrollment
-   memadai, enkripsi backup, atau penghapusan foto enrollment saat mahasiswa
-   dihapus. Retensi foto scan sudah otomatis.
+   / aksi administrator, atau enkripsi backup. Retensi foto scan otomatis dan
+   hapus mahasiswa ikut menghapus data biometriknya.
 7. **Hardening HTTP**: HSTS dan audit logging belum ada.
 8. **Port RPC Garage (3901)** terbuka di semua interface pada konfigurasi
    pengembangan; batasi dengan firewall atau ganti `rpc_secret`.
@@ -296,6 +313,8 @@ Ini adalah pekerjaan backend yang masih outstanding (lihat juga `HANDOFF.md` §B
    sketch; pindahkan ke `secrets.h` dan rotasi token.
 11. **Face service tanpa autentikasi** (CORS `*`, token Go belum diperiksa)
     → wajib dijalankan di `127.0.0.1`/jaringan internal.
+12. **Sisa mahasiswa contoh dari seed lama** (`IK24001`–`IK24005`) tidak
+    dihapus otomatis; seed kini hanya kelas dan perangkat (lihat `database.md` §5).
 
 ## 11. Berkas acuan
 
@@ -304,6 +323,7 @@ Ini adalah pekerjaan backend yang masih outstanding (lihat juga `HANDOFF.md` §B
 - `HANDOFF.md` — status implementasi, keputusan UI, daftar risiko.
 - `cmd/server/main.go` — wiring route, middleware, env, bootstrap.
 - `internal/api/server.go` — endpoint + query ber-scope role.
+- `internal/api/admin.go`, `internal/controller/admin_partials.go` — fitur administrator.
 - `internal/security/middleware.go` — session, CSRF, principal, CSP.
 - `internal/controller/` — handler halaman & fragment.
 - `internal/store/database.go` — koneksi, index, seed MongoDB.

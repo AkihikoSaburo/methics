@@ -1,87 +1,187 @@
-# Perangkat (ESP8266 / ESP32)
+# Perangkat (ESP32 / ESP32-CAM / ESP8266)
 
-> Status: **[SEBAGIAN]**. Firmware yang ada di repo hanya **heartbeat ping**
-> ESP8266 (`devices/esp8266/esp8266_ping/`). Firmware kamera yang mengirim
-> scan wajah (ESP32-CAM) **belum ada**; kontraknya sudah diterapkan di backend
-> dan dijelaskan di §4.
+> Status: **[SEBAGIAN]**. Firmware perangkat absensi sudah ada dan lolos
+> kompilasi (core ESP32 3.0.7) serta uji format request terhadap backend,
+> tetapi **belum diuji di perangkat keras**. Terakhir diperbarui 26 Oktober 2026.
 
 ## 1. Ringkasan
 
-| Fungsi | Endpoint | Auth | Firmware di repo |
-| --- | --- | --- | --- |
-| Heartbeat / status online | `GET` atau `POST /api/v1/devices/ping` | bearer `DEVICE_TOKEN` **hanya di production** | ya (ESP8266) |
-| Cek kesehatan backend | `GET /api/v1/health[?device_id=…]` | tidak ada | tidak |
-| Kirim scan wajah | `POST /api/v1/scans` | bearer `DEVICE_TOKEN` + HMAC-SHA256 + timestamp | **belum** |
+| Folder | Board | Peran |
+| --- | --- | --- |
+| `devices/esp32_scanner/` | ESP32 Dev Module | **perangkat absensi**: ultrasonik → foto → `POST /api/v1/scans` → hasil di layar + buzzer; heartbeat |
+| `devices/esp32cam_uart/` | AI Thinker ESP32-CAM | **kamera** untuk `esp32_scanner`; dikendalikan lewat UART, tanpa Wi-Fi |
+| `devices/algorithmics_engine_ultrasonic_buzzer/` | ESP32 | sketch uji layar + ultrasonik + buzzer (tanpa jaringan); dasar `esp32_scanner` |
+| `devices/esp32cam_stream/` | ESP32-CAM | sketch uji kamera lewat web (stream, `/capture`) untuk mengatur arah/fokus; **jangan dipakai di produksi** |
+| `devices/esp8266_ping/` | ESP8266 | uji koneksi heartbeat (sebelum ESP32 tersedia) |
+
+| Fungsi | Endpoint | Auth |
+| --- | --- | --- |
+| Heartbeat / status online | `GET` atau `POST /api/v1/devices/ping` | bearer `DEVICE_TOKEN` **hanya di production** |
+| Cek kesehatan backend | `GET /api/v1/health[?device_id=…]` | tidak ada |
+| Kirim scan wajah | `POST /api/v1/scans` | bearer `DEVICE_TOKEN` + HMAC-SHA256 + timestamp |
 
 Ketiganya dipasang di router luar (`cmd/server/main.go`), sehingga **tidak**
-melewati session maupun CSRF browser.
+melewati session maupun CSRF browser. Dashboard menampilkan perangkat
+"Terhubung" bila ada perangkat dengan `last_seen` kurang dari **2 menit**.
 
-Dashboard menampilkan perangkat "Terhubung" bila ada perangkat dengan
-`last_seen` kurang dari **2 menit** yang lalu. Nilai `last_seen` diperbarui oleh
-ketiga endpoint di atas.
+## 2. Perangkat absensi ESP32 (`esp32_scanner` + `esp32cam_uart`)
 
-## 2. Firmware heartbeat ESP8266
+```text
+HC-SR04 ──► ESP32 utama ──UART 460800──► ESP32-CAM
+TFT, buzzer ◄──┘   │  ◄──── JPEG + CRC32 ────┘
+                   └── Wi-Fi ──► Go  POST /api/v1/scans (Bearer + HMAC)
+                                     POST /api/v1/devices/ping (tiap 15 s)
+```
 
-Berkas: `devices/esp8266/esp8266_ping/esp8266_ping.ino`
+### 2.1 Wiring
 
-Perilaku:
+| Dari | Ke | Catatan |
+| --- | --- | --- |
+| ESP32-CAM **GPIO15** (TX1) | ESP32 **GPIO16** (RX2) | data foto |
+| ESP32-CAM **GPIO14** (RX1) | ESP32 **GPIO17** (TX2) | perintah |
+| ESP32-CAM **GND** | ESP32 **GND** | **wajib** disatukan |
+| ESP32-CAM **5V** | catu 5 V ≥ 2 A | jangan dari pin 3V3 ESP32 utama; kamera + Wi-Fi butuh arus puncak tinggi |
+| HC-SR04 TRIG / ECHO | GPIO26 / GPIO27 | ECHO lewat pembagi tegangan 1k + 2k (5 V → 3,3 V) |
+| Buzzer (+) | GPIO22 | modul *low trigger*: ubah `BUZZER_ON_LEVEL` ke `LOW` |
+| TFT ILI9341 | sesuai `User_Setup.h` TFT_eSPI | backlight `TFT_BL` (default GPIO21) |
 
-1. Tersambung ke Wi-Fi (mode station; mencoba ulang tiap 20 detik bila gagal).
-2. Mengirim `POST` ke `SERVER_URL` setiap `PING_INTERVAL_MS` (default 15 detik)
-   dengan header `Authorization: Bearer <DEVICE_TOKEN>`, `X-Device-Id`, dan body
-   `device_id=<DEVICE_ID>` (form-urlencoded).
-3. LED bawaan berkedip 3× saat Wi-Fi tersambung dan 1× setiap ping diterima
-   (HTTP 200/202). Log diagnostik ada di Serial Monitor **115200 baud**.
+- GPIO14/15 pada ESP32-CAM adalah pin kartu SD — **jangan pasang kartu SD**.
+- GPIO16/17 harus tidak dipakai di `User_Setup.h` TFT_eSPI. Pada modul
+  **ESP32-WROVER**, GPIO16/17 dipakai PSRAM; ganti `CAM_RX_PIN`/`CAM_TX_PIN`.
+- UART0 ESP32-CAM (GPIO1/3) tetap untuk upload & log, jadi kabel ke ESP32 utama
+  tidak perlu dicabut saat flashing.
 
-### Konfigurasi
+### 2.2 Perilaku
 
-Ubah konstanta di bagian atas sketch:
+1. Saat start: Wi-Fi → sinkron jam NTP (UTC) → `PING` ke kamera → heartbeat
+   pertama. Layar menampilkan "Siap" atau "Periksa" (Wi-Fi/jam/kamera mana yang gagal).
+2. Objek ≤ `DETECT_CM` (20 cm) terdeteksi 2× berturut-turut → layar menyala,
+   "Memindai…", bip pendek, jeda 300 ms, lalu minta foto ke kamera.
+3. Foto (JPEG ≤ 60 KB, VGA 640×480 bila ada PSRAM) dikirim ke
+   `POST /api/v1/scans` dengan tanda tangan HMAC (§6). `liveness_passed`
+   dikirim **`false`** (`LIVENESS_PASSED`): alat belum punya anti-spoof, jadi
+   wajah yang cocok dicatat **Perlu ditinjau**, bukan Hadir.
+4. Hasil di layar + pola buzzer:
+
+   | Respons | Layar | Buzzer |
+   | --- | --- | --- |
+   | `202` status `Hadir` | **HADIR** (hijau) + nama + NIM | 1 bip panjang |
+   | `202` status `Perlu ditinjau` | **DITINJAU** (oranye) + nama + alasan | 2 bip |
+   | `202` status `Ditolak` | **DITOLAK** (merah) + alasan | 3 bip pendek |
+   | error (HTTP 4xx/5xx, kamera, Wi-Fi, jam) | **GAGAL** + kode + pesan | 3 bip pendek |
+
+5. Scan berikutnya baru terjadi setelah objek menjauh (~0,5 s) **dan** lewat
+   `SCAN_COOLDOWN_MS` (8 s), agar satu orang tidak terpindai berulang.
+6. Heartbeat `POST /api/v1/devices/ping` tiap 15 s menggantikan ESP8266.
+7. Respons `401 invalid_signature` / `400 stale_capture` memicu sinkron ulang
+   jam pada scan berikutnya.
+
+### 2.3 Konfigurasi
+
+`devices/esp32_scanner/secrets.h` (salin dari `secrets.example.h`; di-gitignore):
 
 | Konstanta | Isi |
 | --- | --- |
-| `WIFI_SSID`, `WIFI_PASSWORD` | jaringan Wi-Fi yang sama dengan server |
-| `SERVER_URL` | `http://<IP-server>:8080/api/v1/devices/ping` |
-| `DEVICE_TOKEN` | sama dengan `DEVICE_TOKEN` backend |
-| `DEVICE_ID` | ID di koleksi `devices` (default `ESP32-GED-A1`) |
-| `PING_INTERVAL_MS` | interval ping; harus < 120000 agar tetap "online" |
+| `WIFI_SSID`, `WIFI_PASSWORD` | Wi-Fi 2,4 GHz yang menjangkau server |
+| `DEVICE_TOKEN` | sama persis dengan `DEVICE_TOKEN` di `.env` backend |
 
-### Build & unggah (Arduino IDE)
+Bagian atas `esp32_scanner.ino`:
 
-1. Tambahkan board manager URL
-   `http://arduino.esp8266.com/stable/package_esp8266com_index.json`, lalu
-   pasang paket **esp8266**.
-2. Pilih board (mis. *NodeMCU 1.0 (ESP-12E Module)* atau *LOLIN(WEMOS) D1 mini*)
-   dan port USB.
-3. Upload, lalu buka Serial Monitor 115200 baud.
+| Konstanta | Default | Keterangan |
+| --- | --- | --- |
+| `SERVER_HOST`, `SERVER_PORT` | `10.229.23.195`, `8080` | IP komputer yang menjalankan Go |
+| `DEVICE_ID` | `ESP32-GED-A1` | harus ada di koleksi `devices` (seed) |
+| `CLASS_ID` | `IK24-A` | kelas di ruangan itu, **huruf besar** |
+| `LIVENESS_PASSED` | `false` | lihat §2.2 butir 3 |
+| `DETECT_CM`, `SCAN_COOLDOWN_MS`, `RESULT_SHOW_MS` | 20, 8000, 6000 | jarak deteksi & jeda |
+| `CAM_BAUD`, `MAX_IMAGE_BYTES` | 460800, 60000 | **samakan** dengan `LINK_BAUD`, `MAX_JPEG_BYTES` di `esp32cam_uart` |
 
-Pustaka yang dipakai (`ESP8266WiFi`, `ESP8266HTTPClient`, `WiFiClient`) sudah
-termasuk paket board.
+Di `esp32cam_uart.ino`: `FRAME_SIZE` (VGA), `JPEG_QUALITY` (12), `USE_FLASH` (0).
+
+`CLASS_ID` masih tetap per perangkat; jadwal kuliah per ruangan belum ada di
+backend.
+
+### 2.4 Build & upload (Arduino IDE)
+
+1. Board manager URL `https://espressif.github.io/arduino-esp32/package_esp32_index.json`,
+   pasang paket **esp32** (diuji kompilasi dengan 3.0.7).
+2. Library **TFT_eSPI** (Bodmer) dengan `User_Setup.h` yang sama seperti sketch
+   `algorithmics_engine_ultrasonic_buzzer`, dan `#define LOAD_GFXFF` aktif.
+3. **Kamera dulu** (upload terpisah dari ESP32 utama): buka
+   `devices/esp32cam_uart`, board *AI Thinker ESP32-CAM*.
+   - Dengan **ESP32-CAM-MB** (papan uploader USB): pasang kamera di MB,
+     pilih port COM MB, upload. MB mengatur mode boot sendiri; bila muncul
+     `Failed to connect`, tahan tombol **IO0** di MB, tekan **RST**, lepas IO0
+     saat tulisan `Connecting...`.
+   - Dengan adaptor USB-serial biasa: hubungkan GPIO0 ke GND saat upload,
+     lepas, tekan RST.
+   - Serial Monitor 115200 harus menampilkan `[CAM] siap, PSRAM=1`.
+   - Setelah itu **lepas kamera dari MB**: pin GPIO14/15 tertutup oleh MB,
+     jadi kabel ke ESP32 utama (§2.1) dipasang langsung ke pin kamera, dengan
+     catu 5 V terpisah. MB baru dipakai lagi saat upload ulang (lepas kabel
+     UART dulu).
+4. **ESP32 utama**: lewat kabel USB-nya sendiri, buka `devices/esp32_scanner`,
+   buat `secrets.h`, board *ESP32 Dev Module*, upload, Serial Monitor 115200.
+
+### 2.5 Uji bertahap
+
+Ketik di Serial Monitor ESP32 utama (akhiri dengan newline):
+
+| Perintah | Menguji | Hasil yang diharapkan |
+| --- | --- | --- |
+| `status` | Wi-Fi, jam, kamera, memori | `WiFi=OK … jam=… (sinkron) kamera=OK` |
+| `cam` | kabel UART | `[Cam] PONG` |
+| `ping` | server & token | `[Ping] HTTP 200`; dashboard menjadi "Terhubung" |
+| `scan` | alur lengkap tanpa sensor | `[Scan] foto … byte` lalu `[Scan] HTTP 202 {…}` |
+
+`DEVICE_ID` harus ada di koleksi `devices` database yang dipakai server
+(seed membuat `ESP32-GED-A1`/`B1` di setiap start), dan `CLASS_ID` harus
+kelas yang ada; kalau tidak, scan ditolak `403 unknown_device` /
+`400 unknown_class`.
+
+Urutan disarankan: `cam` → `ping` → enroll wajahmu di halaman Mahasiswa →
+`scan` → cek halaman Log (status, skor, foto bila Garage aktif) → uji dengan
+sensor ultrasonik.
+
+## 3. Protokol UART kamera
+
+UART 8N1, 460800 baud, satu permintaan per waktu:
+
+| Arah | Pesan |
+| --- | --- |
+| ESP32 → kamera | `PING\n` → kamera `PONG psram=<0\|1>\n` |
+| ESP32 → kamera | `CAP\n` → kamera `IMG <panjang> <crc32hex>\n` + `<panjang>` byte JPEG |
+| kamera → ESP32 | `ERR <alasan>\n` (`camera_init`, `capture`, `too_big <n>`, `unknown_command`) |
+| kamera → ESP32 | `READY\n` saat start (diabaikan ESP32 utama) |
+
+CRC-32 = CRC IEEE (sama dengan `zlib.crc32`). ESP32 utama menolak foto bila
+panjang tidak lengkap dalam 6 detik atau CRC tidak cocok ("Foto rusak (CRC)").
+Bila kabel panjang/berisik dan CRC sering gagal, turunkan baud di **kedua**
+sketch (mis. 230400). Foto lebih besar dari 60 KB diulang dengan kualitas JPEG
+20; bila masih terlalu besar, kamera membalas `ERR too_big`.
+
+## 4. Firmware heartbeat ESP8266 (uji koneksi)
+
+Berkas: `devices/esp8266_ping/esp8266_ping.ino`. Mengirim `POST` ke
+`SERVER_URL` setiap `PING_INTERVAL_MS` (15 s) dengan header
+`Authorization: Bearer <DEVICE_TOKEN>`, `X-Device-Id`, dan body
+`device_id=<DEVICE_ID>`. Board: paket **esp8266**
+(`http://arduino.esp8266.com/stable/package_esp8266com_index.json`), mis.
+*NodeMCU 1.0*. Setelah `esp32_scanner` berjalan, ESP8266 tidak diperlukan lagi
+(keduanya memakai `DEVICE_ID` yang sama).
 
 ### ⚠️ Jangan commit kredensial
 
-Sketch saat ini menulis SSID, password Wi-Fi, dan `DEVICE_TOKEN` langsung di
-kode, dan sketch itu **sudah ter-commit** (commit `9af21ce`), sehingga nilainya
-tersimpan di riwayat Git. Langkah perbaikan:
+Sketch ESP8266 dan `esp32cam_stream` menulis SSID/password Wi-Fi (dan ESP8266
+juga `DEVICE_TOKEN`) langsung di kode. Versi lama sketch ESP8266 **sudah
+ter-commit** (commit `9af21ce`), sehingga nilainya ada di riwayat Git:
 
-1. Pindahkan nilai rahasia ke `secrets.h` di folder sketch:
+1. **Ganti `DEVICE_TOKEN`** di `.env` dan perangkat, serta password Wi-Fi.
+2. Sebelum meng-commit `esp32cam_stream` atau `esp8266_ping`, kosongkan nilai
+   rahasianya atau pindahkan ke `secrets.h` seperti `esp32_scanner`
+   (`secrets.h` sudah di-gitignore).
 
-   ```cpp
-   // devices/esp8266/esp8266_ping/secrets.h  (JANGAN di-commit)
-   #pragma once
-   #define WIFI_SSID_VALUE     "nama-wifi"
-   #define WIFI_PASSWORD_VALUE "password-wifi"
-   #define DEVICE_TOKEN_VALUE  "token-acak-minimal-32-karakter"
-   ```
-
-   lalu di sketch: `#include "secrets.h"` dan
-   `const char* WIFI_SSID = WIFI_SSID_VALUE;` (dst.).
-2. Tambahkan `devices/**/secrets.h` ke `.gitignore` dan sediakan
-   `secrets.example.h` berisi placeholder.
-3. **Ganti `DEVICE_TOKEN`** di `.env` dan perangkat, serta password Wi-Fi,
-   karena nilai lama sudah ada di riwayat Git. Menghapus berkas dari commit
-   berikutnya tidak menghapusnya dari riwayat.
-
-## 3. Endpoint heartbeat
+## 5. Endpoint heartbeat
 
 `GET|POST /api/v1/devices/ping`
 
@@ -115,7 +215,7 @@ curl -X POST http://localhost:8080/api/v1/devices/ping \
   -d device_id=ESP32-GED-A1
 ```
 
-## 4. Protokol scan (untuk firmware ESP32-CAM)
+## 6. Protokol scan HTTP
 
 `POST /api/v1/scans` — `multipart/form-data`, batas total body **8 MiB**.
 
@@ -187,19 +287,17 @@ membalas `502 face_service_error` dan **tidak** menyimpan event. Bila
 penyimpanan foto (`S3_*`) aktif, capture juga disimpan ke Garage dan bisa
 dibuka dari kolom **Foto** di halaman Log.
 
-### Catatan implementasi ESP32
+### Implementasi di firmware
 
-- HMAC-SHA256 dan SHA-256 tersedia lewat mbedTLS bawaan core ESP32
-  (`mbedtls/md.h`: `mbedtls_md_hmac_starts/update/finish` dengan
-  `MBEDTLS_MD_SHA256`).
-- Hitung SHA-256 gambar dari buffer frame kamera (`camera_fb_t->buf`,
-  `->len`) yang sama dengan yang dikirim.
-- Gunakan HTTPS (`WiFiClientSecure`) bila server berada di belakang TLS.
-- `liveness_passed` hanyalah klaim perangkat. Backend mencatat `Hadir` hanya
-  bila nilainya `true`, tetapi tidak dapat memverifikasinya; lihat
-  `HANDOFF.md` §Batasan.
+`postScan()` di `esp32_scanner.ino` mengikuti kontrak ini: SHA-256 dan
+HMAC-SHA256 lewat mbedTLS bawaan core ESP32 (`mbedtls_md`, `mbedtls_md_hmac`),
+`X-Device-Timestamp` = `captured_at` = waktu NTP saat foto diterima, dan body
+multipart ditulis bertahap ke `WiFiClient` (foto tidak disalin dua kali di
+RAM). Format ini diuji terhadap `readImagePart` dan `validScanSignature`
+backend. Koneksi masih HTTP biasa; untuk server di belakang TLS ganti ke
+`WiFiClientSecure`.
 
-## 5. Catatan keamanan
+## 7. Catatan keamanan
 
 1. **Satu `DEVICE_TOKEN` untuk semua perangkat.** Bocor satu perangkat berarti
    semua perangkat bisa ditiru. Rencana: secret per perangkat + rotasi.
@@ -212,14 +310,24 @@ dibuka dari kolom **Foto** di halaman Log.
    memperbarui perangkat yang sudah terdaftar.
 3. **Belum ada nonce anti-replay.** Request scan yang sama bisa diputar ulang
    dalam jendela 2 menit.
-4. Sketch ESP8266 memakai HTTP biasa. Token terkirim tanpa enkripsi; di
-   produksi gunakan TLS atau jaringan perangkat yang terisolasi.
+4. Firmware memakai HTTP biasa. Token terkirim tanpa enkripsi; di produksi
+   gunakan TLS atau jaringan perangkat yang terisolasi.
+5. `esp32cam_stream` membuka stream dan `/capture` **tanpa autentikasi** ke
+   seluruh jaringan; pakai hanya untuk menyetel kamera. `esp32cam_uart` tidak
+   memakai Wi-Fi sama sekali.
 
-## 6. Pemecahan masalah
+## 8. Pemecahan masalah
 
 | Gejala | Kemungkinan penyebab |
 | --- | --- |
-| Serial: `Gagal terhubung ke server. Kode error: -1` | IP/port salah, server tidak jalan, atau Windows Firewall memblokir port 8080 |
+| Layar "Periksa", kamera GAGAL / `[Cam] tidak merespons` | TX/RX tertukar, GND tidak disatukan, baud berbeda, kamera kurang daya (brownout), atau kartu SD terpasang |
+| "Foto rusak (CRC)" / "Transfer foto terputus" | kabel UART terlalu panjang/berisik → turunkan baud di kedua sketch |
+| `[CAM] init gagal 0x105` (log kamera) | kabel pita kamera longgar atau board bukan AI Thinker |
+| "Jam belum sinkron" | NTP diblokir jaringan kampus; ganti `NTP_SERVER_1` ke server NTP lokal |
+| "Server tidak terjangkau" (ESP32) | `SERVER_HOST` salah, Go tidak jalan, atau Windows Firewall memblokir port 8080 |
+| Layar tidak menampilkan apa-apa / huruf aneh | `User_Setup.h` TFT_eSPI berbeda atau `LOAD_GFXFF` tidak aktif |
+| Wajah cocok tetapi selalu "Perlu ditinjau" | memang begitu selama `LIVENESS_PASSED=false`, atau mahasiswa bukan anggota `CLASS_ID` |
+| Serial: `Gagal terhubung ke server. Kode error: -1` (ESP8266) | IP/port salah, server tidak jalan, atau Windows Firewall memblokir port 8080 |
 | HTTP `401 invalid_token` | `APP_ENV=production` dan token perangkat ≠ `DEVICE_TOKEN` |
 | Dashboard tetap "offline" | interval ping > 2 menit, atau jam server bergeser |
 | Scan `401 invalid_signature` | jam perangkat tidak sinkron, `class_id`/`captured_at` berbeda dari yang ditandatangani, atau hash dihitung dari byte berbeda |

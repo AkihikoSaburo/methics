@@ -11,10 +11,13 @@ import (
 	"github.com/gorilla/csrf"
 )
 
+// Web merender halaman penuh (shell). Datanya dimuat htmx dari /partials/*.
 type Web struct {
 	templates map[string]*template.Template
 }
 
+// NewWeb mem-parse setiap halaman bersama layout dan partial sekali saat start;
+// perubahan .html baru terlihat setelah restart (air menanganinya otomatis).
 func NewWeb(viewDir string) (*Web, error) {
 	pages := []string{"dashboard", "mahasiswa", "kelas", "laporan", "logs", "akses"}
 	views := make(map[string]*template.Template, len(pages))

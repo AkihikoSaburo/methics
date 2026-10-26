@@ -24,6 +24,8 @@ Riwayat revisi:
 | Versi | Tanggal | Perubahan | Oleh |
 | --- | --- | --- | --- |
 | 0.1 | ISI: | Kerangka awal dari kode yang ada | ISI: |
+| 0.6 | 2026-10-26 | Hapus mahasiswa (FR-STU-10), buat & hapus akun dosen (FR-AUTH-09, FR-AUTHZ-06 sebagian); matriks dihitung ulang | ISI: |
+| 0.5 | 2026-10-26 | Firmware perangkat ESP32 + ESP32-CAM (UART); IF-HW-01/04 diperbarui, tambah IF-HW-05 | ISI: |
 | 0.4 | 2026-10-26 | Penyimpanan foto wajah di object storage S3 (Garage) dengan retensi; tambah FR-BIO-11, IF-SW-06, NFR-REL-07; bug cakupan log (FR-LOG-01) diperbaiki; status privasi & test diperbarui; matriks dihitung ulang | ISI: |
 | 0.3 | 2026-10-26 | Face service Python (YOLO-FaceV2 + ArcFace) terhubung ke Go; penyimpanan & pencocokan embedding di Go; status biometrik diperbarui; tambah FR-BIO-10 | ISI: |
 | 0.2 | 2026-10-21 | Selaras dengan MongoDB; tambah log pemindaian (FR-LOG), heartbeat perangkat (FR-DEV-16); status biometrik diturunkan ke `[SEBAGIAN]` karena face service belum ada di repo; matriks dihitung ulang | ISI: |
@@ -124,7 +126,7 @@ diekspos ke jaringan luar.
 
 - **Server:** `ISI:` OS & spesifikasi (dev saat ini Windows; produksi TBD). Zona waktu server menentukan batas "hari ini".
 - **Basis data:** MongoDB (default `mongodb://10.100.1.11:27017`, database `attendance`). `ISI:` versi & topologi produksi (single node / replica set).
-- **Perangkat:** ESP32-CAM untuk scan (firmware belum ada) dan ESP8266 untuk heartbeat (firmware ada). `ISI:` jumlah perangkat & lokasi.
+- **Perangkat:** ESP32 utama (HC-SR04, TFT, buzzer, Wi-Fi) + ESP32-CAM lewat UART untuk scan dan heartbeat (firmware ada, belum diuji di perangkat keras); ESP8266 untuk uji heartbeat. `ISI:` jumlah perangkat & lokasi.
 - **Jaringan:** `ISI:` LAN kampus / VPN / TLS reverse proxy.
 - **Object storage:** Garage (S3-compatible), mis. `http://10.100.1.11:3900`, bucket `methics-faces`; opsional.
 - **Layanan wajah:** Python 3.10 + FastAPI + ONNX Runtime (YOLO-FaceV2, ArcFace R50), model dari Hugging Face `AkihikoSaburo/methics` (`services/face/`).
@@ -166,7 +168,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | FR-AUTH-06 | Sesi kedaluwarsa → pengguna diarahkan ke login, tanpa kehilangan konteks halaman | S | `[TERSEDIA]` |
 | FR-AUTH-07 | Sesi punya batas umur dan batas idle | W | `[TERSEDIA]` (8 jam / idle 30 menit) |
 | FR-AUTH-08 | Semua aksi tulis staf dilindungi proteksi CSRF | W | `[TERSEDIA]` |
-| FR-AUTH-09 | Administrator dapat mengelola akun staf (buat, ubah, nonaktifkan, reset password) | W | `[BELUM]` |
+| FR-AUTH-09 | Administrator dapat mengelola akun staf (buat, ubah, nonaktifkan, reset password) | W | `[SEBAGIAN]` (buat & hapus akun dosen di `/akses`; ubah, nonaktifkan, reset password belum) |
 | FR-AUTH-10 | Akun dapat dikunci setelah kegagalan berulang pada akun yang sama | S | `[BELUM]` |
 | FR-AUTH-11 | `ISI:` kebijakan password (panjang, kompleksitas, masa berlaku) | — | TBD |
 
@@ -179,7 +181,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | FR-AUTHZ-03 | Data dibatasi di sisi server (query), bukan di klien | W | `[TERSEDIA]` |
 | FR-AUTHZ-04 | Pendaftaran mahasiswa & enrollment wajah hanya administrator | W | `[TERSEDIA]` |
 | FR-AUTHZ-05 | Halaman manajemen akses hanya administrator | W | `[TERSEDIA]` |
-| FR-AUTHZ-06 | Administrator dapat mengatur penugasan kelas ke dosen melalui UI | S | `[BELUM]` |
+| FR-AUTHZ-06 | Administrator dapat mengatur penugasan kelas ke dosen melalui UI | S | `[SEBAGIAN]` (kelas dipilih saat membuat akun; belum bisa diubah) |
 | FR-AUTHZ-07 | Aksi pengguna tercatat pada jejak audit | S | `[BELUM]` |
 
 ### 3.3 Dashboard
@@ -215,7 +217,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | FR-STU-07 | Administrator dapat melakukan enrollment wajah mahasiswa | W | `[TERSEDIA]` |
 | FR-STU-08 | Enrollment gagal (wajah tidak terdeteksi/service mati) memberi pesan yang dapat ditindaklanjuti | W | `[TERSEDIA]` |
 | FR-STU-09 | Administrator dapat mengubah data mahasiswa | S | `[BELUM]` |
-| FR-STU-10 | Administrator dapat menghapus/menonaktifkan mahasiswa | S | `[BELUM]` |
+| FR-STU-10 | Administrator dapat menghapus/menonaktifkan mahasiswa | S | `[TERSEDIA]` (hapus beserta template wajah, foto, dan riwayat scan; nonaktifkan belum) |
 | FR-STU-11 | Mahasiswa dapat diimpor secara massal (unggah CSV) | B | `[BELUM]` |
 | FR-STU-12 | Riwayat absensi per mahasiswa | S | `[TERSEDIA]` (via laporan) |
 
@@ -252,7 +254,7 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 | FR-DEV-13 | Deteksi liveness yang tervalidasi (anti-spoof) | W | `[BELUM]` |
 | FR-DEV-14 | Administrator dapat mengelola daftar perangkat | S | `[BELUM]` |
 | FR-DEV-15 | Perangkat menerima konfigurasi/pembaruan dari server | B | `[BELUM]` |
-| FR-DEV-16 | Perangkat mengirim heartbeat berkala sehingga status "Terhubung" tampil di dashboard | S | `[TERSEDIA]` (`/api/v1/devices/ping` + firmware ESP8266) |
+| FR-DEV-16 | Perangkat mengirim heartbeat berkala sehingga status "Terhubung" tampil di dashboard | S | `[TERSEDIA]` (`/api/v1/devices/ping` + firmware ESP32 `esp32_scanner`/ESP8266) |
 
 ### 3.8 Pengenalan wajah
 
@@ -322,8 +324,9 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 
 | ID | Kebutuhan | Status |
 | --- | --- | --- |
-| IF-HW-01 | Perangkat kamera mengirim gambar via HTTP multipart ke backend | `[SEBAGIAN]` (endpoint ada; firmware kamera belum ada) |
-| IF-HW-04 | Perangkat mengirim heartbeat HTTP berkala (< 2 menit) | `[TERSEDIA]` (ESP8266) |
+| IF-HW-01 | Perangkat kamera mengirim gambar via HTTP multipart ke backend | `[SEBAGIAN]` (firmware `esp32_scanner` + `esp32cam_uart` ada dan lolos kompilasi; belum diuji di perangkat keras) |
+| IF-HW-04 | Perangkat mengirim heartbeat HTTP berkala (< 2 menit) | `[TERSEDIA]` (ESP32 `esp32_scanner`, ESP8266) |
+| IF-HW-05 | ESP32 utama ↔ ESP32-CAM melalui UART (perintah ambil foto, JPEG + CRC32) | `[SEBAGIAN]` (firmware ada; belum diuji di perangkat keras) |
 | IF-HW-02 | `ISI:` spesifikasi minimum kamera/resolusi & pencahayaan | TBD |
 | IF-HW-03 | `ISI:` kebutuhan daya & jaringan di lokasi | TBD |
 
@@ -432,19 +435,19 @@ Kolom **Pri** = prioritas (W wajib, S sebaiknya, B bila memungkinkan).
 
 | Area | Jumlah FR | `[TERSEDIA]` | `[SEBAGIAN]` | `[BELUM]` | TBD |
 | --- | --- | --- | --- | --- | --- |
-| Autentikasi & sesi | 11 | 8 | 0 | 2 | 1 |
-| Otorisasi | 7 | 5 | 0 | 2 | 0 |
+| Autentikasi & sesi | 11 | 8 | 1 | 1 | 1 |
+| Otorisasi | 7 | 5 | 1 | 1 | 0 |
 | Dashboard | 7 | 6 | 0 | 1 | 0 |
 | Kelas | 3 | 2 | 0 | 1 | 0 |
-| Mahasiswa & enrollment | 12 | 9 | 0 | 3 | 0 |
+| Mahasiswa & enrollment | 12 | 10 | 0 | 2 | 0 |
 | Laporan | 9 | 5 | 0 | 3 | 1 |
 | Perangkat & absensi otomatis | 16 | 10 | 1 | 5 | 0 |
 | Pengenalan wajah | 11 | 6 | 1 | 4 | 0 |
 | API integrasi | 7 | 4 | 2 | 1 | 0 |
 | Log pemindaian | 6 | 5 | 0 | 1 | 0 |
-| **Total** | **89** | **60** | **4** | **23** | **2** |
+| **Total** | **89** | **61** | **6** | **20** | **2** |
 
-> Angka di atas dihitung dari tabel Bagian 3 pada dokumen ini (revisi 0.4,
+> Angka di atas dihitung dari tabel Bagian 3 pada dokumen ini (revisi 0.6,
 > 26 Oktober 2026); perbarui bila kebutuhan berubah.
 
 ## 8. Daftar Keputusan yang Diperlukan (TBD)

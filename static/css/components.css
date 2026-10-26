@@ -137,3 +137,21 @@ tbody tr:hover { background: #fbfcfb; }
 .pagination button.current { border-color: var(--green); background: var(--green); color: white; }
 .pagination button:disabled { color: #b7bfbb; cursor: default; }
 .empty-row { display: none; padding: 24px; color: var(--muted); text-align: center; }
+/* Aksi administrator: hapus mahasiswa & kelola akun dosen */
+.button.danger { border-color: #ecc9c7; color: var(--red); }
+.button.danger:hover { background: var(--red-soft); }
+.button.icon-only { min-height: 32px; width: 32px; padding: 0; }
+.row-actions { display: flex; align-items: center; gap: 8px; }
+.inline-alert { margin: 0 0 12px; border: 1px solid var(--line); border-radius: 7px; padding: 9px 12px; font-size: 11px; }
+.inline-alert.success { border-color: #b9dcc9; background: #eef7f2; color: var(--green); }
+.inline-alert.error { border-color: #ecc9c7; background: var(--red-soft); color: #b7504b; }
+.staff-layout { display: grid; grid-template-columns: minmax(240px, 300px) 1fr; gap: 18px; align-items: start; }
+.staff-form { display: grid; gap: 11px; border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+.staff-form-title { display: flex; align-items: center; gap: 7px; margin: 0; font-size: 13px; }
+.staff-form-title i { width: 16px; height: 16px; }
+.class-picks { border: 0; margin: 0; padding: 0; }
+.class-picks legend { margin-bottom: 5px; }
+.check { display: flex; align-items: center; gap: 7px; font-weight: 500; }
+.class-picks .check input { width: 15px; height: 15px; margin: 0; flex: none; accent-color: var(--green); }
+.button.danger svg, .staff-form-title svg { width: 15px; height: 15px; flex: none; }
+@media (max-width: 860px) { .staff-layout { grid-template-columns: 1fr; } }

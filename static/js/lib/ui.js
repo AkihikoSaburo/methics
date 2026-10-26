@@ -1,4 +1,8 @@
-// Komponen UI bersama: notifikasi, badge, bar progres, dan sel tabel.
+// Helper UI bersama. Yang dipakai saat ini hanya refreshIcons dan toast
+// (diimpor app.js). Helper lain (setText, cell, emptyRow, notice,
+// studentIdentity, statusBadge, progressBar, progressTrack, deptRow) adalah
+// sisa versi lama yang merakit tabel dari JSON sebelum migrasi htmx; tidak
+// diimpor di mana pun dan aman dihapus.
 export function refreshIcons() {
   if (window.lucide) window.lucide.createIcons();
 }

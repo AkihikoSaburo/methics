@@ -74,3 +74,14 @@ func TestImageStorageDisabled(t *testing.T) {
 		t.Fatalf("got %d %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestValidNIM(t *testing.T) {
+	for nim, want := range map[string]bool{
+		"241011001": true, "241011123": true,
+		"24101100": false, "2410110011": false, "IK24001": false, "24101100A": false, "": false,
+	} {
+		if got := ValidNIM(nim); got != want {
+			t.Errorf("ValidNIM(%q)=%v, want %v", nim, got, want)
+		}
+	}
+}

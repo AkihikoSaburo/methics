@@ -1,0 +1,67 @@
+{{define "staff_fragment"}}
+{{if .Notice}}<div class="inline-alert success" role="status">{{.Notice}}</div>{{end}}
+{{if .Error}}<div class="inline-alert error" role="alert">{{.Error}}</div>{{end}}
+<div class="staff-layout">
+  <form class="staff-form" hx-post="/partials/akses/lecturers" hx-target="#staffRegion" hx-swap="innerHTML"
+    autocomplete="off">
+    <h3 class="staff-form-title"><i data-lucide="user-plus"></i>Buat akun dosen</h3>
+    <label class="field">Username<input name="username" required minlength="3" maxlength="32"
+        pattern="[A-Za-z0-9._\-]+" placeholder="mis. rina.wibowo" value="{{.Form.Username}}"
+        autocomplete="off"></label>
+    <label class="field">Nama tampilan<input name="displayName" required maxlength="120"
+        placeholder="Dr. Rina Wibowo" value="{{.Form.DisplayName}}"></label>
+    <label class="field">Password<input name="password" type="password" required minlength="{{.MinPassword}}"
+        placeholder="Minimal {{.MinPassword}} karakter" autocomplete="new-password"></label>
+    <fieldset class="field class-picks">
+      <legend>Kelas yang diampu</legend>
+      {{range .Classes}}
+      <label class="check"><input type="checkbox" name="classIds" value="{{.ID}}" {{if .Selected}}checked{{end}}>
+        {{.Name}} ({{.ID}})</label>
+      {{else}}
+      <span class="role-note">Belum ada kelas.</span>
+      {{end}}
+    </fieldset>
+    <button class="button primary" type="submit"><i data-lucide="user-plus"></i>Simpan akun dosen</button>
+  </form>
+  <div class="table-scroll staff-table">
+    <table>
+      <thead>
+        <tr>
+          <th>Nama</th>
+          <th>Username</th>
+          <th>Role</th>
+          <th>Kelas</th>
+          <th>Aksi</th>
+        </tr>
+      </thead>
+      <tbody id="staffRows">
+        {{range .Rows}}
+        <tr>
+          <td>
+            <div class="employee"><span class="avatar">{{initials .DisplayName}}</span><span><span
+                  class="employee-name">{{.DisplayName}}{{if .IsSelf}} (Anda){{end}}</span>{{if not .Active}}<span
+                  class="employee-mail">Nonaktif</span>{{end}}</span></div>
+          </td>
+          <td>{{.Username}}</td>
+          <td>{{if eq .Role "administrator"}}<span class="role-label">Administrator</span>{{else}}<span
+              class="role-label blue">Dosen</span>{{end}}</td>
+          <td>{{.Classes}}</td>
+          <td>
+            {{if eq .Role "dosen"}}
+            <button class="button danger" type="button" hx-delete="/partials/akses/staff/{{.ID}}"
+              hx-target="#staffRegion" hx-swap="innerHTML"
+              hx-confirm="Hapus akun dosen {{.Username}}? Dosen ini langsung keluar dan tidak bisa login lagi.">
+              <i data-lucide="trash-2"></i>Hapus</button>
+            {{else}}-{{end}}
+          </td>
+        </tr>
+        {{else}}
+        <tr>
+          <td colspan="5">Belum ada akun staf.</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+{{end}}

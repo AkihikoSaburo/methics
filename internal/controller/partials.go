@@ -52,6 +52,10 @@ func (p *Partials) Handler() http.Handler {
 	mux.HandleFunc("GET /partials/mahasiswa/form", p.mahasiswaForm)
 	mux.HandleFunc("POST /partials/mahasiswa/students", p.createStudent)
 	mux.HandleFunc("POST /partials/mahasiswa/{nim}/face-template", p.enrollFace)
+	mux.HandleFunc("DELETE /partials/mahasiswa/{nim}", p.deleteStudent)
+	mux.HandleFunc("GET /partials/akses/staff", p.staff)
+	mux.HandleFunc("POST /partials/akses/lecturers", p.createLecturer)
+	mux.HandleFunc("DELETE /partials/akses/staff/{id}", p.deleteStaff)
 	mux.HandleFunc("GET /partials/logs", p.logs)
 	return mux
 }
@@ -195,6 +199,7 @@ type mahasiswaRow struct {
 	ClassID      string
 	ClassName    string
 	FaceEnrolled bool
+	FaceImageURL string
 	Status       string
 }
 
@@ -239,7 +244,7 @@ func (p *Partials) mahasiswaRoster(ctx context.Context, principal security.Princ
 		data.Rows = append(data.Rows, mahasiswaRow{
 			StudentNIM: entry.StudentNIM, StudentName: entry.StudentName,
 			ClassID: entry.ClassID, ClassName: entry.ClassName,
-			FaceEnrolled: entry.FaceEnrolled, Status: entry.Status,
+			FaceEnrolled: entry.FaceEnrolled, FaceImageURL: entry.FaceImageURL, Status: entry.Status,
 		})
 	}
 	if len(data.Rows) == 0 {
@@ -317,6 +322,8 @@ func (p *Partials) createStudent(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, api.ErrMissingFields):
 			message = "Nama, NIM, dan kelas wajib diisi."
+		case errors.Is(err, api.ErrInvalidNIM):
+			message = "NIM harus 9 digit angka, mis. 241011001."
 		case errors.Is(err, api.ErrStudentExists):
 			message = "NIM sudah terdaftar."
 		case errors.Is(err, api.ErrInvalidClass):
@@ -502,7 +509,7 @@ func verificationLabel(entry api.RosterEntry) string {
 	}
 }
 
-// initials meniru inisial avatar di frontend: huruf pertama dari maksimal dua kata.
+// initials membuat inisial avatar: huruf pertama dari maksimal dua kata.
 func initials(name string) string {
 	result := make([]rune, 0, 2)
 	for _, field := range strings.Fields(name) {

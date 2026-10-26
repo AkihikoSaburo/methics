@@ -4,3 +4,5 @@ tmp/
 .venv/
 __pycache__/
 *.py[cod]
+# Kredensial firmware perangkat (salin dari secrets.example.h)
+secrets.h

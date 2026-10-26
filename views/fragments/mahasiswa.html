@@ -7,8 +7,8 @@
   <div class="summary-line"><span class="metric-icon orange"><i data-lucide="library-big"></i></span><span><strong
         id="classTotal">{{.ClassCount}}</strong><small>Kelas dalam cakupan</small></span></div>
 </section>
-{{if .Notice}}<div class="role-note" style="margin-bottom:12px">{{.Notice}}</div>{{end}}
-{{if .Error}}<div class="role-note error" style="margin-bottom:12px">{{.Error}}</div>{{end}}
+{{if .Notice}}<div class="inline-alert success" role="status">{{.Notice}}</div>{{end}}
+{{if .Error}}<div class="inline-alert error" role="alert">{{.Error}}</div>{{end}}
 <div class="table-scroll">
   <table>
     <thead>
@@ -32,6 +32,7 @@
         <td>{{if .FaceEnrolled}}Template aktif{{else}}Belum dienrollment{{end}}</td>
         <td>{{.Status}}</td>
         <td>
+          <div class="row-actions">
           {{if and (eq $.Role "administrator") (not .FaceEnrolled)}}
           <label class="button face-enroll-button">
             <i data-lucide="scan-face"></i>Enroll wajah
@@ -39,7 +40,19 @@
               hx-post="/partials/mahasiswa/{{.StudentNIM}}/face-template" hx-encoding="multipart/form-data"
               hx-include="#studentFilters" hx-target="#rosterRegion" hx-swap="innerHTML" hx-trigger="change">
           </label>
-          {{else if .FaceEnrolled}}Terdaftar{{else}}-{{end}}
+          {{else if .FaceEnrolled}}<span>Terdaftar</span>{{else}}<span>-</span>{{end}}
+          {{if .FaceImageURL}}
+          <a class="button" href="{{.FaceImageURL}}" target="_blank" rel="noopener"
+            title="Foto enrollment {{.StudentName}}"><i data-lucide="image"></i>Lihat foto</a>
+          {{end}}
+          {{if eq $.Role "administrator"}}
+          <button class="button danger icon-only" type="button" title="Hapus mahasiswa" aria-label="Hapus {{.StudentName}}"
+            hx-delete="/partials/mahasiswa/{{.StudentNIM}}" hx-include="#studentFilters" hx-target="#rosterRegion"
+            hx-swap="innerHTML"
+            hx-confirm="Hapus {{.StudentName}} ({{.StudentNIM}})? Template wajah, foto, dan seluruh riwayat scan mahasiswa ini ikut dihapus dan tidak bisa dikembalikan.">
+            <i data-lucide="trash-2"></i></button>
+          {{end}}
+          </div>
         </td>
       </tr>
       {{else}}

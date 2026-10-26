@@ -22,11 +22,24 @@ import (
 )
 
 func main() {
-	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
+	// .env menimpa variabel environment yang sudah ada. Terminal VS Code
+	// (python.terminal.useEnvFile) dan air (env_files) menyuntikkan isi .env
+	// saat terminal/air dibuka; tanpa Overload, nilai lama itu menang dan
+	// perubahan .env diabaikan. Bila .env tidak ada (mis. produksi), hanya
+	// environment proses yang dipakai.
+	if err := godotenv.Overload(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Fatalf("load .env: %v", err)
+	} else if err == nil {
+		log.Printf(".env dimuat (menimpa variabel environment yang sama)")
 	}
 
 	config := api.ParseConfig()
+	if config.Environment != "production" {
+		// Pengembangan lokal boleh memakai password pendek (mis. admin/admin).
+		// Production tetap memakai minimal 12 karakter.
+		store.MinPasswordLength = 4
+		log.Printf("development mode: password staf minimal %d karakter (production: 12)", store.MinPasswordLength)
+	}
 	csrfSecret := os.Getenv("CSRF_SECRET")
 	if len(csrfSecret) < 32 {
 		log.Fatal("CSRF_SECRET must contain at least 32 characters")
@@ -46,7 +59,7 @@ func main() {
 	}
 	defer database.Close()
 	log.Printf("connected to MongoDB at %s (database: %s)", mongoURI, mongoDB)
-	bootstrapStaff(database)
+	bootstrapStaff(database, config.Environment)
 
 	staticDir := env("STATIC_DIR", "static")
 	viewDir := env("VIEW_DIR", "views")
@@ -124,8 +137,12 @@ func main() {
 	}
 }
 
-func bootstrapStaff(database *store.Database) {
+func bootstrapStaff(database *store.Database, environment string) {
 	ctx := context.Background()
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("BOOTSTRAP_RESET_PASSWORDS")), "true") {
+		resetBootstrapStaff(ctx, database, environment)
+		return
+	}
 	adminCount, err := database.CountUsersByRole(ctx, "administrator")
 	if err != nil {
 		log.Fatalf("count administrator users: %v", err)
@@ -133,8 +150,8 @@ func bootstrapStaff(database *store.Database) {
 	if adminCount == 0 {
 		username := strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_USERNAME"))
 		password := os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
-		if username == "" || len(password) < 12 {
-			log.Fatal("first startup requires BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD (12+ chars)")
+		if username == "" || len(password) < store.MinPasswordLength {
+			log.Fatalf("first startup requires BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD (%d+ chars)", store.MinPasswordLength)
 		}
 		if err := database.CreateUser(ctx, username, password, username, "administrator", nil); err != nil {
 			log.Fatalf("create bootstrap administrator: %v", err)
@@ -144,13 +161,45 @@ func bootstrapStaff(database *store.Database) {
 	lecturerUsername := strings.TrimSpace(os.Getenv("BOOTSTRAP_LECTURER_USERNAME"))
 	lecturerPassword := os.Getenv("BOOTSTRAP_LECTURER_PASSWORD")
 	if lecturerUsername != "" && lecturerPassword != "" {
-		if len(lecturerPassword) < 12 {
-			log.Fatal("BOOTSTRAP_LECTURER_PASSWORD must contain at least 12 characters")
+		if len(lecturerPassword) < store.MinPasswordLength {
+			log.Fatalf("BOOTSTRAP_LECTURER_PASSWORD must contain at least %d characters", store.MinPasswordLength)
 		}
 		classes := splitCSV(env("BOOTSTRAP_LECTURER_CLASSES", "IK24-A,IK24-B"))
 		if err := database.EnsureUser(ctx, lecturerUsername, lecturerPassword, lecturerUsername, "dosen", classes); err != nil {
 			log.Fatalf("create bootstrap lecturer: %v", err)
 		}
+	}
+}
+
+// resetBootstrapStaff (BOOTSTRAP_RESET_PASSWORDS=true, hanya non-production)
+// menyetel ulang password akun BOOTSTRAP_ADMIN_* dan BOOTSTRAP_LECTURER_* di
+// setiap start, atau membuatnya bila belum ada. Akun lain tidak disentuh.
+func resetBootstrapStaff(ctx context.Context, database *store.Database, environment string) {
+	if environment == "production" {
+		log.Fatal("BOOTSTRAP_RESET_PASSWORDS tidak boleh dipakai saat APP_ENV=production")
+	}
+	accounts := []struct {
+		userKey, passKey, role string
+		classes                []string
+	}{
+		{"BOOTSTRAP_ADMIN_USERNAME", "BOOTSTRAP_ADMIN_PASSWORD", "administrator", nil},
+		{"BOOTSTRAP_LECTURER_USERNAME", "BOOTSTRAP_LECTURER_PASSWORD", "dosen", splitCSV(env("BOOTSTRAP_LECTURER_CLASSES", "IK24-A,IK24-B"))},
+	}
+	for _, account := range accounts {
+		username := strings.TrimSpace(os.Getenv(account.userKey))
+		password := os.Getenv(account.passKey)
+		if username == "" || password == "" {
+			continue
+		}
+		created, err := database.ResetUser(ctx, username, password, account.role, account.classes)
+		if err != nil {
+			log.Fatalf("reset bootstrap %s %q: %v", account.role, username, err)
+		}
+		action := "password diperbarui"
+		if created {
+			action = "dibuat"
+		}
+		log.Printf("bootstrap reset: akun %s %q %s (BOOTSTRAP_RESET_PASSWORDS=true)", account.role, username, action)
 	}
 }
 

@@ -68,7 +68,7 @@ Dokumen `face_templates`:
 
 ```json
 {
-  "student_id": "student-ik24001",
+  "student_id": "student-241011001",
   "encoding": [0.0123, -0.0456, "… 512 angka …"],
   "dimension": 512,
   "detection_confidence": 0.93,
@@ -108,6 +108,10 @@ Sisi Python: lihat `services/face/src/config.py` (`DET_MODEL_PATH`,
 
 ## 6. Menjalankan bersama (pengembangan)
 
+Gunakan Python **3.10–3.12**: conda `face_rec` dari `environment.yml`
+(Python 3.10) atau venv. Python 3.15 belum didukung `numpy<2.3`/`onnxruntime`,
+sehingga `pip install` gagal.
+
 ```powershell
 # Terminal 1 — face service (dari services/face)
 conda activate face_rec
@@ -127,7 +131,7 @@ curl http://localhost:8080/api/v1/health
 ```
 
 Lalu lakukan enrollment dari halaman **Mahasiswa**, dan uji scan dengan
-klien Python di `docs/devices.md` §4 (tanpa perangkat keras).
+klien Python di `docs/devices.md` §6 (tanpa perangkat keras), atau perangkat ESP32 (`docs/devices.md` §2.5).
 
 Pada request pertama setelah start, model sudah dimuat oleh `lifespan`
 FastAPI. Bila model belum ada di `services/face/models/`, layanan akan
@@ -201,5 +205,20 @@ dengan `s3_region` di `garage.toml`), `S3_BUCKET=methics-faces`,
 `S3_ACCESS_KEY_ID`, dan `S3_SECRET_ACCESS_KEY` di `.env`. Jangan memakai
 `admin_token` atau akun root server untuk aplikasi.
 
-Belum ada: penghapusan foto saat data mahasiswa dihapus (aplikasi belum punya
-fitur hapus mahasiswa) dan enrollment ulang otomatis dari foto tersimpan.
+Menghapus mahasiswa (halaman Mahasiswa atau `DELETE /api/v1/students/{nim}`)
+ikut menghapus foto enrollment dan foto scannya dari Garage.
+
+Foto enrollment dibuka lewat tombol **Lihat foto** di halaman Mahasiswa
+(muncul hanya bila `face_templates.image_key` ada; enrollment yang dibuat
+sebelum `S3_*` diisi tidak punya foto). Foto scan dibuka dari kolom **Foto**
+di halaman Log. Belum ada: enrollment ulang otomatis dari foto tersimpan.
+
+## 9. Apa yang disimpan dari hasil Python
+
+| Saat | Embedding dari `/detect` | Yang disimpan |
+| --- | --- | --- |
+| Enrollment | disimpan Go | `face_templates.encoding` (512 angka) + `dimension`, `detection_confidence`, `image_key`, waktu |
+| Scan perangkat | **tidak** disimpan; hanya dipakai untuk pencocokan lalu dibuang | `scan_events`: `student_id` kandidat, `confidence` (cosine similarity), `status`, `review_reason`, `image_key` |
+
+`aligned_face_b64` di respons Python diabaikan Go. Python sendiri tidak
+menyimpan apa pun; folder `services/face/models/` hanya berisi file model.

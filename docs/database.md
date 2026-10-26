@@ -1,7 +1,8 @@
 # Basis Data (MongoDB)
 
 > Status: **berlaku** — sesuai `internal/store/database.go`, `internal/store/users.go`,
-> dan query di `internal/api/server.go`.
+> dan query di `internal/api/server.go`, `face.go`, `images.go`, `admin.go`.
+> Terakhir diselaraskan: 26 Oktober 2026.
 > Versi lama proyek memakai SQLite; semua rujukan ke `DATABASE_PATH`,
 > `data/attendance.db`, tabel `user_classes`, atau `date(…, 'localtime')`
 > sudah **tidak berlaku**.
@@ -11,15 +12,20 @@
 | Variabel | Default | Keterangan |
 | --- | --- | --- |
 | `MONGODB_URI` | `mongodb://10.100.1.11:27017` | URI driver resmi `go.mongodb.org/mongo-driver` v1.17 |
-| `MONGODB_DATABASE` | `attendance` | nama database |
+| `MONGODB_DATABASE` | `attendance` | nama database; dibuat otomatis saat pertama ditulisi (`.env` pengembangan saat ini: `methics`) |
 
 `store.Open` melakukan, berurutan:
 
 1. `mongo.Connect` lalu `Ping` dengan batas waktu **8 detik**. Gagal → server
    berhenti dengan `initialize database (<uri>): …`.
 2. `migrate` — membuat index (idempoten; aman dijalankan setiap startup).
-3. `seed` — upsert kelas, mahasiswa, relasi kelas, dan perangkat contoh
-   memakai `$setOnInsert`, sehingga **tidak menimpa** data yang sudah diubah.
+3. `seed` — upsert kelas dan perangkat memakai `$setOnInsert`, sehingga
+   **tidak menimpa** data yang sudah diubah (lihat §5). Mahasiswa tidak
+   di-seed.
+
+Nilai `MONGODB_*` dibaca dari `.env` dengan `godotenv.Overload` (menimpa
+environment). Baris log `connected to MongoDB at … (database: …)` menunjukkan
+database yang benar-benar dipakai.
 
 Koneksi ditutup saat shutdown (`Database.Close`, batas 5 detik).
 
@@ -44,8 +50,8 @@ otomatis.
 
 | Field | Tipe | Keterangan |
 | --- | --- | --- |
-| `_id` | string | `student-<nim huruf kecil>`, mis. `student-ik24001` |
-| `nim` | string | huruf besar, **unik** |
+| `_id` | string | `student-<nim>`, mis. `student-241011001` |
+| `nim` | string | **9 digit angka** (mis. `241011001`), **unik** |
 | `name` | string | nama lengkap |
 | `email` | string | saat ini selalu `""` |
 | `class_id` | string | kelas utama → `classes._id` |
@@ -60,7 +66,7 @@ query (ringkasan kelas, roster, cek anggota kelas saat scan).
 | `class_id` | string | → `classes._id` |
 | `student_id` | string | → `students._id` |
 
-Relasi ini ditulis saat seed dan saat `CreateStudent`, tetapi **belum dibaca**
+Relasi ini ditulis saat `CreateStudent`, tetapi **belum dibaca**
 oleh query mana pun. Ia disiapkan untuk mahasiswa yang mengikuti lebih dari
 satu kelas. Bila kelak dipakai, pastikan kedua sumber tetap sinkron.
 
@@ -72,19 +78,26 @@ satu kelas. Bila kelak dipakai, pastikan kedua sumber tetap sinkron.
 | `username` | string | **unik** (index biasa, case-sensitive); pencarian login memakai regex case-insensitive |
 | `display_name` | string | nama tampilan |
 | `role` | string | `administrator` atau `dosen` |
-| `password_hash` | binary | bcrypt (`DefaultCost`), password minimal 12 karakter |
+| `password_hash` | binary | bcrypt (`DefaultCost`); password minimal 12 karakter di production, 4 di development (`store.MinPasswordLength`) |
 | `active` | bool | `false` → login & session ditolak |
-| `class_ids` | array string | kelas yang ditugaskan (untuk dosen) |
+| `class_ids` | array string | kelas yang ditugaskan (untuk dosen); diisi dari centang kelas di form `/akses` |
 | `created_at` | date | UTC |
 
 Penugasan kelas dosen disimpan langsung di `users.class_ids` (pengganti tabel
 `user_classes` di versi SQLite). Middleware membacanya ulang di **setiap
 request**, jadi perubahan langsung berlaku tanpa logout.
 
+Akun dibuat oleh tiga jalur: bootstrap `.env` (`BOOTSTRAP_ADMIN_*`,
+`BOOTSTRAP_LECTURER_*`; `BOOTSTRAP_RESET_PASSWORDS=true` menyetel ulang
+keduanya setiap start di development), form "Buat akun dosen" di `/akses`
+(`CreateLecturer`: username huruf kecil, role `dosen`), dan `POST /api/v1/staff`.
+Menghapus akun dosen di `/akses` menghapus dokumennya; sesi dosen itu
+langsung tidak berlaku.
+
 > Karena index unik `username` bersifat case-sensitive sedangkan login
 > case-insensitive, `Admin` dan `admin` bisa tersimpan sebagai dua dokumen
-> lewat `CreateUser`. `EnsureUser` (dipakai bootstrap dosen) sudah mencegah
-> hal ini. Hindari membuat akun yang hanya berbeda huruf besar/kecil.
+> lewat `CreateUser`. `EnsureUser`, `ResetUser`, dan `CreateLecturer` (form
+> `/akses`) sudah memeriksa username tanpa membedakan huruf besar/kecil.
 
 ### `devices`
 
@@ -99,7 +112,7 @@ yang lalu (diambil satu dokumen dengan `last_seen` terbaru).
 
 > Endpoint `/api/v1/devices/ping` dan `/api/v1/health?device_id=…` melakukan
 > **upsert**: ID perangkat yang belum ada akan dibuat otomatis dengan nama
-> `Perangkat <id>`. Lihat `docs/devices.md` §5.
+> `Perangkat <id>`. Lihat `docs/devices.md` §7.
 
 ### `face_templates`
 
@@ -171,18 +184,42 @@ data itu akan salah masuk/keluar dari rentang "hari ini".
 | Jenis | Data |
 | --- | --- |
 | Kelas | `IK24-A` Ilmu Komputer A, `IK24-B` Ilmu Komputer B, `IK24-C` Ilmu Komputer C |
-| Mahasiswa | Alya Putri `IK24001` (A), Bima Saputra `IK24002` (A), Citra Nabila `IK24003` (B), Dafa Ramadhan `IK24004` (B), Eka Anindya `IK24005` (C) |
+| Mahasiswa | **tidak ada** — didaftarkan manual (NIM 9 digit, mis. `241011001`) |
 | Perangkat | `ESP32-GED-A1` ESP32 Gedung A, `ESP32-GED-B1` ESP32 Gedung B |
 | Akun staf | **tidak ada** — dibuat dari `BOOTSTRAP_*` (lihat `README.md`) |
 | Template wajah / scan | **tidak ada** |
 
-Seed berjalan di setiap startup tetapi hanya menyisipkan dokumen yang belum
-ada. Menghapus mahasiswa seed lalu me-restart server akan memunculkannya lagi.
+Seed berjalan di setiap startup tetapi hanya menyisipkan kelas dan perangkat
+yang belum ada. Versi lama juga men-seed mahasiswa `IK24001`–`IK24005`; bila
+masih ada di database, hapus sekali lewat halaman Mahasiswa (tidak akan
+dibuat lagi), atau lewat `mongosh`:
+
+```javascript
+db.students.find({ nim: /^IK24/ })          // cek dulu
+// lalu hapus lewat tombol hapus di dashboard agar template, foto, dan scan ikut terhapus
+```
+
+## 5a. Penghapusan mahasiswa
+
+`DELETE /partials/mahasiswa/{nim}` (tombol hapus di halaman Mahasiswa) dan
+`DELETE /api/v1/students/{nim}` menjalankan `DeleteStudent`
+(`internal/api/admin.go`):
+
+1. Mengumpulkan `image_key` dari `face_templates` dan `scan_events` mahasiswa
+   itu, lalu menghapus fotonya dari Garage (gagal hanya dicatat di log).
+2. Menghapus dokumen `scan_events`, `face_templates`, `class_students`, dan
+   `students` milik mahasiswa itu (berurutan; tidak dalam transaksi).
+
+Riwayat absensi mahasiswa tersebut ikut hilang dan tidak bisa dikembalikan
+kecuali dari backup (§7).
 
 ## 6. Operasi umum (mongosh)
 
 ```javascript
-use attendance
+use methics   // sesuaikan dengan MONGODB_DATABASE
+
+// Melihat akun staf (tanpa hash password)
+db.users.find({}, { username: 1, role: 1, class_ids: 1, active: 1 })
 
 // Menugaskan kelas ke dosen
 db.users.updateOne({ username: "rina" }, { $set: { class_ids: ["IK24-A", "IK24-C"] } })
@@ -196,26 +233,31 @@ db.classes.insertOne({ _id: "IK24-D", name: "Ilmu Komputer D" })
 // Mendaftarkan perangkat baru secara eksplisit
 db.devices.insertOne({ _id: "ESP32-GED-C1", name: "ESP32 Gedung C" })
 
-// Menghapus template biometrik seorang mahasiswa (permintaan penghapusan data)
-db.face_templates.deleteOne({ student_id: "student-ik24001" })
+// Melihat template wajah (5 angka pertama embedding) dan kunci fotonya
+db.face_templates.find({}, { student_id: 1, dimension: 1, image_key: 1, encoding: { $slice: 5 } })
 
 // Scan hari ini yang perlu ditinjau
 db.scan_events.find({ status: "Perlu ditinjau" }).sort({ scanned_at: -1 }).limit(20)
 ```
 
-Belum ada UI untuk operasi di atas (lihat `HANDOFF.md` §Langkah Lanjutan).
+Membuat/menghapus akun dosen dan menghapus mahasiswa (beserta data
+biometrik) sudah tersedia di UI. Mengubah kelas dosen, menonaktifkan akun,
+menambah kelas, dan mendaftarkan perangkat belum ada di UI (lihat `HANDOFF.md`
+§Langkah Lanjutan). Jangan menghapus `face_templates` langsung bila fotonya
+ada di Garage; gunakan hapus mahasiswa agar foto ikut terhapus.
 
 ## 7. Backup & pemulihan
 
 ```bash
 # Backup (arsip terkompresi)
-mongodump --uri="$MONGODB_URI" --db=attendance --archive=attendance-$(date +%F).gz --gzip
+mongodump --uri="$MONGODB_URI" --db="$MONGODB_DATABASE" --archive=methics-$(date +%F).gz --gzip
 
 # Pemulihan
-mongorestore --uri="$MONGODB_URI" --archive=attendance-2026-10-21.gz --gzip --drop
+mongorestore --uri="$MONGODB_URI" --archive=methics-2026-10-26.gz --gzip --drop
 ```
 
-`face_templates` berisi data biometrik: simpan arsip backup terenkripsi,
+Backup MongoDB tidak mencakup foto di Garage; cadangkan bucket terpisah bila
+foto perlu dipulihkan. `face_templates` berisi data biometrik: simpan arsip backup terenkripsi,
 batasi aksesnya, dan tetapkan masa retensi. Panduan hardening server MongoDB
 (user aplikasi, `authorization`, `bindIp`, firewall, TLS) ada di `README.md`.
 

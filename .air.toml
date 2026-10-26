@@ -8,8 +8,9 @@
 root = "."
 tmp_dir = "tmp"
 
-# Muat variabel dari .env sebelum build/run (lihat README).
-# Catatan: nilai yang sudah ada di environment shell TIDAK ditimpa oleh .env.
+# Muat variabel dari .env sebelum build/run (lihat README). Server Go juga
+# memuat ulang .env dengan godotenv.Overload di setiap start, sehingga nilai
+# terbaru di .env selalu menang atas nilai lama di environment.
 env_files = [".env"]
 
 [build]

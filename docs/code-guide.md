@@ -4,7 +4,7 @@ Dokumen ini menjelaskan **bagaimana kode disusun dan mengapa**, agar perubahan
 berikutnya konsisten dengan pola yang ada. Untuk gambaran besar, lihat
 [architecture.md](architecture.md). Untuk kontrak API, lihat [API.md](../API.md).
 Untuk skema data, lihat [database.md](database.md). Terakhir diselaraskan dengan
-kode: 26 Oktober 2026.
+kode: 26 Oktober 2026 (malam).
 
 ## 1. Prinsip yang dipegang
 
@@ -28,22 +28,29 @@ internal/api/server.go        endpoint JSON + query ber-scope role + domain meth
 internal/api/face.go          klien face service, enrollment embedding, pencocokan cosine 1:N
 internal/api/face_test.go     unit test klien & pencocokan (tanpa MongoDB)
 internal/api/images.go        foto wajah di S3: unggah, otorisasi & stream, retensi
+internal/api/admin.go         hapus mahasiswa (+ data wajah/foto/scan), buat & hapus akun dosen + endpoint JSON-nya
+internal/api/admin_test.go    unit test validasi akun dosen (tanpa MongoDB)
 internal/api/images_test.go   unit test kunci objek, unggah gagal, storage nonaktif
 internal/storage/s3.go        klien S3 minimal (SigV4, gaya path) untuk Garage
 internal/storage/s3_test.go   vektor uji AWS SigV4 + round-trip ke S3 tiruan
 internal/controller/
   web.go                      render halaman penuh (shell) + login page
   partials.go                 render fragment htmx (/partials/*)
+  admin_partials.go           fragment administrator: hapus mahasiswa, akun dosen (/akses)
+  fragments_test.go           render fragment akun staf & tombol hapus roster (tanpa MongoDB)
   auth.go                     login, logout, safeNext
 internal/model/page.go        view model untuk halaman (judul, role, tanggal, csrf)
 internal/security/middleware.go
                               session SCS, Principal, RequireSession, RequireRole,
                               LoginRateLimit, SecurityHeaders (CSP), Recover
 internal/store/
-  database.go                 Open (connect+ping MongoDB), migrate (index), seed (kelas/mahasiswa/perangkat)
-  users.go                    User, CreateUser, EnsureUser, AuthenticateUser, UserByID
+  database.go                 Open (connect+ping MongoDB), migrate (index), seed (kelas/perangkat)
+  users.go                    User, CreateUser, EnsureUser, ResetUser, AuthenticateUser, UserByID,
+                              ListStaff, UsernameTaken, UserRole, DeleteUser, MinPasswordLength
 services/face/                face service Python (FastAPI: /health, /detect → embedding ArcFace 512-d)
-devices/esp8266/esp8266_ping/ firmware heartbeat ESP8266 (Arduino)
+devices/esp32_scanner/        firmware ESP32 utama (sensor, TFT, buzzer, Wi-Fi, scan, heartbeat)
+devices/esp32cam_uart/        firmware ESP32-CAM (foto via UART)
+devices/{esp8266_ping,esp32cam_stream,algorithmics_engine_ultrasonic_buzzer}/  sketch uji
 views/
   layouts/base.html           kerangka halaman (head, sidebar, topbar, content)
   pages/*.html                shell per halaman (isi div tempat htmx menaruh fragment)
@@ -52,7 +59,7 @@ views/
   login.html                  dokumen login mandiri
 static/css/*                  tokens, base, layout, components, pages, responsive, print
 static/js/app.js              setup htmx + perilaku global
-static/js/lib/ui.js           refreshIcons, toast
+static/js/lib/ui.js           refreshIcons, toast (helper lain sisa versi pra-htmx, tidak dipakai)
 static/js/vendor/*            htmx, lucide (versi terpin, di-vendor lokal)
 ```
 
@@ -140,19 +147,26 @@ GET|POST /api/v1/devices/ping
 ```
 
 `GET /api/v1/health?device_id=…` melakukan upsert yang sama **tanpa** token.
-Lihat risiko di [devices.md](devices.md) §5.
+Lihat risiko di [devices.md](devices.md) §7.
 
 ## 4. Penjelasan per berkas
 
 ### `cmd/server/main.go`
 
-- Membaca env lewat `api.ParseConfig()` dan `env()`.
+- Memuat `.env` dengan `godotenv.Overload` (menimpa environment; lihat jebakan
+  no. 8), lalu membaca env lewat `api.ParseConfig()` dan `env()`.
+- Di luar production, `store.MinPasswordLength` diturunkan dari 12 ke 4
+  karakter (log `development mode: …`).
 - **Menolak start** bila `CSRF_SECRET` atau `DEVICE_TOKEN` < 32 karakter (semua
   mode); `FACE_SERVICE_TOKEN` < 32 karakter ditegakkan di mode production.
 - `bootstrapStaff` membuat administrator pertama dari `BOOTSTRAP_ADMIN_*` bila
   koleksi `users` belum punya administrator aktif; dosen opsional dari
   `BOOTSTRAP_LECTURER_*` (dibuat lewat `EnsureUser`, jadi dilewati bila
   username sudah ada — kelasnya tidak diperbarui). Tidak ada akun demo bawaan.
+- `resetBootstrapStaff` (bila `BOOTSTRAP_RESET_PASSWORDS=true`, ditolak di
+  production) memanggil `store.ResetUser` untuk kedua akun bootstrap di setiap
+  start: password, role, kelas, dan status aktif disetel ulang, atau akun
+  dibuat bila belum ada.
 - `store.Open(MONGODB_URI, MONGODB_DATABASE)` — gagal konek/ping dalam 8 detik
   menghentikan proses.
 - `setupImageStorage` mengaktifkan penyimpanan foto bila `S3_*` diisi:
@@ -173,7 +187,7 @@ Lihat risiko di [devices.md](devices.md) §5.
 
 Dua peran dalam satu berkas:
 
-**a. Handler HTTP** — `StaffHandler()` (`/api/v1/dashboard|classes|reports|students…|images/…`),
+**a. Handler HTTP** — `StaffHandler()` (`/api/v1/dashboard|classes|reports|students…|staff…|images/…`),
 `DeviceHandler()` (`/api/v1/health|scans|devices/ping`), `StaticHandler()`.
 Header keamanan dipasang sekali oleh `security.SecurityHeaders` yang
 membungkus seluruh router di `main.go`.
@@ -212,7 +226,9 @@ s.AllScanEvents(ctx, role, classes, status, class, q) / s.AllScanStatusCounts(..
 s.DeviceStatus(ctx) / s.FaceStatus(ctx)
 s.CreateStudent(ctx, name, nim, classID)
 s.EnrollFace(ctx, nim, image, filename)
-api.ReadImagePart(w, r)
+s.DeleteStudent(ctx, nim)                 // admin.go
+s.StaffAccounts(ctx) / s.CreateLecturer(ctx, LecturerInput{…}) / s.DeleteLecturer(ctx, id)
+api.ReadImagePart(w, r) / api.LecturerErrorMessage(err)
 ```
 
 **d. Error sentinel** — supaya controller bisa memetakan pesan tanpa tahu detail query MongoDB:
@@ -221,6 +237,8 @@ api.ReadImagePart(w, r)
 ErrMissingFields, ErrStudentExists, ErrInvalidClass, ErrStudentNotFound, ErrFaceService
 ErrInvalidImage, ErrNoFace, ErrMultipleFaces, ErrFaceAlreadyEnrolled   // face.go
 ErrImageNotFound, ErrImageForbidden                                    // images.go
+ErrInvalidUsername, ErrPasswordTooShort, ErrUsernameTaken, ErrNoClasses,
+ErrUserNotFound, ErrNotLecturer                                        // admin.go
 ```
 
 **e. Tipe bertipe** — `ClassRow`, `ScanEvent`, `RosterEntry`. Fungsi
@@ -234,9 +252,16 @@ lama** tetap sama meski internalnya bertipe.
 - Setiap handler: ambil `Principal` dari context → panggil query `api` →
   rakit struct data → `p.render(w, "<nama>_fragment", data)`.
 - `mahasiswaRoster` adalah helper bersama untuk `/partials/mahasiswa` dan
-  `enrollFace` (keduanya mengembalikan tabel roster yang sama).
+  `enrollFace` (keduanya mengembalikan tabel roster yang sama). Baris yang
+  punya `FaceImageURL` (dari `face_templates.image_key`) menampilkan tombol
+  **Lihat foto** yang membuka `/api/v1/images/enroll/...` di tab baru; izin
+  tetap diperiksa `authorizeImage`.
 - `createStudent`, `mahasiswaForm`, dan `enrollFace` menolak non-administrator
   dengan 403.
+- `admin_partials.go`: `deleteStudent` (roster setelah hapus), `staff`,
+  `createLecturer`, `deleteStaff` (fragment `staff_fragment` di
+  `views/fragments/akses.html`). Semua lewat `requireAdminPartial` (403 untuk
+  non-administrator); gagal validasi tetap HTTP 200 dengan pesan di region.
 - `logs` memanggil `AllScanStatusCounts` (ringkasan seluruh waktu, tidak ikut
   filter) dan `AllScanEvents` (tabel, ikut filter `q`/`status`/`class`).
 
@@ -263,15 +288,19 @@ lama** tetap sama meski internalnya bertipe.
 ### `internal/store/`
 
 - `database.go`: `Open` (connect + ping 8 detik) → `migrate` (membuat index,
-  idempoten) → `seed` (3 kelas, 5 mahasiswa, relasi `class_students`,
-  2 perangkat; idempoten via upsert `$setOnInsert`). `Collection(name)` adalah
+  idempoten) → `seed` (3 kelas dan 2 perangkat; idempoten via upsert
+  `$setOnInsert`; mahasiswa tidak di-seed). `Collection(name)` adalah
   helper akses koleksi.
-- `users.go`: `CreateUser` (bcrypt, password ≥ 12 karakter, role terbatas
-  `administrator`/`dosen`, `_id` hex acak), `EnsureUser` (cek username
-  case-insensitive), `AuthenticateUser` (username case-insensitive lewat regex
-  yang di-escape; perbandingan hash dummy untuk menyamakan waktu saat user
-  tidak ada), `UserByID` (menolak akun nonaktif), `CountUsersByRole` (hanya
-  akun aktif).
+- `users.go`: `CreateUser` (bcrypt, password ≥ `MinPasswordLength`: 12 di
+  production, 4 di development, role terbatas `administrator`/`dosen`, `_id`
+  hex acak), `EnsureUser` (cek username case-insensitive), `ResetUser`
+  (setel ulang/buat akun bootstrap), `AuthenticateUser` (username
+  case-insensitive lewat regex yang di-escape; perbandingan hash dummy untuk
+  menyamakan waktu saat user tidak ada), `UserByID` (menolak akun nonaktif),
+  `CountUsersByRole` (hanya akun aktif), serta `ListStaff`, `UsernameTaken`,
+  `UserRole`, `DeleteUser` untuk halaman `/akses`.
+- `seed` berjalan di **setiap** start dengan upsert `$setOnInsert`; mahasiswa
+  hanya berasal dari pendaftaran manual (lihat jebakan no. 15).
 
 ### `internal/api/face.go`
 
@@ -304,17 +333,46 @@ lama** tetap sama meski internalnya bertipe.
 - `storage.S3` ditulis dengan pustaka standar (AWS Signature V4, gaya path)
   supaya tidak menambah dependensi; diuji dengan vektor resmi AWS.
 
+### `internal/api/admin.go`
+
+- `DeleteStudent`: kumpulkan `image_key` dari `face_templates` dan
+  `scan_events`, hapus fotonya dari Garage (`deleteImage`, gagal hanya
+  di-log), lalu hapus `scan_events`, `face_templates`, `class_students`, dan
+  `students` milik mahasiswa itu.
+- `CreateLecturer`: username dinormalisasi huruf kecil dan dicek
+  `^[a-z0-9._-]{3,32}$`, password ≥ `store.MinPasswordLength`, minimal satu
+  kelas yang ada di `classes`, username belum dipakai (case-insensitive).
+  Validasi format berjalan sebelum menyentuh MongoDB (diuji di
+  `admin_test.go`).
+- `DeleteLecturer`: hanya akun ber-role `dosen`; administrator ditolak
+  (`ErrNotLecturer`) agar admin tidak mengunci diri sendiri.
+- Endpoint JSON `DELETE /api/v1/students/{nim}`, `GET|POST /api/v1/staff`,
+  `DELETE /api/v1/staff/{id}` memakai fungsi yang sama dengan fragment.
+
 ### `services/face/` (Python)
 
 FastAPI stateless milik tim ML (YOLO-FaceV2 + ArcFace). Go hanya memakai
-`GET /health` dan `POST /detect`. Detail: [face-service.md](face-service.md)
-dan `services/face/README.md`.
+`GET /health` dan `POST /detect`; `aligned_face_b64` di respons diabaikan.
+Butuh Python 3.10–3.12. Detail: [face-service.md](face-service.md) dan
+`services/face/README.md`.
 
-### `devices/esp8266/esp8266_ping/esp8266_ping.ino`
+### `devices/esp32_scanner/` dan `devices/esp32cam_uart/`
 
-Sketch Arduino ESP8266 yang tersambung ke Wi-Fi lalu mengirim
-`POST /api/v1/devices/ping` setiap 15 detik. Konfigurasi dan peringatan
-kredensial: [devices.md](devices.md).
+- `esp32_scanner.ino`: loop non-blocking (ultrasonik tiap 100 ms, heartbeat
+  tiap 15 s, buzzer, backlight); `doScan()` blocking: `camCapture()` (UART2,
+  CRC32) → `postScan()` (SHA-256 + HMAC mbedTLS, multipart ditulis bertahap ke
+  `WiFiClient`) → `jsonString()` mengurai respons → `showMessage()`.
+  Kredensial di `secrets.h` (di-gitignore). Semua fungsi didefinisikan sebelum
+  dipakai, jadi tidak bergantung pada prototipe otomatis Arduino.
+- `esp32cam_uart.ino`: kamera tanpa Wi-Fi; perintah `PING`/`CAP` di UART1
+  (GPIO14/15), balasan `IMG <len> <crc>` + JPEG.
+- Kontrak HMAC/multipart sama dengan `validScanSignature`/`readImagePart`;
+  bila salah satu berubah, ubah keduanya (lihat [devices.md](devices.md) §3, §6).
+
+### `devices/esp8266_ping/esp8266_ping.ino`
+
+Sketch uji ESP8266 yang mengirim `POST /api/v1/devices/ping` setiap 15 detik.
+Konfigurasi dan peringatan kredensial: [devices.md](devices.md) §4.
 
 ## 5. Model data (MongoDB)
 
@@ -322,7 +380,7 @@ Ringkas — detail field, index, dan operasi ada di [database.md](database.md).
 
 ```text
 classes        {_id: "IK24-A", name}
-students       {_id: "student-ik24001", nim (unik), name, email, class_id}
+students       {_id: "student-241011001", nim (unik, 9 digit), name, email, class_id}
 class_students {class_id, student_id}              (unik gabungan; belum dibaca query)
 users          {_id, username (unik), display_name, role, password_hash,
                 active, class_ids: [...], created_at}
@@ -378,6 +436,14 @@ Catatan penyimpanan waktu:
 3. Bila tampil di UI, tambahkan field struct data fragment + template.
 4. Perbarui [database.md](database.md).
 
+**Menambah aksi administrator baru**
+
+Ikuti pola `admin.go` + `admin_partials.go`: logika & validasi di fungsi
+`api.Server` (dipakai juga endpoint JSON), handler fragment memanggil
+`requireAdminPartial`, lalu merender ulang region yang sama dengan pesan
+`Notice`/`Error`. Untuk aksi yang menghapus data, pakai `hx-delete` +
+`hx-confirm` dan sertakan filter halaman lewat `hx-include`.
+
 **Menambah halaman log/filter baru**
 
 Ikuti pola `/logs`: kontainer form dengan `hx-get` + `hx-trigger="load, every
@@ -406,9 +472,11 @@ dipakai di `$regex`.
    Pakai `UTF8Encoding($false)` atau `-Encoding ascii`.
 7. **Satu `DEVICE_TOKEN` untuk semua perangkat.** Belum ada secret per
    perangkat; lihat risiko di [HANDOFF.md](../HANDOFF.md) §Batasan.
-8. **`.env` dimuat saat startup Go.** Nilai environment dari shell tidak
-   ditimpa oleh `.env`; `air` juga memuat file tersebut melalui
-   `env_files` di `.air.toml`.
+8. **`.env` dimuat saat startup Go dan menimpa environment.** `main.go` memakai
+   `godotenv.Overload()`, karena terminal VS Code (`python.terminal.useEnvFile`)
+   dan `air` (`env_files`) menyuntikkan isi `.env` saat dibuka; dengan
+   `Load()` biasa, nilai lama itu menang dan perubahan `.env` diabaikan. Untuk
+   memakai nilai dari environment, hapus baris tersebut dari `.env`.
 9. **Ping tanpa `device_id` menandai `ESP32-GED-A1`.** Perangkat yang lupa
    mengirim ID akan membuat perangkat A1 tampak online.
 10. **Opsi filter kelas di view masih hardcoded** (`views/pages/mahasiswa.html`,
@@ -425,3 +493,10 @@ dipakai di `$regex`.
 14. **Ganti model recognition = enrollment ulang.** Embedding lama tidak
     sebanding dengan model baru; foto enrollment di Garage bisa dipakai untuk
     membuat ulang template (belum diotomasi).
+15. **NIM wajib 9 digit angka** (`api.ValidNIM`, mis. `241011001`). Validasi
+    ada di `CreateStudent`, jadi endpoint JSON dan form htmx memakai aturan
+    yang sama; pola `pattern` di `mahasiswa_form.html` hanya bantuan browser.
+    Mahasiswa contoh `IK24…` dari seed lama tidak lolos aturan ini dan tidak
+    dibuat ulang lagi.
+16. **`hx-include` pada `DELETE` dikirim sebagai query string**, jadi handler
+    membaca filter dengan `r.FormValue` (bukan `r.PostFormValue`).

@@ -10,6 +10,7 @@ import (
 	"github.com/alexedwards/scs/v2"
 )
 
+// Auth menangani login dan logout staf (session SCS + bcrypt).
 type Auth struct {
 	database *store.Database
 	sessions *scs.SessionManager
@@ -28,6 +29,8 @@ func (auth *Auth) LoginPage(w http.ResponseWriter, r *http.Request) {
 	auth.web.LoginPage(w, r, "", safeNext(r.URL.Query().Get("next")))
 }
 
+// Login memverifikasi username/password (username tanpa membedakan huruf
+// besar/kecil), memperbarui token sesi, lalu mengalihkan ke next yang aman.
 func (auth *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	if err := r.ParseForm(); err != nil {
@@ -59,6 +62,7 @@ func (auth *Auth) Logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
+// safeNext hanya mengizinkan path lokal (mencegah open redirect).
 func safeNext(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" || !strings.HasPrefix(value, "/") || strings.HasPrefix(value, "//") {

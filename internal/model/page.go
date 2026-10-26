@@ -18,6 +18,9 @@ type Page struct {
 	Today       string
 }
 
+// NewPage menyiapkan data tampilan halaman. Role tak dikenal ditampilkan
+// sebagai administrator hanya untuk label; otorisasi tetap memakai Principal.
+// TeacherName masih nilai contoh (hanya dipakai atribut data-teacher-name).
 func NewPage(page, role string, userName, roleClasses, csrfToken string) Page {
 	pageTitles := map[string]string{
 		"dashboard": "Dashboard absensi",

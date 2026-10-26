@@ -18,6 +18,8 @@ import (
 
 type principalKey struct{}
 
+// Principal adalah identitas staf yang sedang login, dimuat ulang dari
+// koleksi users pada setiap request oleh RequireSession.
 type Principal struct {
 	UserID      string
 	Username    string
@@ -36,6 +38,8 @@ var loginAttempts = struct {
 	byIP map[string]loginWindow
 }{byIP: make(map[string]loginWindow)}
 
+// NewSessionManager membuat session store in-memory (cookie itbjh_session,
+// umur 8 jam, idle 30 menit). Restart server mengakhiri semua sesi.
 func NewSessionManager(secureCookie bool) *scs.SessionManager {
 	manager := scs.New()
 	manager.Lifetime = 8 * time.Hour
@@ -49,15 +53,21 @@ func NewSessionManager(secureCookie bool) *scs.SessionManager {
 	return manager
 }
 
+// PrincipalFromContext mengambil Principal yang dipasang RequireSession.
 func PrincipalFromContext(ctx context.Context) (Principal, bool) {
 	principal, ok := ctx.Value(principalKey{}).(Principal)
 	return principal, ok
 }
 
+// WithPrincipal memasang Principal ke context request.
 func WithPrincipal(r *http.Request, principal Principal) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), principalKey{}, principal))
 }
 
+// RequireSession mewajibkan sesi staf. User (role, class_ids, status aktif)
+// dibaca ulang dari MongoDB setiap request, sehingga akun yang dihapus atau
+// dinonaktifkan langsung kehilangan akses. Gagal: 401 JSON bila apiRequest
+// (atau path /api/), selain itu redirect ke /login?next=….
 func RequireSession(manager *scs.SessionManager, database *store.Database, apiRequest bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -81,6 +91,8 @@ func RequireSession(manager *scs.SessionManager, database *store.Database, apiRe
 	}
 }
 
+// RequireRole membatasi handler ke role tertentu: 403 JSON untuk /api/,
+// redirect ke / untuk halaman.
 func RequireRole(roles ...string) func(http.Handler) http.Handler {
 	allowed := make(map[string]struct{}, len(roles))
 	for _, role := range roles {
@@ -106,6 +118,9 @@ func RequireRole(roles ...string) func(http.Handler) http.Handler {
 	}
 }
 
+// SecurityHeaders memasang header keamanan (CSP script-src 'self', nosniff,
+// X-Frame-Options DENY, dst.) untuk seluruh router, plus Cache-Control:
+// no-store untuk semua path kecuali /static/.
 func SecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		header := w.Header()
@@ -121,6 +136,8 @@ func SecurityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// LoginRateLimit membatasi percobaan login per IP (in-memory) dalam satu
+// jendela waktu; kelebihan → 429 dengan Retry-After.
 func LoginRateLimit(maxAttempts int, window time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -155,6 +172,7 @@ func LoginRateLimit(maxAttempts int, window time.Duration) func(http.Handler) ht
 	}
 }
 
+// Recover menangkap panic, mencatatnya di log, dan membalas 500 tanpa detail.
 func Recover(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {

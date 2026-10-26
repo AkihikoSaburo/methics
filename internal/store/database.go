@@ -10,13 +10,15 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+// Database membungkus koneksi MongoDB dan database aplikasi (MONGODB_DATABASE).
 type Database struct {
 	Client *mongo.Client
 	DB     *mongo.Database
 }
 
-// Open membuka koneksi ke MongoDB pada host/URI yang ditentukan (default mongodb://10.100.1.11:27017)
-// dan menginisialisasi index serta data seed bila koleksi masih kosong.
+// Open membuka koneksi ke MongoDB (default mongodb://10.100.1.11:27017, database
+// "attendance"), memastikan koneksi hidup dalam 8 detik, lalu menjalankan
+// migrate (index) dan seed. Keduanya idempoten dan berjalan di SETIAP start.
 func Open(uri, dbName string) (*Database, error) {
 	if uri == "" {
 		uri = "mongodb://10.100.1.11:27017"
@@ -137,6 +139,10 @@ func (db *Database) migrate(ctx context.Context) error {
 	return nil
 }
 
+// seed meng-upsert data dasar (3 kelas dan 2 perangkat) dengan $setOnInsert:
+// dokumen yang sudah ada tidak ditimpa, dokumen yang hilang dibuat lagi.
+// Mahasiswa TIDAK di-seed; semuanya didaftarkan manual lewat dashboard atau
+// POST /api/v1/students, jadi mahasiswa yang dihapus tidak muncul kembali.
 func (db *Database) seed(ctx context.Context) error {
 	classes := []struct{ ID, Name string }{
 		{"IK24-A", "Ilmu Komputer A"},
@@ -151,39 +157,6 @@ func (db *Database) seed(ctx context.Context) error {
 		)
 		if err != nil {
 			return fmt.Errorf("seed class %s: %w", class.ID, err)
-		}
-	}
-
-	students := []struct{ ID, NIM, Name, ClassID string }{
-		{"student-ik24001", "IK24001", "Alya Putri", "IK24-A"},
-		{"student-ik24002", "IK24002", "Bima Saputra", "IK24-A"},
-		{"student-ik24003", "IK24003", "Citra Nabila", "IK24-B"},
-		{"student-ik24004", "IK24004", "Dafa Ramadhan", "IK24-B"},
-		{"student-ik24005", "IK24005", "Eka Anindya", "IK24-C"},
-	}
-	for _, student := range students {
-		_, err := db.Collection("students").UpdateOne(ctx,
-			bson.M{"_id": student.ID},
-			bson.M{"$setOnInsert": bson.M{
-				"_id":      student.ID,
-				"nim":      student.NIM,
-				"name":     student.Name,
-				"email":    "",
-				"class_id": student.ClassID,
-			}},
-			options.Update().SetUpsert(true),
-		)
-		if err != nil {
-			return fmt.Errorf("seed student %s: %w", student.NIM, err)
-		}
-
-		_, err = db.Collection("class_students").UpdateOne(ctx,
-			bson.M{"class_id": student.ClassID, "student_id": student.ID},
-			bson.M{"$setOnInsert": bson.M{"class_id": student.ClassID, "student_id": student.ID}},
-			options.Update().SetUpsert(true),
-		)
-		if err != nil {
-			return fmt.Errorf("enroll student %s: %w", student.NIM, err)
 		}
 	}
 
