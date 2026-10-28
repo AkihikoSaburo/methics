@@ -13,8 +13,6 @@ from .utils import (
     letterbox,
     nms,
     sigmoid,
-    draw_detection,
-    draw_overlay,
 )
 
 __all__ = [
@@ -32,6 +30,4 @@ __all__ = [
     "letterbox",
     "nms",
     "sigmoid",
-    "draw_detection",
-    "draw_overlay",
 ]
