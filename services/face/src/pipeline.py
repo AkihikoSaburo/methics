@@ -101,45 +101,7 @@ class FacePipeline:
 
         return results
 
-    def compare_faces(
-        self,
-        img1_bgr: np.ndarray,
-        img2_bgr: np.ndarray,
-        similarity_threshold: Optional[float] = None,
-        conf_threshold: Optional[float] = None,
-        iou_threshold: Optional[float] = None
-    ) -> Dict[str, Any]:
-        """
-        Detect faces in two images, align, and compare the most prominent face from each.
-        """
-        sim_thresh = similarity_threshold if similarity_threshold is not None else settings.sim_threshold
 
-        faces1 = self.process_image(img1_bgr, conf_threshold=conf_threshold, iou_threshold=iou_threshold)
-        faces2 = self.process_image(img2_bgr, conf_threshold=conf_threshold, iou_threshold=iou_threshold)
-
-        if not faces1:
-            return {"error": "No face detected in Image 1", "match": False}
-        if not faces2:
-            return {"error": "No face detected in Image 2", "match": False}
-
-        # Select most confident face from each image
-        face1 = max(faces1, key=lambda f: f["confidence"])
-        face2 = max(faces2, key=lambda f: f["confidence"])
-
-        sim = self.recognizer.compute_similarity(face1["embedding"], face2["embedding"])
-        dist = self.recognizer.compute_distance(face1["embedding"], face2["embedding"])
-        is_match = sim >= sim_thresh
-
-        return {
-            "similarity": sim,
-            "euclidean_distance": dist,
-            "threshold": sim_thresh,
-            "match": is_match,
-            "face1_confidence": face1["confidence"],
-            "face2_confidence": face2["confidence"],
-            "face1_aligned": face1["aligned_face"],
-            "face2_aligned": face2["aligned_face"],
-        }
 
 
 # ============================================================================

@@ -2,7 +2,7 @@
 Utility functions and geometric operations for Face Detection and Recognition.
 """
 
-from typing import List, Tuple, Sequence
+from typing import List, Tuple
 import cv2
 import numpy as np
 
@@ -104,50 +104,3 @@ def nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.45) -> L
         order = order[inds + 1]
 
     return keep
-
-
-def draw_detection(
-    img: np.ndarray,
-    bbox: Sequence[float],
-    confidence: float,
-    label: str = "Face",
-    color: Tuple[int, int, int] = (0, 255, 0),
-    thickness: int = 2
-) -> None:
-    """
-    Draw bounding box and confidence label onto an image in-place.
-    """
-    x1, y1, x2, y2 = [int(v) for v in bbox]
-    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
-    text = f"{label} {confidence:.2f}"
-    text_pos = (x1, max(15, y1 - 8))
-    cv2.putText(
-        img,
-        text,
-        text_pos,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        color,
-        thickness
-    )
-
-
-def draw_overlay(
-    frame: np.ndarray,
-    crop: np.ndarray,
-    top: int = 10,
-    margin_right: int = 10,
-    border_color: Tuple[int, int, int] = (255, 255, 255)
-) -> None:
-    """
-    Draw an overlay thumbnail (e.g. aligned face crop) onto frame in-place.
-    """
-    h_f, w_f = frame.shape[:2]
-    h_c, w_c = crop.shape[:2]
-    if w_f >= w_c + margin_right + 10 and h_f >= h_c + top + 10:
-        x_start = w_f - w_c - margin_right
-        x_end = w_f - margin_right
-        y_start = top
-        y_end = top + h_c
-        frame[y_start:y_end, x_start:x_end] = crop
-        cv2.rectangle(frame, (x_start, y_start), (x_end, y_end), border_color, 1)

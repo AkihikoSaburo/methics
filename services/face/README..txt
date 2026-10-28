@@ -1,1 +1,0 @@
-tempatnya system cerdas ini
