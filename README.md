@@ -46,7 +46,7 @@ Untuk orientasi cepat AI/kontributor berikutnya, mulai dari
 cmd/server/main.go        entry point: env, routing, middleware, bootstrap akun, shutdown
 internal/api/             endpoint JSON, query ber-scope role, logika domain,
                           klien face service (face.go), foto wajah (images.go),
-                          fitur administrator (admin.go)
+                          fitur administrator (admin.go), scan multi-frame & HMAC (scan.go)
 internal/storage/         klien S3 untuk Garage (pustaka standar, SigV4)
 internal/controller/      halaman (web.go), fragment htmx (partials.go, admin_partials.go), login (auth.go)
 internal/model/           view model halaman
@@ -55,6 +55,7 @@ internal/store/           koneksi MongoDB, index, seed, akun staf
 views/                    template html/template (layouts, pages, partials, fragments)
 static/                   CSS, JS, htmx & Lucide yang di-vendor lokal
 devices/                  firmware Arduino: esp32_scanner (perangkat absensi), esp32cam_uart (kamera),
+                          esp32cam_wifi (kamera mode uji Wi-Fi),
                           sketch uji layar/sensor, stream kamera, dan heartbeat ESP8266
 services/face/            face service Python (FastAPI: deteksi wajah + embedding ArcFace)
 docs/                     dokumentasi
@@ -116,7 +117,7 @@ Binary membaca `views/` dan `static/` dari direktori kerja (atau dari
 | Route | Isi | Akses |
 | --- | --- | --- |
 | `/` | ringkasan absensi hari ini, status perangkat & face service | staf |
-| `/mahasiswa` | roster, pendaftaran & penghapusan mahasiswa, enrollment wajah | staf (aksi tulis: administrator) |
+| `/mahasiswa` | roster, pendaftaran & penghapusan mahasiswa, enrollment wajah 1–6 foto, lihat foto enrollment | staf (aksi tulis: administrator) |
 | `/kelas` | kehadiran dan enrollment per kelas | staf |
 | `/laporan` | rekap status scan hari ini, kehadiran per kelas, 50 scan terbaru, cetak | staf |
 | `/logs` | log pemindaian seluruh waktu (200 terbaru) dengan filter status, kelas, pencarian, dan tautan foto capture | staf |
@@ -138,7 +139,9 @@ dirender Go dengan `html/template`; data dimuat dan disegarkan oleh htmx dari
 | `MONGODB_DATABASE` | `attendance` | nama database (dibuat otomatis saat pertama ditulisi) |
 | `FACE_SERVICE_URL` | `http://127.0.0.1:8000` | face service internal (`services/face/api.py`) |
 | `FACE_SIM_THRESHOLD` | `0.45` | ambang cosine similarity untuk menyatakan wajah cocok |
-| `FACE_SERVICE_TIMEOUT_SECONDS` | `15` | batas waktu panggilan `/detect` |
+| `FACE_POSE_THRESHOLD` | `0.30` | ambang kemiripan antar-foto dalam satu enrollment (1–6 pose) |
+| `SCAN_MIN_MATCH_FRAMES` | `2` | frame scan yang harus cocok dengan mahasiswa yang sama agar langsung Hadir |
+| `FACE_SERVICE_TIMEOUT_SECONDS` | `15` | batas waktu satu panggilan `/embed` atau `/register` |
 | `FACE_SERVICE_TOKEN` | kosong | bearer ke face service; ≥ 32 karakter di production |
 | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET` | kosong, `garage`, kosong | object storage S3 (Garage) untuk foto wajah; kosong = foto tidak disimpan |
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | kosong | kunci Garage khusus bucket (bukan kunci admin) |
@@ -185,11 +188,16 @@ pencocokan dilakukan oleh Go.
 
 Perangkat absensi = **ESP32 utama** (`devices/esp32_scanner`: ultrasonik, layar
 TFT, buzzer, Wi-Fi) + **ESP32-CAM** (`devices/esp32cam_uart`) yang tersambung
-lewat kabel UART. Saat orang terdeteksi, ESP32 meminta foto ke kamera, lalu
-mengirimnya ke `POST /api/v1/scans` (token + HMAC + jam NTP) dan menampilkan
-hasilnya; tiap 15 detik ia juga mengirim heartbeat ke
+lewat kabel UART. Kamera mati saat idle; begitu sensor ultrasonik mendeteksi
+orang, ESP32 menyalakan kamera, mengambil ±4 frame selama ±2 detik, lalu
+mengirim semuanya ke `POST /api/v1/scans` (token + HMAC + jam NTP). Wajah yang
+cocok di ≥ 2 frame langsung tercatat **Hadir** di kelas mahasiswa itu; wajah
+yang tidak cocok dengan siapa pun tampil **"Wajah tidak Terdaftar"** di layar
+TFT. Tiap 15 detik ESP32 juga mengirim heartbeat ke
 `POST /api/v1/devices/ping`. Wiring, konfigurasi, urutan upload, dan uji
-bertahap ada di [docs/devices.md](docs/devices.md) §2.
+bertahap ada di [docs/devices.md](docs/devices.md) §2. Untuk uji tanpa kabel
+antar-board, kamera bisa disambungkan lewat Wi-Fi (`devices/esp32cam_wifi`,
+`CAM_LINK_WIFI 1`; [docs/devices.md](docs/devices.md) §2.6).
 
 Wi-Fi dan `DEVICE_TOKEN` untuk ESP32 disimpan di
 `devices/esp32_scanner/secrets.h` (salin dari `secrets.example.h`; di-gitignore).
@@ -202,9 +210,11 @@ Wi-Fi dan `DEVICE_TOKEN` untuk ESP32 disimpan di
 
 Face service ada di `services/face/` (FastAPI + ONNX Runtime: YOLO-FaceV2 untuk
 deteksi, ArcFace untuk embedding 512 dimensi). Layanan ini **stateless**: Go
-memanggil `POST /detect`, lalu Go sendiri yang menyimpan embedding ke MongoDB
-(enrollment) dan mencocokkannya dengan cosine similarity (scan). Jadi dashboard
-dan perangkat ESP32 cukup memakai satu API, yaitu Go.
+memanggil `POST /register` saat enrollment (1–6 foto pose berbeda → satu
+embedding per foto) dan `POST /embed` saat scan, lalu Go sendiri yang
+menyimpan embedding ke MongoDB dan mencocokkannya dengan cosine similarity
+terhadap semua pose. Jadi dashboard dan perangkat ESP32 cukup memakai satu
+API, yaitu Go.
 
 Gunakan Python **3.10–3.12** (`services/face/environment.yml` memakai 3.10).
 Python 3.15 belum didukung: `numpy<2.3` dan `onnxruntime` belum punya wheel
@@ -214,7 +224,7 @@ untuknya, sehingga `pip install` gagal membangun `numpy` dari source.
 # Terminal 1 — face service (dari services/face; lihat services/face/README.md)
 conda activate face_rec            # atau venv Python 3.10–3.12
 pip install -r requirements.txt    # sekali
-uvicorn api:app --host 127.0.0.1 --port 8000
+python main.py --host 127.0.0.1 --port 8000   # atau: uvicorn api:app --host 127.0.0.1 --port 8000
 
 # Terminal 2 — backend Go
 air
@@ -257,10 +267,10 @@ Detail di [API.md](API.md). Ringkasan:
 - `GET /api/v1/health` — publik
 - `GET /api/v1/dashboard`, `/classes`, `/reports` — session staf
 - `POST /api/v1/students` — administrator + CSRF (JSON)
-- `POST /api/v1/students/{nim}/face-template` — administrator + CSRF (multipart `image`)
+- `POST /api/v1/students/{nim}/face-template` — administrator + CSRF (multipart `images`, 1–6 foto)
 - `DELETE /api/v1/students/{nim}` — administrator + CSRF (hapus mahasiswa + data wajah, foto, riwayat scan)
 - `GET|POST /api/v1/staff`, `DELETE /api/v1/staff/{id}` — administrator + CSRF (akun dosen)
-- `POST /api/v1/scans` — perangkat (multipart `device_id`, `class_id`, `captured_at`, `liveness_passed`, `image`; bearer + HMAC)
+- `POST /api/v1/scans` — perangkat (multipart `device_id`, `class_id` opsional, `captured_at`, `liveness_passed`, 1–6 `image`; bearer + HMAC)
 - `GET|POST /api/v1/devices/ping` — heartbeat perangkat
 - `GET /api/v1/images/{key...}` — foto enrollment/scan dari Garage (session staf; dosen hanya kelasnya)
 
@@ -349,8 +359,11 @@ diterapkan:
 | Login `429` | lebih dari 10 percobaan dari IP yang sama dalam 5 menit; tunggu |
 | Semua pengguna ter-logout | server di-restart (session in-memory) |
 | "Verifikasi Python" offline | face service belum berjalan, model belum selesai dimuat, atau `FACE_SERVICE_URL` salah (default port `8000`) |
-| Enrollment: "Tidak ada wajah yang terdeteksi" | foto buram/terlalu gelap/wajah terlalu kecil; coba foto wajah frontal yang jelas |
-| Enrollment: "Wajah ini sudah terdaftar atas NIM …" | wajah mirip (≥ `FACE_SIM_THRESHOLD`) dengan template mahasiswa lain |
+| Enrollment: "Tidak ada wajah yang terdeteksi (foto ke-N)" | foto ke-N buram/terlalu gelap/wajah terlalu kecil; ganti foto itu |
+| Enrollment: "Wajah (foto ke-N) tidak cocok dengan foto pertama" | foto ke-N orang lain, atau pose terlalu ekstrem (> ~45°); kurangi sudut atau buang foto itu (ambang `FACE_POSE_THRESHOLD`) |
+| Enrollment banyak foto gagal / koneksi terputus, 1–2 foto berhasil | versi lama: request melewati batas 15 detik server. Pakai Go terbaru (batas enrollment 3 menit, unggah Garage paralel) dan lihat log `enrollment … gagal (N foto, durasi)` |
+| Enrollment: "Wajah … sudah terdaftar atas NIM …" | wajah mirip (≥ `FACE_SIM_THRESHOLD`) dengan template mahasiswa lain |
+| Enrollment / scan: `face_service_error` setelah memperbarui `services/face` | Go versi lama masih memanggil `POST /detect` (sudah dihapus dari `api.py`); pakai Go terbaru yang memanggil `/embed` dan `/register` |
 | Perangkat "offline" | tidak ada ping/scan dalam 2 menit; lihat [docs/devices.md](docs/devices.md) §8 |
 | Log: `image storage: PERINGATAN bucket … belum bisa diakses` | Garage tidak terjangkau dari server Go, bucket belum dibuat, atau `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY` salah |
 | Kolom Foto di Log berisi `-` | penyimpanan foto nonaktif, unggah gagal (lihat log `image storage: upload … gagal`), scan dibuat sebelum `S3_*` diisi/server di-restart, atau foto sudah lewat retensi |

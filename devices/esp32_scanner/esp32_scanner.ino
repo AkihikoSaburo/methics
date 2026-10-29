@@ -5,28 +5,41 @@
  * Peran   : ESP32 utama perangkat absensi.
  *
  *   1. Sensor ultrasonik HC-SR04 mendeteksi orang (<= DETECT_CM).
- *   2. Layar TFT menyala, buzzer berbunyi, ESP32 meminta foto ke ESP32-CAM
- *      lewat UART (devices/esp32cam_uart).
- *   3. Foto dikirim ke backend Go  POST /api/v1/scans  dengan Bearer token,
- *      stempel waktu NTP, dan tanda tangan HMAC-SHA256.
- *   4. Hasil (Hadir / Perlu ditinjau / Ditolak) tampil di layar + pola buzzer.
- *   5. Setiap PING_INTERVAL_MS mengirim heartbeat  POST /api/v1/devices/ping
+ *   2. Layar TFT menyala, buzzer berbunyi, ESP32 menyalakan ESP32-CAM ("ON")
+ *      lewat Wi-Fi atau UART (CAM_LINK_WIFI). Kamera terus menangkap frame.
+ *   3. Selama ±SCAN_WINDOW_MS (2 detik) ESP32 mengambil hingga
+ *      SCAN_MAX_FRAMES frame, lalu mematikan kamera ("OFF").
+ *   4. Semua frame dikirim sekaligus ke backend Go  POST /api/v1/scans
+ *      dengan Bearer token, stempel waktu NTP, dan tanda tangan HMAC-SHA256.
+ *      Go mencocokkan tiap frame dengan wajah terdaftar di MongoDB.
+ *   5. Hasil tampil di layar + pola buzzer:
+ *        HADIR                  wajah cocok di >= 2 frame (tercatat di dashboard
+ *                               pada kelas mahasiswa itu)
+ *        Wajah tidak Terdaftar  ada wajah tetapi tidak cocok dengan siapa pun
+ *        Wajah tidak terdeteksi tidak ada wajah di semua frame
+ *        DITINJAU               cocok di 1 frame saja / bukan kelas perangkat
+ *   6. Setiap PING_INTERVAL_MS mengirim heartbeat  POST /api/v1/devices/ping
  *      agar dashboard menampilkan perangkat "Terhubung".
  *
  * Wiring:
  *   HC-SR04 : VCC->5V(VIN), GND->GND, TRIG->GPIO26, ECHO->GPIO27 (lewat pembagi 1k+2k)
  *   Buzzer  : (+)/IO->GPIO22, (-)->GND
  *   TFT     : sesuai User_Setup.h TFT_eSPI (backlight TFT_BL, default GPIO21)
- *   Kamera  : ESP32 GPIO16 (RX2) <- ESP32-CAM GPIO15 (TX)
- *             ESP32 GPIO17 (TX2) -> ESP32-CAM GPIO14 (RX)
- *             GND <-> GND (wajib)
+ *   Kamera  : pilih lewat CAM_LINK_WIFI.
+ *     1 = Wi-Fi (MODE UJI): ESP32-CAM menjalankan devices/esp32cam_wifi,
+ *         tetap di MB dengan USB sendiri; TIDAK ada kabel antar-board.
+ *         Isi CAM_TOKEN di secrets.h dan (bila mDNS gagal) CAM_HOST.
+ *     0 = kabel UART: ESP32-CAM menjalankan devices/esp32cam_uart,
+ *         ESP32 GPIO16 (RX2) <- ESP32-CAM GPIO15 (TX)
+ *         ESP32 GPIO17 (TX2) -> ESP32-CAM GPIO14 (RX)
+ *         GND <-> GND (wajib)
  *   Pastikan GPIO16/17 tidak dipakai di User_Setup.h TFT_eSPI. Pada modul
  *   ESP32-WROVER, GPIO16/17 dipakai PSRAM: ganti CAM_RX_PIN/CAM_TX_PIN.
  *
  * Library: TFT_eSPI (Bodmer), dengan User_Setup.h yang sama seperti sketch
  * algorithmics_engine_ultrasonic_buzzer dan LOAD_GFXFF aktif (font FreeSans).
  *
- * Perintah Serial Monitor (115200, newline): scan | ping | cam | status
+ * Perintah Serial Monitor (115200, newline): scan | ping | cam | camon | camoff | status
  * ==============================================================================
  */
 
@@ -34,6 +47,8 @@
 #include <time.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
+#include <HTTPClient.h>
+#include <ESPmDNS.h>
 #include "mbedtls/md.h"
 
 #if __has_include("secrets.h")
@@ -45,14 +60,17 @@
 // ---------------------------------------------------------------------------
 // Konfigurasi server & identitas perangkat
 // ---------------------------------------------------------------------------
-#define SERVER_HOST      "10.229.23.195"   // IP komputer yang menjalankan backend Go
+#define SERVER_HOST      "172.16.0.102"   // IP komputer yang menjalankan backend Go
 #define SERVER_PORT      8080
 #define DEVICE_ID        "ESP32-GED-A1"    // harus ada di koleksi devices (seed)
-#define CLASS_ID         "IK24-A"          // kelas di ruangan ini, HURUF BESAR
+// Kosong = kelas otomatis: kehadiran dicatat di kelas mahasiswa yang cocok.
+// Isi kode kelas (HURUF BESAR, mis. "IK24-A") bila alat dipasang khusus untuk
+// satu kelas; mahasiswa kelas lain lalu tercatat "Perlu ditinjau".
+#define CLASS_ID         ""
 
-// Alat ini belum punya deteksi liveness (anti-spoof) sungguhan. Ultrasonik
-// hanya mendeteksi ada objek, jadi kirim false: wajah yang cocok dicatat
-// "Perlu ditinjau" sampai ada anti-spoof yang tervalidasi.
+// Alat ini belum punya deteksi liveness (anti-spoof) sungguhan, jadi kirim
+// false. Server tetap mencatat "Hadir" bila wajah yang sama cocok di
+// beberapa frame (SCAN_MIN_MATCH_FRAMES di server, default 2).
 #define LIVENESS_PASSED  false
 
 #define PING_INTERVAL_MS 15000UL           // dashboard offline bila > 2 menit tanpa ping
@@ -61,13 +79,37 @@
 #define NTP_SERVER_2     "time.google.com"
 
 // ---------------------------------------------------------------------------
-// Kamera (UART2)
+// Kamera
 // ---------------------------------------------------------------------------
+// Cara ESP32 utama terhubung ke ESP32-CAM:
+//   0 = kabel UART  -> upload devices/esp32cam_uart ke kamera (mode produksi)
+//   1 = Wi-Fi       -> upload devices/esp32cam_wifi ke kamera (MODE UJI, tanpa
+//                      kabel antar-board; kamera tetap di MB dengan USB sendiri)
+#define CAM_LINK_WIFI    1
+
+// Mode Wi-Fi: IP kamera (lihat Serial Monitor kamera: "[WiFi] IP kamera: ...").
+// Kosong = cari otomatis lewat mDNS "methics-cam.local".
+#define CAM_HOST         ""
+#define CAM_MDNS_NAME    "methics-cam"     // SAMAKAN dengan CAM_HOSTNAME di esp32cam_wifi
+
+// Mode UART:
 #define CAM_RX_PIN       16
 #define CAM_TX_PIN       17
 #define CAM_BAUD         460800            // SAMAKAN dengan LINK_BAUD di esp32cam_uart
-#define MAX_IMAGE_BYTES  60000             // SAMAKAN dengan MAX_JPEG_BYTES di esp32cam_uart
-#define CAM_TIMEOUT_MS   6000UL
+
+#define MAX_IMAGE_BYTES  24000             // SAMAKAN dengan MAX_JPEG_BYTES di sketch kamera
+#define CAM_TIMEOUT_MS   4000UL            // batas satu frame
+#define CAM_ON_TIMEOUT_MS 5000UL           // batas kamera menyala (init + pemanasan)
+
+#if CAM_LINK_WIFI && !defined(CAM_TOKEN)
+#error "Mode Wi-Fi: tambahkan  #define CAM_TOKEN \"...\"  ke secrets.h (sama dengan CAM_TOKEN di esp32cam_wifi/secrets.h)."
+#endif
+
+// Jendela scan: kamera stream, ESP32 mengambil hingga SCAN_MAX_FRAMES frame
+// yang tersebar dalam SCAN_WINDOW_MS. 4 frame QVGA ±60 KB RAM.
+#define SCAN_WINDOW_MS   2000UL
+#define SCAN_MAX_FRAMES  4                 // maks 6 (batas server)
+#define HEAP_RESERVE     40000             // sisakan heap untuk Wi-Fi/TLS saat menyimpan frame
 
 // ---------------------------------------------------------------------------
 // Sensor, buzzer, layar (sama dengan sketch algorithmics_engine_ultrasonic_buzzer)
@@ -80,8 +122,7 @@
 #define MEASURE_INTERVAL   100UL
 #define CONFIRM_HITS       2
 #define RESULT_SHOW_MS     6000UL          // lama hasil tampil sebelum layar mati
-#define SCAN_COOLDOWN_MS   8000UL          // jeda minimum antar scan
-#define SCAN_SETTLE_MS     300UL           // jeda agar wajah diam sebelum difoto
+#define SCAN_COOLDOWN_MS   6000UL          // jeda minimum antar scan
 
 #define BUZZER_PIN       22
 #define BUZZER_PASSIVE    0
@@ -99,6 +140,24 @@
 #define COLOR_ORANGE 0xFD20
 
 TFT_eSPI tft = TFT_eSPI();
+
+// Tipe yang dipakai di parameter/nilai balik fungsi WAJIB didefinisikan di sini,
+// sebelum fungsi pertama: Arduino IDE menyisipkan prototipe otomatis semua
+// fungsi tepat sebelum fungsi pertama, jadi tipe yang didefinisikan lebih bawah
+// menyebabkan error "'Frames' does not name a type".
+
+// Hasil satu request HTTP.
+struct HttpResult {
+  int status = -1;        // -1 = gagal terhubung / timeout
+  String body;
+};
+
+// Kumpulan frame satu scan (buffer malloc, dibebaskan freeFrames).
+struct Frames {
+  uint8_t* data[SCAN_MAX_FRAMES];
+  size_t len[SCAN_MAX_FRAMES];
+  int count = 0;
+};
 
 bool screenOn = false;
 unsigned long screenOffAt = 0;
@@ -252,7 +311,8 @@ void drawFooter() {
   tft.setFreeFont(&FreeSans9pt7b);
   tft.setTextDatum(BC_DATUM);
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  String s = String(CLASS_ID) + "  " + (WiFi.status() == WL_CONNECTED ? "WiFi" : "no WiFi") +
+  String kelas = strlen(CLASS_ID) ? String(CLASS_ID) : String("Kelas otomatis");
+  String s = kelas + "  " + (WiFi.status() == WL_CONNECTED ? "WiFi" : "no WiFi") +
              (cameraOk ? "  CAM" : "  no CAM");
   tft.drawString(s, tft.width() / 2, tft.height() - 4);
 }
@@ -354,8 +414,124 @@ uint32_t crc32(const uint8_t* data, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// Kamera lewat UART
+// Kamera lewat Wi-Fi (MODE UJI, devices/esp32cam_wifi)
 // ---------------------------------------------------------------------------
+#if CAM_LINK_WIFI
+
+String camBaseUrl;   // "http://<ip>" setelah ditemukan
+
+// Tentukan alamat kamera: CAM_HOST, atau cari "methics-cam.local" lewat mDNS.
+bool camResolve() {
+  if (camBaseUrl.length()) return true;
+  if (strlen(CAM_HOST)) {
+    camBaseUrl = String("http://") + CAM_HOST;
+    return true;
+  }
+  static bool mdnsStarted = false;
+  if (!mdnsStarted) mdnsStarted = MDNS.begin("methics-scanner");
+  IPAddress ip = MDNS.queryHost(CAM_MDNS_NAME, 2500);
+  if (ip.toString() == "0.0.0.0") {
+    Serial.printf("[Cam] %s.local tidak ditemukan; isi CAM_HOST dengan IP kamera\n", CAM_MDNS_NAME);
+    return false;
+  }
+  camBaseUrl = "http://" + ip.toString();
+  Serial.printf("[Cam] kamera ditemukan di %s\n", camBaseUrl.c_str());
+  return true;
+}
+
+// Panggil endpoint kamera. Mengembalikan kode HTTP (< 0 = gagal terhubung).
+int camHttp(bool post, const char* path, unsigned long timeoutMs, String& body) {
+  body = "";
+  if (WiFi.status() != WL_CONNECTED || !camResolve()) return -1;
+  HTTPClient http;
+  http.setConnectTimeout(2000);
+  http.setTimeout(timeoutMs);
+  if (!http.begin(camBaseUrl + path)) return -1;
+  http.addHeader("X-Cam-Token", CAM_TOKEN);
+  int code = post ? http.POST("") : http.GET();
+  if (code > 0) body = http.getString();
+  http.end();
+  if (code < 0 && !strlen(CAM_HOST)) camBaseUrl = "";   // IP kamera mungkin berubah: cari ulang
+  return code;
+}
+
+String camHttpError(int code, const String& body) {
+  if (code < 0) return "Kamera tidak merespons";
+  if (code == 401) return "Token kamera salah";
+  return "Kamera: " + (body.length() ? body : String("HTTP ") + code);
+}
+
+bool camPing() {
+  String body;
+  int code = camHttp(false, "/ping", 2500, body);
+  cameraOk = code == 200 && body.startsWith("PONG");
+  if (!cameraOk) Serial.printf("[Cam] ping: %s\n", camHttpError(code, body).c_str());
+  return cameraOk;
+}
+
+// Nyalakan kamera (stream ke buffer di ESP32-CAM).
+bool camOn(String& err) {
+  String body;
+  int code = camHttp(true, "/on", CAM_ON_TIMEOUT_MS, body);
+  if (code == 200) {
+    cameraOk = true;
+    return true;
+  }
+  if (code < 0) cameraOk = false;
+  err = camHttpError(code, body);
+  return false;
+}
+
+void camOff() {
+  String body;
+  camHttp(true, "/off", 1500, body);
+}
+
+// Ambil satu frame JPEG. Berhasil -> *out (malloc, wajib free) dan *outLen.
+bool camCapture(uint8_t** out, size_t* outLen, String& err) {
+  if (WiFi.status() != WL_CONNECTED || !camResolve()) { err = "Kamera tidak merespons"; cameraOk = false; return false; }
+  HTTPClient http;
+  http.setConnectTimeout(2000);
+  http.setTimeout(CAM_TIMEOUT_MS);
+  if (!http.begin(camBaseUrl + "/capture")) { err = "Kamera tidak merespons"; return false; }
+  http.addHeader("X-Cam-Token", CAM_TOKEN);
+  int code = http.GET();
+  if (code != 200) {
+    String body = code > 0 ? http.getString() : String("");
+    http.end();
+    err = camHttpError(code, body);
+    if (code < 0) {
+      cameraOk = false;
+      if (!strlen(CAM_HOST)) camBaseUrl = "";
+    }
+    return false;
+  }
+  int len = http.getSize();
+  if (len <= 0 || len > MAX_IMAGE_BYTES) { http.end(); err = "Ukuran foto tidak valid"; return false; }
+  if (ESP.getMaxAllocHeap() < (size_t)len + HEAP_RESERVE) { http.end(); err = "Memori tidak cukup"; return false; }
+  uint8_t* buf = (uint8_t*)malloc(len);
+  if (!buf) { http.end(); err = "Memori tidak cukup"; return false; }
+
+  WiFiClient* stream = http.getStreamPtr();
+  size_t got = 0;
+  unsigned long t0 = millis();
+  while (got < (size_t)len && millis() - t0 < CAM_TIMEOUT_MS) {
+    size_t avail = stream->available();
+    if (avail) got += stream->readBytes(buf + got, min(avail, (size_t)len - got));
+    else if (!stream->connected()) break;
+    else delay(1);
+  }
+  http.end();
+  if (got != (size_t)len) { free(buf); err = "Transfer foto terputus"; return false; }
+  cameraOk = true;
+  *out = buf;
+  *outLen = len;
+  return true;
+}
+
+#else  // CAM_LINK_WIFI == 0 : kabel UART
+
+// Kamera lewat UART (devices/esp32cam_uart)
 HardwareSerial& Cam = Serial2;
 
 // Baca satu baris dari kamera; abaikan "READY" dan log lain. Kosong = timeout.
@@ -397,6 +573,38 @@ bool camPing() {
   return false;
 }
 
+// Kirim perintah satu baris lalu tunggu balasan yang diawali `expect`.
+bool camCommand(const char* cmd, const char* expect, unsigned long timeoutMs, String& reply) {
+  camFlush();
+  Cam.print(cmd);
+  Cam.print('\n');
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    reply = camReadLine(timeoutMs - (millis() - t0));
+    if (reply.length() == 0) break;
+    if (reply.startsWith(expect) || reply.startsWith("ERR")) break;
+  }
+  bool ok = reply.startsWith(expect);
+  if (reply.length() == 0) cameraOk = false;
+  return ok;
+}
+
+// Nyalakan kamera (stream ke buffer di ESP32-CAM).
+bool camOn(String& err) {
+  String reply;
+  if (camCommand("ON", "ON", CAM_ON_TIMEOUT_MS, reply)) {
+    cameraOk = true;
+    return true;
+  }
+  err = reply.length() ? "Kamera: " + reply.substring(reply.indexOf(' ') + 1) : String("Kamera tidak merespons");
+  return false;
+}
+
+void camOff() {
+  String reply;
+  camCommand("OFF", "OFF", 1000, reply);
+}
+
 // Minta foto. Berhasil -> *out (malloc, wajib free) dan *outLen.
 bool camCapture(uint8_t** out, size_t* outLen, String& err) {
   camFlush();
@@ -415,6 +623,7 @@ bool camCapture(uint8_t** out, size_t* outLen, String& err) {
     err = "Header kamera tidak valid";
     return false;
   }
+  if (ESP.getMaxAllocHeap() < len + HEAP_RESERVE) { err = "Memori tidak cukup"; return false; }
   uint8_t* buf = (uint8_t*)malloc(len);
   if (!buf) { err = "Memori tidak cukup"; return false; }
 
@@ -433,14 +642,11 @@ bool camCapture(uint8_t** out, size_t* outLen, String& err) {
   return true;
 }
 
+#endif  // CAM_LINK_WIFI
+
 // ---------------------------------------------------------------------------
 // HTTP (WiFiClient mentah: foto dikirim bertahap tanpa salinan kedua)
 // ---------------------------------------------------------------------------
-struct HttpResult {
-  int status = -1;        // -1 = gagal terhubung / timeout
-  String body;
-};
-
 bool writeAll(WiFiClient& c, const uint8_t* data, size_t len) {
   size_t sent = 0;
   unsigned long t0 = millis();
@@ -526,14 +732,33 @@ void sendPing() {
   Serial.printf("[Ping] HTTP %d\n", r.status);
 }
 
-HttpResult postScan(const uint8_t* image, size_t imageLen, const char* timestamp) {
+void freeFrames(Frames& f) {
+  for (int i = 0; i < f.count; i++) free(f.data[i]);
+  f.count = 0;
+}
+
+// SHA-256 atas semua frame digabung berurutan (sama dengan framesHash di Go).
+void framesSha256Hex(const Frames& f, char out[65]) {
+  uint8_t digest[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+  mbedtls_md_starts(&ctx);
+  for (int i = 0; i < f.count; i++) mbedtls_md_update(&ctx, f.data[i], f.len[i]);
+  mbedtls_md_finish(&ctx, digest);
+  mbedtls_md_free(&ctx);
+  toHex(digest, 32, out);
+}
+
+HttpResult postScan(const Frames& frames, const char* timestamp) {
   const char* liveness = LIVENESS_PASSED ? "true" : "false";
 
   // Tanda tangan: 6 baris digabung "\n" (lihat API.md / docs/devices.md §4).
-  char imageHash[65], signature[65];
-  sha256Hex(image, imageLen, imageHash);
+  // Baris terakhir = SHA-256 semua frame; CLASS_ID boleh kosong (kelas otomatis).
+  char framesHash[65], signature[65];
+  framesSha256Hex(frames, framesHash);
   String message = String(timestamp) + "\n" + DEVICE_ID + "\n" + CLASS_ID + "\n" +
-                   timestamp + "\n" + liveness + "\n" + imageHash;
+                   timestamp + "\n" + liveness + "\n" + framesHash;
   hmacSha256Hex(DEVICE_TOKEN, message, signature);
 
   const char* B = "----methicsScanBoundary7d9f";
@@ -545,10 +770,13 @@ HttpResult postScan(const uint8_t* image, size_t imageLen, const char* timestamp
   field("class_id", CLASS_ID);
   field("captured_at", timestamp);
   field("liveness_passed", liveness);
-  head += String("--") + B + "\r\nContent-Disposition: form-data; name=\"image\"; filename=\"scan.jpg\"\r\n"
-          "Content-Type: image/jpeg\r\n\r\n";
-  String tail = String("\r\n--") + B + "--\r\n";
-  size_t contentLength = head.length() + imageLen + tail.length();
+  auto partHead = [&](int i) {
+    return String("--") + B + "\r\nContent-Disposition: form-data; name=\"image\"; filename=\"frame-" + (i + 1) +
+           ".jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+  };
+  String tail = String("--") + B + "--\r\n";
+  size_t contentLength = head.length() + tail.length();
+  for (int i = 0; i < frames.count; i++) contentLength += partHead(i).length() + frames.len[i] + 2;
 
   HttpResult r;
   WiFiClient c;
@@ -559,9 +787,14 @@ HttpResult postScan(const uint8_t* image, size_t imageLen, const char* timestamp
   c.printf("X-Device-Timestamp: %s\r\nX-Device-Signature: %s\r\n", timestamp, signature);
   c.printf("Content-Type: multipart/form-data; boundary=%s\r\n", B);
   c.printf("Content-Length: %u\r\nConnection: close\r\n\r\n", (unsigned)contentLength);
-  bool ok = writeAll(c, (const uint8_t*)head.c_str(), head.length()) &&
-            writeAll(c, image, imageLen) &&
-            writeAll(c, (const uint8_t*)tail.c_str(), tail.length());
+  bool ok = writeAll(c, (const uint8_t*)head.c_str(), head.length());
+  for (int i = 0; ok && i < frames.count; i++) {
+    String ph = partHead(i);
+    ok = writeAll(c, (const uint8_t*)ph.c_str(), ph.length()) &&
+         writeAll(c, frames.data[i], frames.len[i]) &&
+         writeAll(c, (const uint8_t*)"\r\n", 2);
+  }
+  ok = ok && writeAll(c, (const uint8_t*)tail.c_str(), tail.length());
   if (ok) r = readResponse(c);
   c.stop();
   return r;
@@ -576,12 +809,70 @@ void showError(const String& line1, const String& line2) {
   beepBlocking(3, 90, 90);
 }
 
+// Garis progres di bawah judul selama jendela scan.
+void drawProgress(int done, int total) {
+  int w = tft.width() - 60, x = 30, y = tft.height() / 2 + 30;
+  tft.drawRect(x, y, w, 10, TFT_DARKGREY);
+  tft.fillRect(x + 1, y + 1, (w - 2) * done / total, 8, TFT_CYAN);
+}
+
+// Ambil frame selama SCAN_WINDOW_MS (kamera sudah ON). Frame disebar merata
+// agar wajah terlihat di beberapa momen berbeda.
+void captureWindow(Frames& frames, String& lastErr) {
+  unsigned long start = millis();
+  unsigned long gap = SCAN_WINDOW_MS / SCAN_MAX_FRAMES;
+  for (int i = 0; i < SCAN_MAX_FRAMES; i++) {
+    unsigned long due = start + i * gap;
+    while ((long)(millis() - due) < 0) { updateBeep(); delay(2); }
+    if (millis() - start > SCAN_WINDOW_MS + 1500) break;   // UART lambat: jangan memperpanjang scan
+    uint8_t* image = nullptr;
+    size_t imageLen = 0;
+    if (camCapture(&image, &imageLen, lastErr)) {
+      frames.data[frames.count] = image;
+      frames.len[frames.count] = imageLen;
+      frames.count++;
+      drawProgress(i + 1, SCAN_MAX_FRAMES);
+      Serial.printf("[Scan] frame %d: %u byte (t=%lu ms)\n", frames.count, (unsigned)imageLen, millis() - start);
+    } else {
+      Serial.printf("[Scan] frame %d gagal: %s\n", i + 1, lastErr.c_str());
+      if (lastErr == "Memori tidak cukup" || lastErr == "Kamera tidak merespons" || lastErr == "Token kamera salah") break;
+    }
+  }
+}
+
+void showResult(const HttpResult& r) {
+  String result = jsonString(r.body, "result");
+  String status = jsonString(r.body, "status");
+  String name = jsonString(r.body, "name");
+  String nim = jsonString(r.body, "nim");
+  String kelas = jsonString(r.body, "classId");
+  String reason = jsonString(r.body, "reviewReason");
+  if (result.length() == 0) {   // server lama tanpa field result
+    result = status == "Hadir" ? "hadir" : status == "Perlu ditinjau" ? "perlu_ditinjau" : "tidak_terdaftar";
+  }
+  String detail = nim.length() ? "NIM " + nim + (kelas.length() ? "  -  " + kelas : String("")) : String("");
+
+  if (result == "hadir") {
+    showMessage("HADIR", TFT_GREEN, name, detail);
+    beepBlocking(1, 450, 0);
+  } else if (result == "tidak_terdaftar") {
+    showMessage("Wajah tidak Terdaftar", TFT_RED, "Hubungi admin untuk enroll", "");
+    beepBlocking(3, 90, 90);
+  } else if (result == "wajah_tidak_terdeteksi") {
+    showMessage("Wajah tidak terdeteksi", COLOR_ORANGE, "Hadapkan wajah ke kamera", "lalu coba lagi.");
+    beepBlocking(2, 90, 90);
+  } else {
+    showMessage("DITINJAU", COLOR_ORANGE, name.length() ? name : String("Perlu ditinjau"), reason);
+    beepBlocking(2, 120, 120);
+  }
+  screenFor(RESULT_SHOW_MS);
+}
+
 void doScan() {
   lastScan = millis();
-  screenFor(RESULT_SHOW_MS + 10000);
-  showMessage("Memindai...", TFT_CYAN, "Lihat ke kamera", "");
+  screenFor(RESULT_SHOW_MS + 15000);
+  showMessage("Kamera menyala", TFT_CYAN, "Lihat ke kamera", "");
   beepBlocking(1, 80, 0);
-  delay(SCAN_SETTLE_MS);
 
   if (WiFi.status() != WL_CONNECTED && !connectWiFi(8000)) {
     showError("Wi-Fi terputus", "Periksa jaringan Wi-Fi dan sinyal di ruangan.");
@@ -592,43 +883,34 @@ void doScan() {
     return;
   }
 
-  uint8_t* image = nullptr;
-  size_t imageLen = 0;
   String err;
-  if (!camCapture(&image, &imageLen, err)) {
+  unsigned long t0 = millis();
+  if (!camOn(err)) {
     Serial.printf("[Scan] kamera: %s\n", err.c_str());
-    showError(err, "Periksa kabel UART & daya ESP32-CAM.");
+    showError(err, CAM_LINK_WIFI ? "Periksa Wi-Fi, CAM_HOST/CAM_TOKEN & daya ESP32-CAM." : "Periksa kabel UART & daya ESP32-CAM.");
     return;
   }
-  Serial.printf("[Scan] foto %u byte, mengirim...\n", (unsigned)imageLen);
-  showMessage("Memverifikasi...", TFT_CYAN, "", "");
+  Serial.printf("[Scan] kamera ON dalam %lu ms\n", millis() - t0);
+  showMessage("Memindai...", TFT_CYAN, "Tahan wajah +-2 detik", "");
+  Frames frames;
+  captureWindow(frames, err);
+  camOff();
 
+  if (frames.count == 0) {
+    showError(err.length() ? err : String("Tidak ada frame"),
+              CAM_LINK_WIFI ? "Periksa Wi-Fi, CAM_HOST/CAM_TOKEN & daya ESP32-CAM." : "Periksa kabel UART & daya ESP32-CAM.");
+    return;
+  }
+  showMessage("Memverifikasi...", TFT_CYAN, String(frames.count) + " frame", "");
   char ts[25];
   rfc3339Now(ts, sizeof(ts));
-  HttpResult r = postScan(image, imageLen, ts);
-  free(image);
-  Serial.printf("[Scan] HTTP %d %s\n", r.status, r.body.c_str());
+  t0 = millis();
+  HttpResult r = postScan(frames, ts);
+  freeFrames(frames);
+  Serial.printf("[Scan] HTTP %d dalam %lu ms: %s\n", r.status, millis() - t0, r.body.c_str());
 
   if (r.status == 202) {
-    String status = jsonString(r.body, "status");
-    String name = jsonString(r.body, "name");
-    String nim = jsonString(r.body, "nim");
-    String reason = jsonString(r.body, "reviewReason");
-    String who = name.length() ? name : String("Tidak dikenali");
-    if (nim.length()) reason = nim + (reason.length() ? " - " + reason : "");
-    if (status == "Hadir") {
-      showMessage("HADIR", TFT_GREEN, who, reason);
-      screenFor(RESULT_SHOW_MS);
-      beepBlocking(1, 450, 0);
-    } else if (status == "Perlu ditinjau") {
-      showMessage("DITINJAU", COLOR_ORANGE, who, reason);
-      screenFor(RESULT_SHOW_MS);
-      beepBlocking(2, 120, 120);
-    } else {
-      showMessage("DITOLAK", TFT_RED, who, reason);
-      screenFor(RESULT_SHOW_MS);
-      beepBlocking(3, 90, 90);
-    }
+    showResult(r);
     return;
   }
   if (r.status < 0) {
@@ -657,6 +939,8 @@ void handleSerialCommand() {
   if (cmd == "scan") doScan();
   else if (cmd == "ping") sendPing();
   else if (cmd == "cam") Serial.printf("[Cam] %s\n", camPing() ? "PONG" : "tidak merespons");
+  else if (cmd == "camon") { String e; Serial.printf("[Cam] ON %s\n", camOn(e) ? "OK" : e.c_str()); }
+  else if (cmd == "camoff") { camOff(); Serial.println("[Cam] OFF"); }
   else if (cmd == "status") printStatus();
 }
 
@@ -671,16 +955,21 @@ void setup() {
   tft.init();
   tft.setRotation(ROT);
 
+#if !CAM_LINK_WIFI
   Cam.setRxBufferSize(8192);
   Cam.begin(CAM_BAUD, SERIAL_8N1, CAM_RX_PIN, CAM_TX_PIN);
+#endif
 
   setBacklight(true);
   showMessage("Memulai", TFT_CYAN, "Wi-Fi...", "");
   bool wifi = connectWiFi(20000);
   showMessage("Memulai", TFT_CYAN, wifi ? "Wi-Fi OK" : "Wi-Fi GAGAL", "Sinkron jam (NTP)...");
   if (wifi) syncTime(10000);
-  delay(800);   // beri waktu ESP32-CAM selesai boot
+  delay(1500);  // beri waktu ESP32-CAM selesai boot (uji kamera lalu power-down)
   camPing();
+#if CAM_LINK_WIFI
+  Serial.printf("[Cam] mode Wi-Fi: %s\n", cameraOk ? camBaseUrl.c_str() : "kamera belum terhubung");
+#endif
   showMessage(wifi && timeOk && cameraOk ? "Siap" : "Periksa", wifi && timeOk && cameraOk ? TFT_GREEN : COLOR_ORANGE,
               String(DEVICE_ID),
               String("WiFi ") + (wifi ? "OK" : "GAGAL") + ", jam " + (timeOk ? "OK" : "GAGAL") +

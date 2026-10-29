@@ -26,6 +26,8 @@ kode: 26 Oktober 2026 (malam).
 cmd/server/main.go            entry point: env, routing, middleware, bootstrap, shutdown
 internal/api/server.go        endpoint JSON + query ber-scope role + domain method + error sentinel
 internal/api/face.go          klien face service, enrollment embedding, pencocokan cosine 1:N
+internal/api/scan.go          POST /api/v1/scans: frame multi, HMAC, konsensus frame, status + result
+internal/api/scan_test.go     unit test konsensus frame, status, hash/HMAC, pembacaan frame
 internal/api/face_test.go     unit test klien & pencocokan (tanpa MongoDB)
 internal/api/images.go        foto wajah di S3: unggah, otorisasi & stream, retensi
 internal/api/admin.go         hapus mahasiswa (+ data wajah/foto/scan), buat & hapus akun dosen + endpoint JSON-nya
@@ -47,9 +49,10 @@ internal/store/
   database.go                 Open (connect+ping MongoDB), migrate (index), seed (kelas/perangkat)
   users.go                    User, CreateUser, EnsureUser, ResetUser, AuthenticateUser, UserByID,
                               ListStaff, UsernameTaken, UserRole, DeleteUser, MinPasswordLength
-services/face/                face service Python (FastAPI: /health, /detect → embedding ArcFace 512-d)
+services/face/                face service Python (FastAPI: /health, /embed, /register → embedding ArcFace 512-d)
 devices/esp32_scanner/        firmware ESP32 utama (sensor, TFT, buzzer, Wi-Fi, scan, heartbeat)
 devices/esp32cam_uart/        firmware ESP32-CAM (foto via UART)
+devices/esp32cam_wifi/        firmware ESP32-CAM (mode uji Wi-Fi, pengganti UART)
 devices/{esp8266_ping,esp32cam_stream,algorithmics_engine_ultrasonic_buzzer}/  sketch uji
 views/
   layouts/base.html           kerangka halaman (head, sidebar, topbar, content)
@@ -106,34 +109,42 @@ bukan status 4xx.
 ### 3.3 Scan perangkat ESP32
 
 ```text
-POST /api/v1/scans
+POST /api/v1/scans                               (internal/api/scan.go)
   → (tanpa sesi, tanpa CSRF)
   → validDeviceToken        (Authorization: Bearer <DEVICE_TOKEN>, perbandingan konstan-waktu)
-  → readImagePart           (multipart field "image", maks 8 MB)
-  → cek device_id & class_id tidak kosong, captured_at RFC3339 ±5 menit, liveness_passed true/false
-  → validScanSignature      (HMAC-SHA256 atas X-Device-Timestamp ±2 menit + fields + hash gambar)
-  → cek devices._id ada, classes._id ada
-  → verifyCapture: POST /detect ke Python (file image; timeout 15 s)
-      → ambil wajah dengan confidence tertinggi
-      → cosine similarity terhadap semua face_templates (≥ FACE_SIM_THRESHOLD → kandidat)
-  → tentukan status: Hadir / Perlu ditinjau / Ditolak
-  → (bila S3_* diisi) unggah capture ke Garage, maks 3 s → image_key
-  → InsertOne scan_events + UpdateOne devices.last_seen
-  → 202 JSON {status, student, faceVerified, confidence, reviewReason}
+  → readScanFrames          (1–6 file "image" berurutan, maks 8 MB per frame, 16 MB total)
+  → cek device_id, captured_at RFC3339 ±5 menit, liveness_passed true/false
+  → validScanSignature      (HMAC-SHA256 atas X-Device-Timestamp ±2 menit + fields + framesHash)
+  → cek devices._id ada; classes._id ada bila class_id diisi (kosong = kelas otomatis)
+  → loadTemplates sekali, lalu matchFrames: POST /embed per frame (timeout 15 s per frame)
+      → 422 "No face" / 400 → frame dilewati; error lain → 502
+      → bestTemplateMatch per frame (pose terbaik ≥ FACE_SIM_THRESHOLD → 1 suara)
+      → berhenti begitu satu mahasiswa punya ScanMinMatchFrames (2) suara
+  → decideFrames  → mahasiswa dengan suara terbanyak, BestFrame (frame bukti)
+  → kelas event: class_id perangkat, atau students.class_id bila kosong
+  → scanStatus    → Hadir / Perlu ditinjau / Ditolak + result code
+  → (bila S3_* diisi) unggah frame bukti ke Garage, maks 3 s → image_key
+  → InsertOne scan_events (+ frames_total/with_face/matched) + UpdateOne devices.last_seen
+  → log "scan <device>: <status> (<result>) frame=… wajah=… cocok=… skor=…"
+  → 202 JSON {status, result, message, student, classId, faceVerified, confidence,
+              reviewReason, framesTotal, framesWithFace, framesMatched}
 ```
 
-Urutan penentuan status (di `receiveScan`) penting dan berlapis:
+Urutan penentuan status (`scanStatus`) penting dan berlapis:
 
-| Kondisi | Status | Alasan dicatat |
+| Kondisi | Status | `result` |
 | --- | --- | --- |
-| Wajah tidak cocok | `Ditolak` | alasan dari Go (mis. kemiripan di bawah ambang) |
-| Cocok tapi bukan anggota kelas di perangkat | `Perlu ditinjau` | "…bukan anggota kelas pada perangkat." |
-| Cocok, anggota kelas, tapi `liveness_passed != true` | `Perlu ditinjau` | "…bukti liveness belum tersedia atau tidak lolos." |
-| Cocok + anggota kelas + liveness true | `Hadir` | kosong |
+| Tidak ada wajah di semua frame | `Ditolak` | `wajah_tidak_terdeteksi` |
+| Ada wajah, tidak cocok dengan siapa pun | `Ditolak` | `tidak_terdaftar` (layar: "Wajah tidak Terdaftar") |
+| Cocok, `class_id` diisi, tapi bukan anggota kelas itu | `Perlu ditinjau` | `perlu_ditinjau` |
+| Cocok di ≥ `ScanMinMatchFrames` frame, atau `liveness_passed=true` | `Hadir` | `hadir` |
+| Cocok di kurang dari `ScanMinMatchFrames` frame | `Perlu ditinjau` | `perlu_ditinjau` |
 
 "Anggota kelas" dicek dengan `students.class_id == class_id` (bukan
-`class_students`). Bila face service gagal, respons `502` dan event **tidak**
-disimpan. Bila unggah foto gagal, event **tetap** disimpan tanpa `image_key`.
+`class_students`); dengan `class_id` kosong pemeriksaan ini tidak berlaku
+karena event memakai kelas mahasiswa itu sendiri. Bila face service gagal,
+respons `502` dan event **tidak** disimpan. Bila unggah foto gagal, event
+**tetap** disimpan tanpa `image_key`. Konsensus frame **bukan** anti-spoof.
 
 ### 3.4 Heartbeat perangkat
 
@@ -225,17 +236,17 @@ s.ScanStatusCounts(...) / s.Roster(...) / s.RecentEvents(...)
 s.AllScanEvents(ctx, role, classes, status, class, q) / s.AllScanStatusCounts(...)
 s.DeviceStatus(ctx) / s.FaceStatus(ctx)
 s.CreateStudent(ctx, name, nim, classID)
-s.EnrollFace(ctx, nim, image, filename)
+s.EnrollFace(ctx, nim, []api.EnrollImage{…})   // 1–6 foto
 s.DeleteStudent(ctx, nim)                 // admin.go
 s.StaffAccounts(ctx) / s.CreateLecturer(ctx, LecturerInput{…}) / s.DeleteLecturer(ctx, id)
-api.ReadImagePart(w, r) / api.LecturerErrorMessage(err)
+api.ReadEnrollImages(w, r) / api.EnrollErrorMessage(err, detail) / api.LecturerErrorMessage(err)
 ```
 
 **d. Error sentinel** — supaya controller bisa memetakan pesan tanpa tahu detail query MongoDB:
 
 ```go
 ErrMissingFields, ErrStudentExists, ErrInvalidClass, ErrStudentNotFound, ErrFaceService
-ErrInvalidImage, ErrNoFace, ErrMultipleFaces, ErrFaceAlreadyEnrolled   // face.go
+ErrInvalidImage, ErrNoFace, ErrInconsistentFaces, ErrFaceAlreadyEnrolled, ErrTooManyPhotos   // face.go (per foto: *PhotoError)
 ErrImageNotFound, ErrImageForbidden                                    // images.go
 ErrInvalidUsername, ErrPasswordTooShort, ErrUsernameTaken, ErrNoClasses,
 ErrUserNotFound, ErrNotLecturer                                        // admin.go
@@ -252,10 +263,14 @@ lama** tetap sama meski internalnya bertipe.
 - Setiap handler: ambil `Principal` dari context → panggil query `api` →
   rakit struct data → `p.render(w, "<nama>_fragment", data)`.
 - `mahasiswaRoster` adalah helper bersama untuk `/partials/mahasiswa` dan
-  `enrollFace` (keduanya mengembalikan tabel roster yang sama). Baris yang
-  punya `FaceImageURL` (dari `face_templates.image_key`) menampilkan tombol
-  **Lihat foto** yang membuka `/api/v1/images/enroll/...` di tab baru; izin
-  tetap diperiksa `authorizeImage`.
+  `enrollFace` (keduanya mengembalikan tabel roster yang sama). Kolom
+  enrollment menampilkan jumlah pose (`FaceTemplates`). Baris yang punya
+  `FaceImageURLs` (dari `face_templates.image_keys`/`image_key`) menampilkan
+  tombol **Lihat foto** (foto pertama) dan link nomor 2–6 yang membuka
+  `/api/v1/images/enroll/...` di tab baru; izin tetap diperiksa
+  `authorizeImage`. Tombol **Enroll wajah / Enroll ulang** adalah
+  `<input type="file" name="images" multiple>` yang langsung dikirim saat
+  file dipilih (fungsi template `inc` dipakai untuk nomor foto).
 - `createStudent`, `mahasiswaForm`, dan `enrollFace` menolak non-administrator
   dengan 403.
 - `admin_partials.go`: `deleteStudent` (roster setelah hapus), `staff`,
@@ -304,17 +319,34 @@ lama** tetap sama meski internalnya bertipe.
 
 ### `internal/api/face.go`
 
-- `detectFaces` memanggil `POST /detect` pada face service dan mengembalikan
-  `faceServiceError{Status}` untuk respons non-2xx (400 → `ErrInvalidImage`).
-- `enrollEmbedding` (dipanggil `EnrollFace`): wajib tepat satu wajah
-  (`ErrNoFace`/`ErrMultipleFaces`), tolak wajah yang mirip template mahasiswa
-  lain (`ErrFaceAlreadyEnrolled`), lalu upsert ke `face_templates`.
-- `verifyCapture` (dipanggil `receiveScan`): pilih wajah dengan confidence
-  tertinggi, hitung `cosineSimilarity` ke semua template lewat
-  `bestTemplateMatch`, kembalikan `FaceMatch{Verified, StudentID, Confidence,
-  Reason}`.
-- Template dengan dimensi berbeda diabaikan. Ambang: `Config.SimThreshold`
-  (`FACE_SIM_THRESHOLD`).
+- `postImages` mengirim multipart ke face service; respons non-2xx menjadi
+  `faceServiceError{Status, Detail}` (field `detail` FastAPI).
+  `classifyFaceError` memetakannya: 400 → `ErrInvalidImage`, 422 "No face" →
+  `ErrNoFace` (nomor foto dari `image #N` dibungkus `*PhotoError`), lainnya →
+  `ErrFaceService`.
+- `embedFace` → `POST /embed` (field `image`); `registerFaces` →
+  `POST /register?student_id=` (field `images`, file dinamai `foto-N.<ext>`).
+- `enrollEmbeddings` (dipanggil `EnrollFace`): 1–`MaxEnrollPhotos` (6) foto,
+  `checkEnrollEmbeddings` menolak foto yang bukan orang yang sama
+  (`poseConsistency` = maks kemiripan dengan foto pertama atau rata-rata foto
+  lain < `Config.PoseThreshold`, `ErrInconsistentFaces`) dan wajah yang mirip
+  template mahasiswa lain
+  (`ErrFaceAlreadyEnrolled`), lalu upsert `encodings` ke `face_templates`
+  (dan `$unset` field lama `encoding`).
+- `bestTemplateMatch` (dipakai enrollment dan `scan.go`): `faceTemplate.vectors()`
+  membaca `encodings` atau `encoding` lama, dan skor mahasiswa = pose terbaik.
+- Vektor dengan dimensi berbeda diabaikan. Ambang: `Config.SimThreshold`
+  (`FACE_SIM_THRESHOLD`) untuk scan dan cek duplikat; `Config.PoseThreshold`
+  (`FACE_POSE_THRESHOLD`, 0.30) untuk konsistensi pose.
+- Batas waktu: `postImages` memberi `FaceServiceTimeout × jumlah foto`
+  lewat context (`http.Client` tanpa timeout global). `ReadEnrollImages`
+  memperpanjang deadline baca/tulis request menjadi `EnrollRequestTimeout`
+  (3 menit) lewat `http.ResponseController`, karena server memakai
+  `ReadTimeout`/`WriteTimeout` 15 detik. `storeEnrollmentImages` mengunggah
+  foto ke Garage secara paralel.
+- `EnrollFace` menulis log `enrollment <nim> berhasil/gagal (N foto, durasi)`.
+- Pesan error untuk UI/JSON dirakit `EnrollErrorMessage` di `server.go`
+  (menyebut "foto ke-N" lewat `PhotoNumber`).
 
 ### `internal/api/images.go` dan `internal/storage/s3.go`
 
@@ -323,8 +355,10 @@ lama** tetap sama meski internalnya bertipe.
   semua fungsi foto menjadi no-op.
 - `uploadImage` memakai batas 3 detik dan **tidak pernah** menggagalkan
   pemanggil: gagal unggah hanya dicatat di log dan mengembalikan kunci kosong.
-- `storeEnrollmentImage` mengganti `face_templates.image_key` dan menghapus
-  foto enrollment lama.
+- `storeEnrollmentImages` mengunggah semua foto enrollment, mengisi
+  `face_templates.image_keys` (semua) dan `image_key` (foto pertama), lalu
+  menghapus foto enrollment lama (`enrollmentKeys` menggabungkan kedua field).
+- `authorizeImage` mencari kunci `enroll/…` di `image_key` **atau** `image_keys`.
 - `serveImage` (`GET /api/v1/images/{key...}`): kunci harus tercatat di
   MongoDB; `authorizeImage` membatasi dosen ke kelasnya.
 - `PurgeExpiredImages` / `RunImageRetention`: hapus foto scan yang lewat
@@ -335,7 +369,7 @@ lama** tetap sama meski internalnya bertipe.
 
 ### `internal/api/admin.go`
 
-- `DeleteStudent`: kumpulkan `image_key` dari `face_templates` dan
+- `DeleteStudent`: kumpulkan `image_key`/`image_keys` dari `face_templates` dan
   `scan_events`, hapus fotonya dari Garage (`deleteImage`, gagal hanya
   di-log), lalu hapus `scan_events`, `face_templates`, `class_students`, dan
   `students` milik mahasiswa itu.
@@ -352,7 +386,9 @@ lama** tetap sama meski internalnya bertipe.
 ### `services/face/` (Python)
 
 FastAPI stateless milik tim ML (YOLO-FaceV2 + ArcFace). Go hanya memakai
-`GET /health` dan `POST /detect`; `aligned_face_b64` di respons diabaikan.
+`GET /health`, `POST /embed`, dan `POST /register` (tanpa `return_aligned`).
+`main.py` adalah peluncur uvicorn (`--host`, `--port`, `--reload`,
+`--workers`, `--list-models`, `--download-model`).
 Butuh Python 3.10–3.12. Detail: [face-service.md](face-service.md) dan
 `services/face/README.md`.
 
@@ -362,11 +398,27 @@ Butuh Python 3.10–3.12. Detail: [face-service.md](face-service.md) dan
   tiap 15 s, buzzer, backlight); `doScan()` blocking: `camCapture()` (UART2,
   CRC32) → `postScan()` (SHA-256 + HMAC mbedTLS, multipart ditulis bertahap ke
   `WiFiClient`) → `jsonString()` mengurai respons → `showMessage()`.
+  Sejak 28 Okt: `doScan()` = `camOn()` (`ON`) → `captureWindow()` (hingga
+  `SCAN_MAX_FRAMES` `CAP` tersebar dalam `SCAN_WINDOW_MS`, disimpan di
+  `Frames`) → `camOff()` → `postScan(frames)` (SHA-256 bertahap atas semua
+  frame, satu part `image` per frame) → `showResult()` memetakan `result`
+  ke layar (`tidak_terdaftar` → "Wajah tidak Terdaftar").
   Kredensial di `secrets.h` (di-gitignore). Semua fungsi didefinisikan sebelum
-  dipakai, jadi tidak bergantung pada prototipe otomatis Arduino.
-- `esp32cam_uart.ino`: kamera tanpa Wi-Fi; perintah `PING`/`CAP` di UART1
-  (GPIO14/15), balasan `IMG <len> <crc>` + JPEG.
-- Kontrak HMAC/multipart sama dengan `validScanSignature`/`readImagePart`;
+  dipakai. **Tipe buatan sendiri (`HttpResult`, `Frames`) wajib didefinisikan
+  di atas fungsi pertama**: Arduino IDE menyisipkan prototipe otomatis semua
+  fungsi tepat sebelum fungsi pertama, sehingga struct yang didefinisikan lebih
+  bawah memicu error `'Frames' does not name a type`.
+- `esp32cam_uart.ino`: kamera tanpa Wi-Fi; perintah `PING`/`ON`/`CAP`/`OFF`
+  di UART1 (GPIO14/15), balasan `IMG <len> <crc>` + JPEG. Sensor power-down
+  (PWDN) saat idle; `ON` = `esp_camera_init` + buang `WARMUP_FRAMES`, lalu
+  driver terus menangkap ke 2 buffer PSRAM (`CAMERA_GRAB_LATEST`).
+- `esp32cam_wifi.ino` (mode uji): fungsi kamera sama, tetapi lewat `WebServer`
+  port 80 (`/ping`, `/on`, `/capture`, `/off`, header `X-Cam-Token`) dan mDNS
+  `methics-cam`. Di `esp32_scanner.ino`, `CAM_LINK_WIFI` memilih implementasi
+  `camPing`/`camOn`/`camOff`/`camCapture`: blok `#if CAM_LINK_WIFI` (HTTPClient,
+  `camResolve()` = `CAM_HOST` atau `MDNS.queryHost`) atau blok UART. Nama dan
+  tanda tangan fungsi kedua blok sama, jadi `doScan()` tidak berubah.
+- Kontrak HMAC/multipart sama dengan `validScanSignature`/`readScanFrames`;
   bila salah satu berubah, ubah keduanya (lihat [devices.md](devices.md) §3, §6).
 
 ### `devices/esp8266_ping/esp8266_ping.ino`
@@ -385,10 +437,12 @@ class_students {class_id, student_id}              (unik gabungan; belum dibaca 
 users          {_id, username (unik), display_name, role, password_hash,
                 active, class_ids: [...], created_at}
 devices        {_id: "ESP32-GED-A1", name, last_seen}
-face_templates {student_id (unik), encoding, dimension, detection_confidence,
-                image_key?, created_at, updated_at}          (ditulis Go)
-scan_events    {student_id, class_id, device_id, scanned_at, face_verified,
-                liveness_passed, confidence, status, review_reason, image_key?}
+face_templates {student_id (unik), encodings [1–6 × 512], template_count, dimension,
+                detection_confidences, image_key?, image_keys?, created_at,
+                updated_at}                                  (ditulis Go; dokumen lama: encoding tunggal)
+scan_events    {student_id, class_id (boleh ""), device_id, scanned_at, face_verified,
+                liveness_passed, confidence, status, review_reason,
+                frames_total, frames_with_face, frames_matched, image_key?}
 ```
 
 Catatan penyimpanan waktu:

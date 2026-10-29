@@ -11,8 +11,8 @@
 #include <WiFi.h>
 #include "esp_http_server.h"
 
-const char* WIFI_SSID = "Poco X3 Oguri";       // <-- isi dengan WiFi kamu
-const char* WIFI_PASS = "qwertyuiop";   // <-- isi dengan password WiFi kamu
+const char* WIFI_SSID = "Qwerty";       // <-- isi dengan WiFi kamu
+const char* WIFI_PASS = "Qwertyuiop";   // <-- isi dengan password WiFi kamu
 
 // Pin AI Thinker ESP32-CAM
 #define PWDN_GPIO_NUM     32

@@ -142,6 +142,9 @@ tbody tr:hover { background: #fbfcfb; }
 .button.danger:hover { background: var(--red-soft); }
 .button.icon-only { min-height: 32px; width: 32px; padding: 0; }
 .row-actions { display: flex; align-items: center; gap: 8px; }
+.photo-links { display: inline-flex; gap: 4px; font-size: 11px; }
+.photo-links a { min-width: 18px; text-align: center; border: 1px solid var(--line); border-radius: var(--radius); padding: 1px 4px; color: inherit; text-decoration: none; }
+.photo-links a:hover { background: var(--green-soft); }
 .inline-alert { margin: 0 0 12px; border: 1px solid var(--line); border-radius: 7px; padding: 9px 12px; font-size: 11px; }
 .inline-alert.success { border-color: #b9dcc9; background: #eef7f2; color: var(--green); }
 .inline-alert.error { border-color: #ecc9c7; background: var(--red-soft); color: #b7504b; }

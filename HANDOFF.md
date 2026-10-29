@@ -2,6 +2,12 @@
 
 Dokumen ini adalah titik awal untuk AI/engineer berikutnya. Baca dokumen ini lebih dulu agar tidak perlu memetakan seluruh repository sebelum melanjutkan pekerjaan. Nama produk pada UI: **Algorithmics Face Recognation**; nama institusi/workspace: **Institut Teknologi Bacharuddin Jusuf Habibie (ITBJH)**.
 
+Pembaruan 28 Oktober 2026 (kamera Wi-Fi, mode uji) — karena kamera belum bisa dicatu/dikabel bersama ESP32 utama (5V kamera dari ESP32 memicu brownout), ditambahkan `devices/esp32cam_wifi` (ESP32-CAM di MB dengan USB sendiri, HTTP `/ping` `/on` `/capture` `/off` + header `X-Cam-Token`, mDNS `methics-cam.local`) dan pilihan `CAM_LINK_WIFI` di `esp32_scanner` (default 1 = Wi-Fi; 0 = kabel UART). Alur scan dan backend Go tidak berubah. `secrets.h` ESP32 utama kini butuh `CAM_TOKEN` pada mode Wi-Fi.
+
+Pembaruan 28 Oktober 2026 (scan stream) — rangkaian perangkat tetap, cara scan berubah: ESP32-CAM mati saat idle dan menyala (`ON`) begitu ultrasonik mendeteksi orang; ESP32 utama mengambil hingga 4 frame QVGA selama ±2 detik lalu mengirim semuanya dalam satu `POST /api/v1/scans` (field `image` berulang, HMAC atas SHA-256 semua frame). Go (`internal/api/scan.go`) mencocokkan tiap frame lewat `/embed`; wajah yang sama cocok di ≥ `SCAN_MIN_MATCH_FRAMES` (2) frame → **Hadir** di kelas mahasiswa itu (`CLASS_ID` kosong = kelas otomatis); wajah tak dikenal → `result: tidak_terdaftar`, layar TFT **"Wajah tidak Terdaftar"**. Konsensus frame bukan anti-spoof (Batasan no. 21).
+
+Pembaruan 28 Oktober 2026 (face service) — `services/face/api.py` kini hanya menyediakan `/embed`, `/register`, `/health`, dan `/models*` (`/detect` dan `/compare` dihapus; `main.py` menjadi peluncur API). Go disesuaikan: scan memakai `POST /embed`, enrollment memakai `POST /register` dengan **1–6 foto pose** per mahasiswa (`face_templates.encodings`, cek konsistensi pose dan duplikat per foto), pencocokan memakai pose terbaik tiap mahasiswa, semua foto enrollment disimpan di Garage (`image_keys`), dan halaman Mahasiswa menerima beberapa file sekaligus + tombol **Enroll ulang**. Template lama (satu `encoding`) tetap dipakai sampai di-enroll ulang. Perbaikan susulan: enrollment >2 foto sempat terputus karena `ReadTimeout`/`WriteTimeout` server 15 detik dan timeout klien 15 detik; kini request enrollment mendapat batas 3 menit, `/register` mendapat `FACE_SERVICE_TIMEOUT_SECONDS` × jumlah foto, unggah Garage paralel, dan cek konsistensi pose memakai ambang terpisah `FACE_POSE_THRESHOLD` (0.30).
+
 Pembaruan 26 Oktober 2026 (data mahasiswa) — seed mahasiswa contoh dihapus (seed kini hanya kelas dan perangkat; mahasiswa didaftarkan manual), NIM wajib **9 digit angka** (mis. `241011001`, `api.ValidNIM`, error `invalid_nim`), dan tombol **Lihat foto** enrollment di halaman Mahasiswa (`RosterEntry.FaceImageURL`, `faceImageUrl` di JSON dashboard).
 
 Status dokumen: diperbarui **26 Oktober 2026 (penyelarasan dokumentasi)** — seluruh dokumen Markdown (kecuali `docs/SRS.md`, yang dirawat terpisah oleh tim) dan komentar kode diselaraskan dengan kode saat ini; temuan baru: seed mahasiswa memunculkan kembali mahasiswa contoh yang dihapus (Batasan no. 17), dan sebagian besar helper di `static/js/lib/ui.js` tidak terpakai.
@@ -12,7 +18,7 @@ Pembaruan 26 Oktober 2026 (perangkat) — firmware perangkat absensi ESP32 + ESP
 
 Pembaruan 26 Oktober 2026 (sore) — penyimpanan foto wajah opsional di object storage S3 (**Garage**, `internal/storage/s3.go` + `internal/api/images.go`) dengan retensi otomatis dan tampilan foto di halaman Log; bug scoping filter kelas di `AllScanEvents` diperbaiki; code cleaning (fungsi mati dan pembungkus header keamanan ganda dihapus).
 
-Pembaruan 26 Oktober 2026 (pagi) — face service Python (`services/face/`, YOLO-FaceV2 + ArcFace) dihubungkan ke backend Go: Go memanggil `POST /detect`, menyimpan embedding di MongoDB, dan melakukan pencocokan cosine sendiri (`internal/api/face.go`), sehingga Go menjadi satu-satunya API untuk dashboard dan ESP32.
+Pembaruan 26 Oktober 2026 (pagi) — face service Python (`services/face/`, YOLO-FaceV2 + ArcFace) dihubungkan ke backend Go: Go memanggil `POST /detect` (sejak 28 Oktober diganti `/embed` + `/register`), menyimpan embedding di MongoDB, dan melakukan pencocokan cosine sendiri (`internal/api/face.go`), sehingga Go menjadi satu-satunya API untuk dashboard dan ESP32.
 
 Pembaruan 21 Oktober 2026 — dokumentasi diselaraskan dengan kode setelah migrasi **SQLite → MongoDB**, penambahan halaman **Log pemindaian** (`/logs`), endpoint **heartbeat perangkat** (`/api/v1/devices/ping`), dan firmware **ESP8266**. Dokumen baru: `docs/database.md`, `docs/devices.md`, `docs/face-service.md`, dan `.env.example`.
 
@@ -35,7 +41,7 @@ Sudah berjalan:
 - Halaman server-rendered: `/`, `/mahasiswa`, `/kelas`, `/laporan`, `/logs`, `/akses`, plus `/login`.
 - Login staf dengan bcrypt, session SCS, CSRF, rate limit login, security headers/CSP, panic recovery.
 - Otorisasi berbasis role dari session + pembatasan data dosen ke `users.class_ids` pada semua halaman dan API staf (termasuk filter kelas halaman log dan endpoint foto).
-- API dashboard, kelas, laporan; pendaftaran dan penghapusan mahasiswa (hapus ikut menghapus template wajah, foto Garage, dan riwayat scan); enrollment wajah (Python `/detect` → embedding disimpan Go).
+- API dashboard, kelas, laporan; pendaftaran dan penghapusan mahasiswa (hapus ikut menghapus template wajah, foto Garage, dan riwayat scan); enrollment wajah 1–6 foto pose (Python `/register` → semua embedding disimpan Go).
 - Administrasi akun: administrator membuat akun dosen (username, nama, password, kelas) dan menghapusnya di `/akses`; daftar semua akun staf. Akun administrator tidak bisa dihapus dari UI.
 - Bootstrap akun dari `.env`: admin dibuat bila belum ada administrator aktif; dosen bootstrap opsional; di development `BOOTSTRAP_RESET_PASSWORDS=true` menyetel ulang password kedua akun bootstrap setiap start. Password minimal 12 karakter di production, 4 di development.
 - Endpoint scan perangkat dengan bearer device token, HMAC-SHA256, timestamp, batas ukuran gambar, dan pencatatan status `Hadir`/`Perlu ditinjau`/`Ditolak`.
@@ -47,12 +53,14 @@ Sudah berjalan:
 
 Belum ada / masih terbatas:
 
-- Firmware perangkat belum diuji di perangkat keras; `CLASS_ID` masih tetap per perangkat (belum ada jadwal kuliah per ruangan); `liveness_passed` dikirim `false`, jadi wajah yang cocok tercatat "Perlu ditinjau".
+- Firmware perangkat belum diuji di perangkat keras; `CLASS_ID` default kosong (kelas otomatis = kelas mahasiswa) karena belum ada jadwal kuliah per ruangan; `liveness_passed` dikirim `false` dan status Hadir berasal dari konsensus ≥ 2 frame, bukan anti-spoof.
 - Pengelolaan akun staf masih sebagian: administrator bisa **membuat dan menghapus akun dosen** (beserta kelasnya) di `/akses`, tetapi belum bisa mengubah kelas, reset password, atau menonaktifkan akun lewat UI.
 - CRUD kelas dan perangkat; opsi filter kelas di `views/pages/mahasiswa.html` dan `views/pages/logs.html` masih hardcoded `IK24-A`/`IK24-B`/`IK24-C`.
 - Rotasi/revokasi token per perangkat dan audit enrollment.
 - Liveness detection nyata.
-- Foto enrollment bisa dibuka lewat tombol **Lihat foto** di halaman Mahasiswa (hanya bila fotonya tersimpan di Garage); enrollment ulang otomatis dari foto tersimpan belum ada.
+- Foto enrollment (semua pose) bisa dibuka lewat tombol **Lihat foto** dan nomor 2–6 di halaman Mahasiswa (hanya bila fotonya tersimpan di Garage); enrollment ulang otomatis dari foto tersimpan belum ada.
+- Face service memilih wajah dengan confidence tertinggi tanpa melaporkan jumlah wajah, jadi foto berisi beberapa orang tidak lagi ditolak (dulu `multiple_faces`).
+- Template lama (satu foto, field `encoding`) belum dimigrasi otomatis; enroll ulang mahasiswa itu dengan beberapa pose.
 - Session store dan login limiter masih in-memory (tidak cocok untuk multi-instance tanpa perubahan).
 - Test yang membutuhkan MongoDB (unit test saat ini untuk face service, pencocokan, foto, klien S3, validasi akun dosen, dan render fragment).
 
@@ -112,23 +120,23 @@ Keputusan frontend: **tetap Go server-rendered (bukan SPA framework)** dan adops
 5. CSRF middleware (`itbjh_csrf`) melindungi semua POST/DELETE staf; form memakai `csrf_token`, request htmx mengirim `X-CSRF-Token`. Login dilimit 10 percobaan per IP per 5 menit. Security headers/CSP dan panic recovery membungkus server.
 6. Halaman memuat & menyegarkan datanya lewat htmx dari `/partials/*` yang dirender server dari query ber-scope role. Dosen dibatasi ke `users.class_ids`; administrator melihat semua.
 7. Administrator mendaftarkan, menghapus, dan meng-enroll mahasiswa serta membuat/menghapus akun dosen lewat UI htmx; controller memakai domain method yang sama dengan endpoint JSON (`/api/v1/students…`, `/api/v1/staff…`).
-8. Go mengirim foto enrollment ke Python `POST /detect`. Go mewajibkan tepat satu wajah, menolak wajah yang sudah terdaftar atas NIM lain (cosine ≥ `FACE_SIM_THRESHOLD`), lalu menyimpan embedding ArcFace 512-d ke koleksi `face_templates`. Bila `S3_*` diisi, foto enrollment disimpan ke Garage (`face_templates.image_key`); foto lama dihapus saat enrollment ulang.
-9. Perangkat mengirim heartbeat ke `/api/v1/devices/ping` (memperbarui `devices.last_seen`) dan scan ke `POST /api/v1/scans` memakai bearer device token, timestamp, HMAC signature, metadata kelas/perangkat/liveness, dan file gambar. Route perangkat terpisah dan tidak memakai session/CSRF browser.
-10. Go memvalidasi token, gambar, field, `captured_at`, HMAC/timestamp, perangkat, dan kelas; lalu mengirim gambar ke Python `POST /detect` untuk mendapatkan embedding wajah.
-11. Python mengembalikan wajah terdeteksi beserta embedding-nya. Go memilih wajah dengan confidence tertinggi, menghitung cosine similarity ke semua `face_templates`, lalu memeriksa keanggotaan kelas (`students.class_id`). Status `Hadir` hanya jika cocok (≥ ambang), anggota kelas, dan flag liveness true. Flag liveness belum merupakan deteksi biologis.
-12. Bila `S3_*` diisi, capture diunggah ke Garage (batas 3 detik) dan kuncinya disimpan di `scan_events.image_key`; gagal unggah tidak menggagalkan scan. Job retensi menghapus foto scan setelah `IMAGE_RETENTION_DAYS` (Hadir, default 30) atau `IMAGE_REVIEW_RETENTION_DAYS` (lainnya, default 90).
+8. Administrator memilih 1–6 foto pose (depan, kiri, kanan, atas, bawah, senyum); Go mengirim semuanya ke Python `POST /register`. Go menolak foto tanpa wajah (`no_face`, menyebut nomor foto), foto yang bukan orang yang sama (`inconsistent_faces`, ambang `FACE_POSE_THRESHOLD` 0.30 terhadap foto pertama atau rata-rata foto lain), dan wajah yang sudah terdaftar atas NIM lain (cosine ≥ `FACE_SIM_THRESHOLD`), lalu menyimpan semua embedding ArcFace 512-d ke satu dokumen `face_templates` (`encodings`). Bila `S3_*` diisi, semua foto disimpan ke Garage (`face_templates.image_keys`, foto pertama juga di `image_key`); foto lama dihapus saat enrollment ulang.
+9. Perangkat mengirim heartbeat ke `/api/v1/devices/ping` (memperbarui `devices.last_seen`) dan scan ke `POST /api/v1/scans` memakai bearer device token, timestamp, HMAC signature, metadata kelas (opsional)/perangkat/liveness, dan 1–6 frame dari jendela scan ±2 detik. Route perangkat terpisah dan tidak memakai session/CSRF browser.
+10. Go memvalidasi token, frame, field, `captured_at`, HMAC/timestamp, perangkat, dan kelas (bila diisi); lalu mengirim frame satu per satu ke Python `POST /embed`; skor tiap mahasiswa per frame adalah kemiripan pose terbaiknya, dan Go berhenti begitu satu mahasiswa cocok di `SCAN_MIN_MATCH_FRAMES` frame.
+11. Python mengembalikan embedding wajah dengan confidence tertinggi per frame (`422` bila tidak ada wajah). Go memilih mahasiswa dengan frame cocok terbanyak. Status `Hadir` bila cocok (≥ ambang) di ≥ `SCAN_MIN_MATCH_FRAMES` frame (atau liveness true) dan — bila perangkat memakai `CLASS_ID` tetap — mahasiswa anggota kelas itu; dengan `CLASS_ID` kosong event dicatat di kelas mahasiswa. Wajah tidak cocok → `Ditolak` dengan `result: tidak_terdaftar` (TFT: "Wajah tidak Terdaftar"); tanpa wajah → `wajah_tidak_terdeteksi`.
+12. Bila `S3_*` diisi, satu frame bukti (skor terbaik) diunggah ke Garage (batas 3 detik) dan kuncinya disimpan di `scan_events.image_key`; gagal unggah tidak menggagalkan scan. Job retensi menghapus foto scan setelah `IMAGE_RETENTION_DAYS` (Hadir, default 30) atau `IMAGE_REVIEW_RETENTION_DAYS` (lainnya, default 90).
 
 Diagram ringkas:
 
 ```text
 Browser -> Go SSR pages (htmx /partials/*) + /api/v1
 ESP8266 -> Go /api/v1/devices/ping -> MongoDB devices.last_seen
-ESP32   -> Go /api/v1/scans -> Python /detect (embedding) -> Go cosine vs MongoDB face_templates
+ESP32 (kamera ON, ±2 s, 1–6 frame) -> Go /api/v1/scans -> Python /embed per frame -> Go cosine vs semua pose, konsensus ≥ 2 frame
                             -> Garage scans/... (opsional) -> MongoDB scan_events (+ image_key)
 Administrator -> Go /partials/mahasiswa/students -> MongoDB students (+ class_students)
 Administrator -> Go DELETE /partials/mahasiswa/{nim} -> Garage (hapus foto) -> MongoDB (hapus students, face_templates, scan_events, class_students)
 Administrator -> Go /partials/akses/lecturers -> MongoDB users (role dosen)
-Administrator -> Go face-template -> Python /detect -> Go simpan embedding -> MongoDB face_templates
+Administrator -> Go face-template (1–6 foto) -> Python /register -> Go cek pose & duplikat -> MongoDB face_templates
                                   -> Garage enroll/... (opsional)
 Staf -> Go /api/v1/images/{key} (cek role/kelas) -> Garage
 ```
@@ -140,14 +148,14 @@ Detail lengkap ada di `API.md`. Ringkasan:
 - `GET /api/v1/health`: publik; status backend, Python, dan penyimpanan foto. `faceVerification.online` hanya true bila Python `/health` menjawab dalam 3 detik dengan `model_loaded: true`; `imageStorage.online` bila `HEAD` bucket berhasil. Query opsional `device_id` memperbarui `last_seen` perangkat (tanpa token).
 - `GET /api/v1/dashboard`, `/classes`, `/reports`: session staf wajib; dibatasi role.
 - `POST /api/v1/students`: JSON `{ "name": "...", "nim": "...", "classId": "IK24-A" }`; session admin + CSRF.
-- `POST /api/v1/students/{nim}/face-template`: multipart field `image`; session admin + CSRF.
+- `POST /api/v1/students/{nim}/face-template`: multipart field `images` (1–6 foto; `image` juga diterima); session admin + CSRF.
 - `DELETE /api/v1/students/{nim}`: hapus mahasiswa + template, foto, riwayat scan; session admin + CSRF.
 - `GET|POST /api/v1/staff`, `DELETE /api/v1/staff/{id}`: daftar akun staf, buat akun dosen (JSON `username`, `displayName`, `password`, `classIds`), hapus akun dosen; session admin + CSRF.
-- `POST /api/v1/scans`: multipart `device_id`, `class_id`, `captured_at` RFC3339, `liveness_passed` boolean, `image`; device bearer token + HMAC.
+- `POST /api/v1/scans`: multipart `device_id`, `class_id` (opsional, kosong = kelas otomatis), `captured_at` RFC3339, `liveness_passed` boolean, 1–6 `image`; device bearer token + HMAC atas SHA-256 semua frame. Respons memuat `result` (`hadir`/`perlu_ditinjau`/`tidak_terdaftar`/`wajah_tidak_terdeteksi`) dan `message` untuk layar.
 - `GET|POST /api/v1/devices/ping`: heartbeat; token hanya diperiksa di production; upsert perangkat.
 - `GET /api/v1/images/{key...}`: foto enrollment/scan dari Garage; session staf, dosen hanya kelasnya.
 - `GET/POST /login`, `POST /logout`: login session staf, CSRF berlaku untuk POST/DELETE.
-- Python hanya internal; Go memakai `GET /health` dan `POST /detect`. Jangan ekspos port Python (default `8000`) ke jaringan publik — `api.py` belum punya autentikasi dan memakai CORS `*`.
+- Python hanya internal; Go memakai `GET /health`, `POST /embed`, dan `POST /register`. `python main.py` tanpa argumen mendengarkan di `0.0.0.0`; jalankan dengan `--host 127.0.0.1`. Jangan ekspos port Python (default `8000`) ke jaringan publik — `api.py` belum punya autentikasi dan memakai CORS `*`.
 
 Format pesan HMAC-SHA256 device, enam baris UTF-8 yang digabung newline:
 
@@ -171,7 +179,7 @@ Basis data utama **MongoDB** (detail field, index, waktu, dan operasi di `docs/d
 - `class_students`: relasi kelas-mahasiswa (ditulis, belum dibaca query)
 - `users`: akun staf (`_id`, `username`, `display_name`, `role`, `password_hash`, `class_ids`, `active`, `created_at`)
 - `devices`: `_id`, `name`, `last_seen` (RFC3339 UTC)
-- `face_templates`: `student_id` (unik), `encoding` (512-d), `dimension`, `detection_confidence`, `image_key` (opsional), `created_at`, `updated_at` — ditulis Go
+- `face_templates`: `student_id` (unik), `encodings` (1–6 × 512-d), `template_count`, `dimension`, `detection_confidences`, `image_key` + `image_keys` (opsional), `created_at`, `updated_at` — ditulis Go; dokumen lama memakai `encoding`/`detection_confidence` tunggal dan tetap dibaca
 - `scan_events`: `student_id`, `class_id`, `device_id`, `scanned_at` (RFC3339 UTC), `face_verified`, `liveness_passed`, `confidence` (cosine similarity), `status`, `review_reason`, `image_key` (opsional)
 
 Foto tidak disimpan di MongoDB, melainkan di bucket Garage (`S3_BUCKET`); MongoDB hanya menyimpan kuncinya.
@@ -236,6 +244,10 @@ Untuk menguji alur scan tanpa perangkat keras, pakai klien uji Python di `docs/d
 16. **Port RPC Garage (3901) terbuka di semua interface** pada `garage.toml` pengembangan, dan `rpc_secret`-nya pernah dibagikan di luar server. Batasi port 3901 dengan firewall atau ganti `rpc_secret`.
 17. **Sisa mahasiswa contoh dari seed lama.** Seed tidak lagi membuat `IK24001`–`IK24005`, tetapi dokumen yang sudah terlanjur ada di MongoDB tidak dihapus otomatis; hapus sekali lewat halaman Mahasiswa. NIM berformat lama itu juga tidak lolos validasi 9 digit bila didaftarkan ulang.
 18. **`BOOTSTRAP_RESET_PASSWORDS=true` menimpa password akun bootstrap setiap start** dan membuat ulang akun dosen bootstrap yang dihapus lewat `/akses`. Matikan setelah login berhasil.
+19. **Face service memproses request satu per satu.** `api.py` menjalankan inferensi di dalam `async def`, sehingga enrollment 6 foto menahan scan lain sesaat. Untuk banyak perangkat jalankan beberapa worker (`--workers`) atau pindahkan inferensi ke thread pool.
+20. **`python main.py` default mendengarkan di `0.0.0.0`.** Tanpa `--host 127.0.0.1`, face service tanpa autentikasi terbuka ke jaringan.
+21. **"Hadir" dari konsensus frame bukan anti-spoof.** Perangkat mengirim `liveness_passed=false`; Go mencatat Hadir bila wajah yang sama cocok di ≥ `SCAN_MIN_MATCH_FRAMES` frame dalam ±2 detik. Foto cetak atau layar HP di depan kamera tetap bisa lolos. Tambahkan liveness nyata sebelum produksi, lalu naikkan `SCAN_MIN_MATCH_FRAMES` di atas jumlah frame perangkat agar konsensus saja tidak cukup.
+22. **Perangkat kelas otomatis (`CLASS_ID` kosong) mencatat kehadiran di kelas mahasiswa mana pun**, tanpa jadwal ruangan; event wajah tak dikenal disimpan dengan `class_id` kosong (hanya terlihat administrator).
 
 ## Langkah Lanjutan yang Disarankan
 

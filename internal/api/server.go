@@ -2,13 +2,12 @@ package api
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"regexp"
@@ -33,7 +32,17 @@ type Config struct {
 	// SimThreshold adalah ambang cosine similarity ArcFace untuk menyatakan
 	// wajah cocok (FACE_SIM_THRESHOLD, default 0.45 = SIM_THRESHOLD face service).
 	SimThreshold float64
-	// FaceServiceTimeout membatasi lama satu panggilan ke face service.
+	// PoseThreshold adalah ambang kemiripan antar-foto dalam satu enrollment
+	// (FACE_POSE_THRESHOLD, default 0.30). Lebih longgar dari SimThreshold
+	// karena foto kiri/kanan/atas/bawah wajar kurang mirip dengan foto depan,
+	// tetapi tetap jauh di atas kemiripan dua orang berbeda.
+	PoseThreshold float64
+	// ScanMinMatchFrames: jumlah frame minimal yang cocok dengan mahasiswa
+	// yang sama agar scan langsung Hadir tanpa bukti liveness dari perangkat
+	// (SCAN_MIN_MATCH_FRAMES, default 2). Lihat scan.go.
+	ScanMinMatchFrames int
+	// FaceServiceTimeout membatasi lama satu panggilan /embed; /register
+	// mendapat FaceServiceTimeout × jumlah foto.
 	FaceServiceTimeout time.Duration
 	// ImageStorage adalah koneksi S3 (Garage) untuk foto wajah; kosong =
 	// foto tidak disimpan.
@@ -89,13 +98,21 @@ func New(db *store.Database, config Config) *Server {
 	if config.SimThreshold <= 0 || config.SimThreshold > 1 {
 		config.SimThreshold = 0.45
 	}
+	if config.PoseThreshold <= 0 || config.PoseThreshold > 1 {
+		config.PoseThreshold = 0.30
+	}
 	if config.FaceServiceTimeout <= 0 {
 		config.FaceServiceTimeout = 15 * time.Second
 	}
+	if config.ScanMinMatchFrames <= 0 {
+		config.ScanMinMatchFrames = 2
+	}
+	// Batas waktu diatur per panggilan lewat context (lihat face.go), karena
+	// enrollment 6 foto butuh waktu lebih lama daripada satu scan.
 	return &Server{
 		db:     db,
 		config: config,
-		client: &http.Client{Timeout: config.FaceServiceTimeout},
+		client: &http.Client{},
 	}
 }
 
@@ -644,17 +661,19 @@ func scanEventsToMaps(events []ScanEvent) []map[string]any {
 // RosterEntry adalah satu baris roster mahasiswa: identitas, kelas, dan status
 // scan terakhir hari ini. Dipakai endpoint JSON dashboard dan fragment /mahasiswa.
 type RosterEntry struct {
-	StudentID    string
-	StudentNIM   string
-	StudentName  string
-	ClassID      string
-	ClassName    string
-	ScannedAt    *string
-	FaceVerified bool
-	FaceEnrolled bool
-	FaceImageURL string // URL foto enrollment (kosong bila tidak tersimpan di Garage)
-	DeviceID     string
-	Status       string
+	StudentID     string
+	StudentNIM    string
+	StudentName   string
+	ClassID       string
+	ClassName     string
+	ScannedAt     *string
+	FaceVerified  bool
+	FaceEnrolled  bool
+	FaceImageURL  string   // URL foto enrollment pertama (kosong bila tidak tersimpan di Garage)
+	FaceImageURLs []string // URL semua foto enrollment (1–6)
+	FaceTemplates int      // jumlah embedding pose yang tersimpan (0 = belum enrollment)
+	DeviceID      string
+	Status        string
 }
 
 var (
@@ -722,13 +741,16 @@ func (s *Server) CreateStudent(ctx context.Context, name, nim, classID string) (
 	return id, nil
 }
 
-// EnrollFace mendeteksi wajah pada foto lewat face service (POST /detect),
-// lalu menyimpan embedding-nya sebagai template mahasiswa dengan NIM tersebut.
-// Bila penyimpanan foto aktif, foto enrollment juga disimpan ke Garage
-// (result["imageStored"]); kegagalan foto tidak menggagalkan enrollment.
-// Error yang mungkin: ErrStudentNotFound, ErrInvalidImage, ErrNoFace,
-// ErrMultipleFaces, ErrFaceAlreadyEnrolled (map berisi conflictNim), ErrFaceService.
-func (s *Server) EnrollFace(ctx context.Context, nim string, image []byte, filename string) (map[string]any, error) {
+// EnrollFace mengirim 1–6 foto enrollment (pose berbeda) ke face service
+// (POST /register), memvalidasi hasilnya, lalu menyimpan semua embedding
+// sebagai template mahasiswa dengan NIM tersebut. Bila penyimpanan foto aktif,
+// foto-fotonya juga disimpan ke Garage (result["imageStored"]); kegagalan
+// foto tidak menggagalkan enrollment.
+// Error yang mungkin: ErrStudentNotFound, ErrInvalidImage, ErrTooManyPhotos,
+// ErrNoFace, ErrInconsistentFaces, ErrFaceAlreadyEnrolled (map berisi
+// conflictNim), ErrFaceService. Error per foto dibungkus *PhotoError
+// (lihat PhotoNumber).
+func (s *Server) EnrollFace(ctx context.Context, nim string, images []EnrollImage) (map[string]any, error) {
 	nim = strings.ToUpper(strings.TrimSpace(nim))
 	var student struct {
 		ID string `bson:"_id"`
@@ -737,7 +759,13 @@ func (s *Server) EnrollFace(ctx context.Context, nim string, image []byte, filen
 	if err != nil {
 		return nil, ErrStudentNotFound
 	}
-	result, err := s.enrollEmbedding(ctx, student.ID, image, filename)
+	started := time.Now()
+	result, err := s.enrollEmbeddings(ctx, student.ID, images)
+	if err != nil {
+		log.Printf("enrollment %s gagal (%d foto, %s): %v %v", nim, len(images), time.Since(started).Round(time.Millisecond), err, result)
+	} else {
+		log.Printf("enrollment %s berhasil: %d foto dalam %s", nim, len(images), time.Since(started).Round(time.Millisecond))
+	}
 	if errors.Is(err, ErrFaceAlreadyEnrolled) {
 		if otherID, ok := result["conflictStudentId"].(string); ok {
 			var other struct {
@@ -750,22 +778,61 @@ func (s *Server) EnrollFace(ctx context.Context, nim string, image []byte, filen
 		return result, err
 	}
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	if s.images != nil {
-		key := s.storeEnrollmentImage(ctx, student.ID, image)
-		result["imageStored"] = key != ""
-		if key != "" {
-			result["imageUrl"] = ImageURL(key)
+		keys := s.storeEnrollmentImages(ctx, student.ID, images)
+		result["imageStored"] = len(keys) > 0
+		if len(keys) > 0 {
+			urls := make([]string, len(keys))
+			for i, key := range keys {
+				urls[i] = ImageURL(key)
+			}
+			result["imageUrls"] = urls
 		}
 	}
 	return result, nil
 }
 
-// ReadImagePart membaca file gambar (maks 8 MB) dari field multipart "image",
-// dipakai fragment htmx untuk enrollment wajah.
-func ReadImagePart(w http.ResponseWriter, r *http.Request) ([]byte, string, error) {
-	return readImagePart(w, r)
+// EnrollRequestTimeout adalah batas waktu baca/tulis satu request
+// enrollment (unggah foto + /register + simpan ke Garage).
+const EnrollRequestTimeout = 3 * time.Minute
+
+// ReadEnrollImages membaca 1–6 foto enrollment (masing-masing maks 8 MB) dari
+// field multipart "images" (atau "image" untuk klien lama), dipakai endpoint
+// JSON dan fragment htmx.
+func ReadEnrollImages(w http.ResponseWriter, r *http.Request) ([]EnrollImage, error) {
+	// ReadTimeout/WriteTimeout server (15 s) terlalu pendek untuk mengunggah
+	// dan memproses 6 foto HP; perpanjang khusus request enrollment.
+	controller := http.NewResponseController(w)
+	deadline := time.Now().Add(EnrollRequestTimeout)
+	_ = controller.SetReadDeadline(deadline)
+	_ = controller.SetWriteDeadline(deadline)
+	r.Body = http.MaxBytesReader(w, r.Body, MaxEnrollPhotos*(8<<20)+(1<<20))
+	if err := r.ParseMultipartForm(16 << 20); err != nil {
+		return nil, fmt.Errorf("kirim multipart/form-data berisi 1–%d foto (maks 8 MB per foto)", MaxEnrollPhotos)
+	}
+	headers := append(r.MultipartForm.File["images"], r.MultipartForm.File["image"]...)
+	switch {
+	case len(headers) == 0:
+		return nil, errors.New("pilih minimal 1 foto wajah")
+	case len(headers) > MaxEnrollPhotos:
+		return nil, fmt.Errorf("maksimal %d foto per enrollment (diterima %d)", MaxEnrollPhotos, len(headers))
+	}
+	images := make([]EnrollImage, 0, len(headers))
+	for i, header := range headers {
+		file, err := header.Open()
+		if err != nil {
+			return nil, fmt.Errorf("foto ke-%d tidak dapat dibaca", i+1)
+		}
+		data, err := io.ReadAll(io.LimitReader(file, 8<<20+1))
+		file.Close()
+		if err != nil || len(data) == 0 || len(data) > 8<<20 {
+			return nil, fmt.Errorf("foto ke-%d kosong atau melebihi 8 MB", i+1)
+		}
+		images = append(images, EnrollImage{Data: data, Filename: header.Filename})
+	}
+	return images, nil
 }
 
 func rosterToMaps(entries []RosterEntry) []map[string]any {
@@ -776,14 +843,16 @@ func rosterToMaps(entries []RosterEntry) []map[string]any {
 			scanTime = *entry.ScannedAt
 		}
 		result = append(result, map[string]any{
-			"student":      map[string]any{"id": entry.StudentID, "nim": entry.StudentNIM, "name": entry.StudentName},
-			"class":        map[string]any{"id": entry.ClassID, "name": entry.ClassName},
-			"scannedAt":    scanTime,
-			"faceVerified": entry.FaceVerified,
-			"faceEnrolled": entry.FaceEnrolled,
-			"faceImageUrl": entry.FaceImageURL,
-			"deviceId":     entry.DeviceID,
-			"status":       entry.Status,
+			"student":       map[string]any{"id": entry.StudentID, "nim": entry.StudentNIM, "name": entry.StudentName},
+			"class":         map[string]any{"id": entry.ClassID, "name": entry.ClassName},
+			"scannedAt":     scanTime,
+			"faceVerified":  entry.FaceVerified,
+			"faceEnrolled":  entry.FaceEnrolled,
+			"faceImageUrl":  entry.FaceImageURL,
+			"faceImageUrls": entry.FaceImageURLs,
+			"faceTemplates": entry.FaceTemplates,
+			"deviceId":      entry.DeviceID,
+			"status":        entry.Status,
 		})
 	}
 	return result
@@ -866,23 +935,32 @@ func (s *Server) dashboardAttendance(ctx context.Context, user principal) ([]Ros
 		studentIDs = append(studentIDs, st.ID)
 	}
 
-	// Hanya student_id dan image_key yang diambil; embedding 512-d tidak perlu
-	// untuk roster.
-	enrolledMap := make(map[string]bool)
-	faceImageMap := make(map[string]string)
+	// Embedding 512-d tidak diambil; roster cukup tahu jumlah pose dan kunci foto.
+	type faceInfo struct {
+		templates int
+		imageURLs []string
+	}
+	faceMap := make(map[string]faceInfo)
 	ftCur, err := s.db.Collection("face_templates").Find(ctx, bson.M{"student_id": bson.M{"$in": studentIDs}},
-		options.Find().SetProjection(bson.M{"student_id": 1, "image_key": 1}))
+		options.Find().SetProjection(bson.M{"student_id": 1, "image_key": 1, "image_keys": 1, "template_count": 1}))
 	if err == nil {
 		var ftList []struct {
-			StudentID string `bson:"student_id"`
-			ImageKey  string `bson:"image_key"`
+			StudentID     string   `bson:"student_id"`
+			ImageKey      string   `bson:"image_key"`
+			ImageKeys     []string `bson:"image_keys"`
+			TemplateCount int      `bson:"template_count"`
 		}
 		if err := ftCur.All(ctx, &ftList); err == nil {
 			for _, ft := range ftList {
-				enrolledMap[ft.StudentID] = true
-				if ft.ImageKey != "" {
-					faceImageMap[ft.StudentID] = ImageURL(ft.ImageKey)
+				info := faceInfo{templates: max(ft.TemplateCount, 1)} // dokumen lama: 1 embedding
+				keys := ft.ImageKeys
+				if len(keys) == 0 && ft.ImageKey != "" {
+					keys = []string{ft.ImageKey}
 				}
+				for _, key := range keys {
+					info.imageURLs = append(info.imageURLs, ImageURL(key))
+				}
+				faceMap[ft.StudentID] = info
 			}
 		}
 	}
@@ -919,14 +997,20 @@ func (s *Server) dashboardAttendance(ctx context.Context, user principal) ([]Ros
 	result := make([]RosterEntry, 0, len(students))
 	for _, st := range students {
 		entry := RosterEntry{
-			StudentID:    st.ID,
-			StudentNIM:   st.NIM,
-			StudentName:  st.Name,
-			ClassID:      st.ClassID,
-			ClassName:    classesMap[st.ClassID],
-			Status:       "Belum hadir",
-			FaceEnrolled: enrolledMap[st.ID],
-			FaceImageURL: faceImageMap[st.ID],
+			StudentID:   st.ID,
+			StudentNIM:  st.NIM,
+			StudentName: st.Name,
+			ClassID:     st.ClassID,
+			ClassName:   classesMap[st.ClassID],
+			Status:      "Belum hadir",
+		}
+		if info, ok := faceMap[st.ID]; ok {
+			entry.FaceEnrolled = true
+			entry.FaceTemplates = info.templates
+			entry.FaceImageURLs = info.imageURLs
+			if len(info.imageURLs) > 0 {
+				entry.FaceImageURL = info.imageURLs[0]
+			}
 		}
 		key := st.ID + "|" + st.ClassID
 		if scan, ok := latestScanMap[key]; ok {
@@ -1063,156 +1147,60 @@ func (s *Server) enrollFace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nim := strings.ToUpper(strings.TrimSpace(r.PathValue("nim")))
-	image, filename, err := readImagePart(w, r)
+	images, err := ReadEnrollImages(w, r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_image", err.Error())
 		return
 	}
-	response, err := s.EnrollFace(r.Context(), nim, image, filename)
+	response, err := s.EnrollFace(r.Context(), nim, images)
 	if err != nil {
+		status, code := http.StatusInternalServerError, "enroll_error"
 		switch {
 		case errors.Is(err, ErrStudentNotFound):
-			writeError(w, http.StatusNotFound, "student_not_found", "Mahasiswa tidak ditemukan.")
-		case errors.Is(err, ErrInvalidImage):
-			writeError(w, http.StatusBadRequest, "invalid_image", "Gambar tidak dapat dibaca; kirim JPEG/PNG yang valid.")
+			status, code = http.StatusNotFound, "student_not_found"
+		case errors.Is(err, ErrInvalidImage), errors.Is(err, ErrTooManyPhotos):
+			status, code = http.StatusBadRequest, "invalid_image"
 		case errors.Is(err, ErrNoFace):
-			writeError(w, http.StatusUnprocessableEntity, "no_face", "Tidak ada wajah yang terdeteksi pada foto.")
-		case errors.Is(err, ErrMultipleFaces):
-			writeError(w, http.StatusUnprocessableEntity, "multiple_faces", "Foto enrollment harus berisi tepat satu wajah.")
+			status, code = http.StatusUnprocessableEntity, "no_face"
+		case errors.Is(err, ErrInconsistentFaces):
+			status, code = http.StatusUnprocessableEntity, "inconsistent_faces"
 		case errors.Is(err, ErrFaceAlreadyEnrolled):
-			conflict, _ := response["conflictNim"].(string)
-			writeError(w, http.StatusConflict, "face_already_enrolled", "Wajah ini sudah terdaftar atas NIM "+conflict+".")
+			status, code = http.StatusConflict, "face_already_enrolled"
 		case errors.Is(err, ErrFaceService):
-			writeError(w, http.StatusBadGateway, "face_service_error", "Enrollment gagal; pastikan service Python dan model wajah aktif.")
-		default:
-			writeError(w, http.StatusInternalServerError, "enroll_error", "Enrollment gagal.")
+			status, code = http.StatusBadGateway, "face_service_error"
 		}
+		writeError(w, status, code, EnrollErrorMessage(err, response))
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"nim": nim, "faceEnrolled": true, "result": response})
 }
 
-// receiveScan: POST /api/v1/scans (perangkat). Urutan: token → gambar → field →
-// captured_at ±5 menit → liveness → HMAC + X-Device-Timestamp ±2 menit →
-// perangkat & kelas terdaftar → verifyCapture (Python /detect + cosine 1:N) →
-// status berlapis → foto ke Garage (opsional) → simpan scan_events. Face
-// service gagal → 502 dan event tidak dicatat. Kontrak: API.md, docs/devices.md §6.
-func (s *Server) receiveScan(w http.ResponseWriter, r *http.Request) {
-	if !s.validDeviceToken(r) {
-		writeError(w, http.StatusUnauthorized, "invalid_device", "Token perangkat tidak valid.")
-		return
+// EnrollErrorMessage menerjemahkan error EnrollFace menjadi pesan berbahasa
+// Indonesia (dipakai endpoint JSON dan fragment htmx). detail adalah map
+// yang dikembalikan EnrollFace bersama error (boleh nil).
+func EnrollErrorMessage(err error, detail map[string]any) string {
+	photo := ""
+	if n := PhotoNumber(err); n > 0 {
+		photo = fmt.Sprintf(" (foto ke-%d)", n)
 	}
-	image, filename, err := readImagePart(w, r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_image", err.Error())
-		return
+	switch {
+	case errors.Is(err, ErrStudentNotFound):
+		return "Mahasiswa tidak ditemukan."
+	case errors.Is(err, ErrTooManyPhotos):
+		return fmt.Sprintf("Maksimal %d foto per enrollment.", MaxEnrollPhotos)
+	case errors.Is(err, ErrInvalidImage):
+		return "Gambar tidak dapat dibaca" + photo + "; unggah foto JPEG/PNG yang valid."
+	case errors.Is(err, ErrNoFace):
+		return "Tidak ada wajah yang terdeteksi" + photo + ". Gunakan foto wajah yang jelas dan terang."
+	case errors.Is(err, ErrInconsistentFaces):
+		return "Wajah" + photo + " tidak cocok dengan foto pertama. Pastikan semua foto adalah mahasiswa yang sama."
+	case errors.Is(err, ErrFaceAlreadyEnrolled):
+		conflict, _ := detail["conflictNim"].(string)
+		return fmt.Sprintf("Wajah%s sudah terdaftar atas NIM %s; enrollment dibatalkan.", photo, conflict)
+	case errors.Is(err, ErrFaceService):
+		return "Enrollment gagal; pastikan service Python dan model wajah aktif."
 	}
-	deviceID := strings.TrimSpace(r.FormValue("device_id"))
-	classID := strings.TrimSpace(strings.ToUpper(r.FormValue("class_id")))
-	capturedAtRaw := strings.TrimSpace(r.FormValue("captured_at"))
-	livenessRaw := strings.ToLower(strings.TrimSpace(r.FormValue("liveness_passed")))
-	if deviceID == "" || classID == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "device_id dan class_id wajib diisi.")
-		return
-	}
-	capturedAt, parseErr := time.Parse(time.RFC3339, capturedAtRaw)
-	if parseErr != nil || time.Since(capturedAt) > 5*time.Minute || time.Until(capturedAt) > 5*time.Minute {
-		writeError(w, http.StatusBadRequest, "stale_capture", "captured_at wajib RFC3339 dan berjarak maksimal 5 menit dari waktu server.")
-		return
-	}
-	livenessPassed := livenessRaw == "true"
-	if livenessRaw != "true" && livenessRaw != "false" {
-		writeError(w, http.StatusBadRequest, "invalid_liveness", "liveness_passed wajib bernilai true atau false.")
-		return
-	}
-	if !s.validScanSignature(r, deviceID, classID, capturedAtRaw, livenessRaw, image) {
-		writeError(w, http.StatusUnauthorized, "invalid_signature", "Signature scan tidak valid atau timestamp kedaluwarsa.")
-		return
-	}
-	deviceCount, err := s.db.Collection("devices").CountDocuments(r.Context(), bson.M{"_id": deviceID})
-	if err != nil || deviceCount == 0 {
-		writeError(w, http.StatusForbidden, "unknown_device", "Perangkat belum terdaftar.")
-		return
-	}
-	classCount, err := s.db.Collection("classes").CountDocuments(r.Context(), bson.M{"_id": classID})
-	if err != nil || classCount == 0 {
-		writeError(w, http.StatusBadRequest, "unknown_class", "Kelas tidak ditemukan.")
-		return
-	}
-	scannedAt := capturedAt.UTC()
-	verification, err := s.verifyCapture(r.Context(), image, filename)
-	if err != nil {
-		switch {
-		case errors.Is(err, ErrInvalidImage):
-			writeError(w, http.StatusBadRequest, "invalid_image", "Gambar tidak dapat dibaca; kirim JPEG/PNG yang valid.")
-		case errors.Is(err, ErrFaceService):
-			writeError(w, http.StatusBadGateway, "face_service_error", "Verifikasi tidak tersedia; scan tidak dicatat sebagai hadir.")
-		default:
-			writeError(w, http.StatusInternalServerError, "database_error", "Gagal memuat template wajah.")
-		}
-		return
-	}
-	studentID := verification.StudentID
-	faceVerified := verification.Verified && studentID != ""
-	status := "Ditolak"
-	reason := verification.Reason
-	if faceVerified {
-		enrolled, err := s.db.Collection("students").CountDocuments(r.Context(), bson.M{"_id": studentID, "class_id": classID})
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "database_error", "Gagal memvalidasi kelas mahasiswa.")
-			return
-		}
-		if enrolled == 0 {
-			status = "Perlu ditinjau"
-			reason = "Mahasiswa terverifikasi tetapi bukan anggota kelas pada perangkat."
-		} else if !livenessPassed {
-			status = "Perlu ditinjau"
-			reason = "Cocok wajah; bukti liveness belum tersedia atau tidak lolos."
-		} else {
-			status = "Hadir"
-			reason = ""
-		}
-	}
-	event := bson.M{
-		"student_id":      studentID,
-		"class_id":        classID,
-		"device_id":       deviceID,
-		"scanned_at":      scannedAt.Format(time.RFC3339),
-		"face_verified":   faceVerified,
-		"liveness_passed": livenessPassed,
-		"confidence":      verification.Confidence,
-		"status":          status,
-		"review_reason":   reason,
-	}
-	if s.images != nil {
-		ext, contentType := imageExtension(image)
-		if key := s.uploadImage(r.Context(), scanImageKey(deviceID, scannedAt, ext), contentType, image); key != "" {
-			event["image_key"] = key
-		}
-	}
-	_, err = s.db.Collection("scan_events").InsertOne(r.Context(), event)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database_error", "Gagal menyimpan event scan.")
-		return
-	}
-	_, _ = s.db.Collection("devices").UpdateOne(r.Context(),
-		bson.M{"_id": deviceID},
-		bson.M{"$set": bson.M{"last_seen": time.Now().UTC().Format(time.RFC3339)}},
-	)
-	var student map[string]any
-	if faceVerified {
-		var st struct {
-			NIM  string `bson:"nim"`
-			Name string `bson:"name"`
-		}
-		if err = s.db.Collection("students").FindOne(r.Context(), bson.M{"_id": studentID}).Decode(&st); err == nil {
-			student = map[string]any{"id": studentID, "nim": st.NIM, "name": st.Name}
-		}
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"status": status, "student": student, "faceVerified": faceVerified,
-		"confidence": verification.Confidence, "reviewReason": reason,
-	})
+	return "Enrollment gagal."
 }
 
 // devicePing: GET|POST /api/v1/devices/ping (heartbeat). ID dari form, query,
@@ -1349,42 +1337,6 @@ func (s *Server) validDeviceToken(r *http.Request) bool {
 	return expected != "" && secureEqual(bearerToken(r), expected)
 }
 
-func (s *Server) validScanSignature(r *http.Request, deviceID, classID, capturedAt, liveness string, image []byte) bool {
-	secret := s.config.DeviceToken
-	timestamp := strings.TrimSpace(r.Header.Get("X-Device-Timestamp"))
-	requestTime, err := time.Parse(time.RFC3339, timestamp)
-	if err != nil || time.Since(requestTime) > 2*time.Minute || time.Until(requestTime) > 2*time.Minute {
-		return false
-	}
-	imageHash := sha256.Sum256(image)
-	message := strings.Join([]string{timestamp, deviceID, classID, capturedAt, liveness, hex.EncodeToString(imageHash[:])}, "\n")
-	mac := hmac.New(sha256.New, []byte(secret))
-	_, _ = mac.Write([]byte(message))
-	expected := hex.EncodeToString(mac.Sum(nil))
-	provided := strings.TrimSpace(r.Header.Get("X-Device-Signature"))
-	if len(provided) != len(expected) {
-		return false
-	}
-	return hmac.Equal([]byte(provided), []byte(expected))
-}
-
-func readImagePart(w http.ResponseWriter, r *http.Request) ([]byte, string, error) {
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<20)
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		return nil, "", errors.New("kirim multipart/form-data dengan file image maksimal 8 MB")
-	}
-	file, header, err := r.FormFile("image")
-	if err != nil {
-		return nil, "", errors.New("field image wajib diisi")
-	}
-	defer file.Close()
-	image, err := io.ReadAll(io.LimitReader(file, 8<<20+1))
-	if err != nil || len(image) == 0 || len(image) > 8<<20 {
-		return nil, "", errors.New("file gambar kosong atau melebihi batas 8 MB")
-	}
-	return image, header.Filename, nil
-}
-
 func bearerToken(r *http.Request) string {
 	value := strings.TrimSpace(r.Header.Get("Authorization"))
 	if len(value) < 7 || !strings.EqualFold(value[:7], "Bearer ") {
@@ -1423,7 +1375,9 @@ func ParseConfig() Config {
 		FaceServiceURL:     env("FACE_SERVICE_URL", "http://127.0.0.1:8000"),
 		FaceServiceToken:   os.Getenv("FACE_SERVICE_TOKEN"),
 		DeviceToken:        os.Getenv("DEVICE_TOKEN"),
-		SimThreshold:       envFloat("FACE_SIM_THRESHOLD", 0.45),
+		SimThreshold:       envFloat("FACE_SIM_THRESHOLD", 0.20),
+		PoseThreshold:      envFloat("FACE_POSE_THRESHOLD", 0.20),
+		ScanMinMatchFrames: int(envFloat("SCAN_MIN_MATCH_FRAMES", 2)),
 		FaceServiceTimeout: time.Duration(envFloat("FACE_SERVICE_TIMEOUT_SECONDS", 15) * float64(time.Second)),
 		ImageStorage: storage.Config{
 			Endpoint:        strings.TrimSpace(os.Getenv("S3_ENDPOINT")),

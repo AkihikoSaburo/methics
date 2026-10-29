@@ -75,3 +75,19 @@ func TestRosterViewPhotoLink(t *testing.T) {
 		}
 	}
 }
+
+func TestRosterMultiPhotoEnrollment(t *testing.T) {
+	p := newTestPartials(t)
+	row := mahasiswaRow{StudentNIM: "241011003", StudentName: "Citra Nabila", ClassID: "IK24-B", FaceEnrolled: true, FaceTemplates: 3,
+		FaceImageURL:  "/api/v1/images/enroll/s/1.jpg",
+		FaceImageURLs: []string{"/api/v1/images/enroll/s/1.jpg", "/api/v1/images/enroll/s/2.jpg", "/api/v1/images/enroll/s/3.jpg"}}
+	rec := httptest.NewRecorder()
+	p.render(rec, "mahasiswa_fragment", mahasiswaFragmentData{Role: "administrator", Total: 1, Rows: []mahasiswaRow{row}})
+	body := rec.Body.String()
+	for _, want := range []string{`name="images"`, "multiple", "Enroll ulang", "Template aktif (3 pose)",
+		`href="/api/v1/images/enroll/s/2.jpg"`, `href="/api/v1/images/enroll/s/3.jpg"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+}

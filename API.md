@@ -78,7 +78,8 @@ Semua error dari `/api/v1/*` berbentuk:
 | 409 | `username_taken` | username akun sudah dipakai |
 | 403 | `not_lecturer` | mencoba menghapus akun administrator lewat `/api/v1/staff/{id}` |
 | 404 | `user_not_found` | akun staf tidak ditemukan |
-| 422 | `no_face`, `multiple_faces` | foto enrollment tidak berisi tepat satu wajah |
+| 422 | `no_face` | salah satu foto enrollment tidak berisi wajah |
+| 422 | `inconsistent_faces` | foto-foto enrollment bukan orang yang sama |
 | 409 | `face_already_enrolled` | wajah pada foto enrollment sudah terdaftar atas NIM lain |
 | 400 | `invalid_image` | bukan multipart, field `image` hilang, kosong, atau > 8 MiB |
 | 401 | `invalid_device` | bearer token perangkat salah (scan) |
@@ -139,7 +140,9 @@ Administrator menerima semua kelas; dosen hanya `users.class_ids`. Data
       "scannedAt": "2026-10-21T00:02:00Z",
       "faceVerified": true,
       "faceEnrolled": true,
-      "faceImageUrl": "/api/v1/images/enroll/student-241011001/20261026T060000Z-3f9a1c2b4d5e.jpg",
+      "faceTemplates": 6,
+      "faceImageUrl": "/api/v1/images/enroll/student-241011001/20261028T080000Z-3f9a1c2b4d5e.jpg",
+      "faceImageUrls": ["/api/v1/images/enroll/student-241011001/20261028T080000Z-3f9a1c2b4d5e.jpg", "…"],
       "deviceId": "ESP32-GED-A1",
       "status": "Hadir"
     }
@@ -232,82 +235,126 @@ setelah restart.
 
 ### `POST /api/v1/students/{nim}/face-template` — administrator + CSRF
 
-`multipart/form-data` dengan file `image` (≤ 8 MiB). Go mengirim foto ke
-face service `POST /detect`, mewajibkan tepat satu wajah, menolak wajah yang
-sudah terdaftar atas NIM lain, lalu menyimpan embedding 512-d ke
-`face_templates` (enrollment ulang menimpa template lama). Respons `201`:
+`multipart/form-data` dengan **1–6** file pada field `images` (field `image`
+tetap diterima; ≤ 8 MiB per foto). Pose yang disarankan: depan, kiri,
+kanan, atas, bawah, senyum. Go mengirim semua foto ke face service
+`POST /register`, memastikan tiap foto berisi wajah, semua foto adalah orang
+yang sama, dan wajahnya belum terdaftar atas NIM lain, lalu menyimpan semua
+embedding 512-d ke satu dokumen `face_templates` (enrollment ulang
+mengganti semua pose lama).
+
+```bash
+curl -b cookie.txt -H "X-CSRF-Token: <token>" \
+  -F images=@depan.jpg -F images=@kiri.jpg -F images=@kanan.jpg \
+  http://localhost:8080/api/v1/students/241011001/face-template
+```
+
+Respons `201`:
 
 ```json
 {
   "nim": "241011001",
   "faceEnrolled": true,
   "result": {
-    "studentId": "student-241011001", "dimension": 512, "detectionConfidence": 0.93, "processingTimeMs": 85.4,
-    "imageStored": true, "imageUrl": "/api/v1/images/enroll/student-241011001/20261026T060000Z-3f9a1c2b4d5e.jpg"
+    "studentId": "student-241011001", "templateCount": 3, "dimension": 512,
+    "detectionConfidences": [0.93, 0.91, 0.9], "processingTimeMs": 412.7,
+    "imageStored": true,
+    "imageUrls": [
+      "/api/v1/images/enroll/student-241011001/20261028T080000Z-3f9a1c2b4d5e.jpg",
+      "/api/v1/images/enroll/student-241011001/20261028T080000Z-a1b2c3d4e5f6.jpg",
+      "/api/v1/images/enroll/student-241011001/20261028T080000Z-0a1b2c3d4e5f.jpg"
+    ]
   }
 }
 ```
 
-`imageStored`/`imageUrl` hanya muncul bila penyimpanan foto aktif. Gagal
+`imageStored`/`imageUrls` hanya muncul bila penyimpanan foto aktif. Gagal
 menyimpan foto (Garage mati) **tidak** menggagalkan enrollment:
 `imageStored: false`, template tetap tersimpan.
 
-Error: `400 invalid_image`, `404 student_not_found`, `422 no_face`,
-`422 multiple_faces`, `409 face_already_enrolled`, `502 face_service_error`.
+Error (pesan menyebut nomor foto bila relevan, mis. "foto ke-2"):
+
+| Status | `error` | Arti |
+| --- | --- | --- |
+| 400 | `invalid_image` | tidak ada foto, lebih dari 6 foto, foto > 8 MiB, atau tidak bisa di-decode |
+| 404 | `student_not_found` | NIM tidak ada |
+| 422 | `no_face` | salah satu foto tidak berisi wajah |
+| 422 | `inconsistent_faces` | salah satu foto bukan orang yang sama (kemiripan dengan foto pertama dan rata-rata foto lain < `FACE_POSE_THRESHOLD`, default 0.30) |
+| 409 | `face_already_enrolled` | wajah sudah terdaftar atas NIM lain |
+| 502 | `face_service_error` | face service mati, model belum siap, atau timeout |
 
 ### `POST /api/v1/scans` — perangkat
 
-`multipart/form-data`: `device_id`, `class_id`, `captured_at` (RFC3339),
-`liveness_passed` (`true`/`false`), file `image` (≤ 8 MiB). Header:
-`Authorization: Bearer <DEVICE_TOKEN>`, `X-Device-Timestamp` (RFC3339),
-`X-Device-Signature` (hex HMAC-SHA256).
+`multipart/form-data`: `device_id`, `class_id` (**opsional**; kosong = kelas
+otomatis), `captured_at` (RFC3339), `liveness_passed` (`true`/`false`), dan
+**1–6** file `image` berurutan (frame dari jendela scan ±2 detik; ≤ 8 MiB
+per frame, total body ≤ 16 MiB). Header: `Authorization: Bearer
+<DEVICE_TOKEN>`, `X-Device-Timestamp` (RFC3339), `X-Device-Signature` (hex
+HMAC-SHA256).
 
 Pesan HMAC = enam baris digabung `\n`, kunci = `DEVICE_TOKEN`:
 
 ```text
 <X-Device-Timestamp RFC3339>
 <device_id>
-<class_id huruf besar>
+<class_id huruf besar, atau kosong>
 <captured_at persis seperti field>
 <liveness_passed lowercase true/false>
-<hex SHA-256 dari byte image>
+<hex SHA-256 dari semua frame digabung berurutan>   ← satu frame = SHA-256 gambar itu
 ```
 
-Urutan validasi: token → gambar → field wajib → `captured_at` (±5 menit) →
+Urutan validasi: token → frame → `device_id` → `captured_at` (±5 menit) →
 `liveness_passed` → HMAC & `X-Device-Timestamp` (±2 menit) → perangkat
-terdaftar → kelas ada → face service `POST /detect` → pencocokan cosine
-similarity di Go terhadap seluruh `face_templates` (ambang
-`FACE_SIM_THRESHOLD`, default 0.45). `confidence` pada respons = skor
-kemiripan terbaik.
+terdaftar → kelas ada (bila `class_id` diisi) → tiap frame ke face service
+`POST /embed` → pencocokan cosine similarity di Go terhadap semua pose
+`face_templates` (ambang `FACE_SIM_THRESHOLD`, default 0.45). Go berhenti
+memproses frame begitu satu mahasiswa cocok di `SCAN_MIN_MATCH_FRAMES`
+(default 2) frame. Frame tanpa wajah atau rusak dilewati.
 
-Penentuan status:
+Penentuan status (mahasiswa dengan frame cocok terbanyak menang):
 
-| Kondisi | `status` | `reviewReason` |
-| --- | --- | --- |
-| tidak ada wajah / kemiripan < ambang / belum ada template | `Ditolak` | alasan dari Go, mis. "Wajah tidak cocok … (kemiripan 0.31 < 0.45)" |
-| cocok, bukan anggota `class_id` | `Perlu ditinjau` | Mahasiswa terverifikasi tetapi bukan anggota kelas pada perangkat. |
-| cocok, anggota kelas, `liveness_passed=false` | `Perlu ditinjau` | Cocok wajah; bukti liveness belum tersedia atau tidak lolos. |
-| cocok, anggota kelas, `liveness_passed=true` | `Hadir` | — |
+| Kondisi | `status` | `result` | `reviewReason` |
+| --- | --- | --- | --- |
+| tidak ada wajah di semua frame | `Ditolak` | `wajah_tidak_terdeteksi` | "Wajah tidak terdeteksi pada 4 frame." |
+| ada wajah, kemiripan < ambang / belum ada template | `Ditolak` | `tidak_terdaftar` | "Wajah tidak terdaftar (kemiripan tertinggi 0.31 < 0.45)." |
+| cocok, `class_id` diisi dan mahasiswa bukan anggotanya | `Perlu ditinjau` | `perlu_ditinjau` | Mahasiswa terverifikasi tetapi bukan anggota kelas pada perangkat. |
+| cocok di ≥ `SCAN_MIN_MATCH_FRAMES` frame, atau `liveness_passed=true` | `Hadir` | `hadir` | — |
+| cocok di kurang dari `SCAN_MIN_MATCH_FRAMES` frame | `Perlu ditinjau` | `perlu_ditinjau` | "Wajah cocok di 1 dari 4 frame; minimal 2 frame agar langsung hadir." |
 
-Event disimpan ke `scan_events` dan `devices.last_seen` diperbarui. Respons
-`202`:
+Dengan `class_id` kosong, event dicatat di **kelas mahasiswa yang cocok**
+(`students.class_id`); event wajah tidak dikenal disimpan dengan `class_id`
+kosong (terlihat oleh administrator di halaman Log). Event disimpan ke
+`scan_events` (ditambah `frames_total`, `frames_with_face`,
+`frames_matched`) dan `devices.last_seen` diperbarui. Respons `202`:
 
 ```json
 {
   "status": "Hadir",
+  "result": "hadir",
+  "message": "Hadir",
   "student": { "id": "student-241011001", "nim": "241011001", "name": "Alya Putri" },
+  "classId": "IK24-A",
   "faceVerified": true,
   "confidence": 0.91,
-  "reviewReason": ""
+  "reviewReason": "",
+  "framesTotal": 4,
+  "framesWithFace": 2,
+  "framesMatched": 2
 }
 ```
 
-`student` bernilai `null` bila wajah tidak cocok. Bila face service gagal,
+`student` bernilai `null` bila wajah tidak cocok; `message` adalah teks
+singkat untuk layar perangkat (`"Wajah tidak Terdaftar"`, `"Wajah tidak
+terdeteksi"`, `"Hadir"`, atau alasan peninjauan). Bila face service gagal,
 respons `502` dan **tidak ada** event yang dicatat.
 
-Bila penyimpanan foto aktif, capture diunggah ke Garage (batas 3 detik)
-sebelum event disimpan, dan kuncinya dicatat di `scan_events.image_key`.
-Gagal unggah hanya dicatat di log; event tetap disimpan tanpa foto.
+> Konsensus beberapa frame **bukan** anti-spoof: foto cetak di depan kamera
+> bisa tercatat Hadir. Lihat `docs/devices.md` §7.
+
+Bila penyimpanan foto aktif, **satu** frame bukti (frame dengan skor terbaik,
+atau frame berwajah pertama) diunggah ke Garage (batas 3 detik) sebelum event
+disimpan, dan kuncinya dicatat di `scan_events.image_key`. Gagal unggah hanya
+dicatat di log; event tetap disimpan tanpa foto.
 
 ### `GET /api/v1/images/{key...}` — staf
 
@@ -350,7 +397,7 @@ Filter `class` dari dosen yang bukan kelasnya menghasilkan data kosong.
 | `GET /partials/mahasiswa?q=&class=` | tabel roster (+ ringkasan via `hx-swap-oob`) | staf | `load, every 15s`, ketik, ganti filter, event `roster-changed` |
 | `GET /partials/mahasiswa/form` | form dialog pendaftaran | administrator | sekali saat halaman dimuat |
 | `POST /partials/mahasiswa/students` | tambah mahasiswa (form-urlencoded `name`, `nim`, `classId`) | administrator | — |
-| `POST /partials/mahasiswa/{nim}/face-template` | enrollment wajah (multipart `image`, dikirim otomatis saat file dipilih; `q`/`class` ikut lewat `hx-include` agar filter tetap) | administrator | — |
+| `POST /partials/mahasiswa/{nim}/face-template` | enrollment / enrollment ulang wajah (multipart `images`, 1–6 foto, dikirim otomatis saat file dipilih; `q`/`class` ikut lewat `hx-include` agar filter tetap) | administrator | — |
 | `DELETE /partials/mahasiswa/{nim}` | hapus mahasiswa + data wajah, foto, riwayat scan (konfirmasi `hx-confirm`; `q`/`class` lewat `hx-include`) → roster | administrator | — |
 | `GET /partials/akses/staff` | form buat dosen + tabel akun staf | administrator | sekali saat halaman `/akses` dimuat |
 | `POST /partials/akses/lecturers` | buat akun dosen (form `username`, `displayName`, `password`, `classIds` berulang) → fragment akun | administrator | — |

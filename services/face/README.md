@@ -87,6 +87,9 @@ python main.py --host 127.0.0.1 --port 9000
 # Development mode (auto-reload)
 python main.py --reload
 
+# Bersama backend Go di satu PC (disarankan: hanya localhost)
+python main.py --host 127.0.0.1 --port 8000
+
 # Atau langsung via uvicorn
 uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 ```
@@ -123,3 +126,38 @@ curl -X POST "http://localhost:8000/register?student_id=12345678" \
   -F "images=@bawah.jpg" \
   -F "images=@senyum.jpg"
 ```
+
+---
+
+## 6. Integrasi dengan Backend Go
+
+Layanan ini dipanggil oleh backend Go (`internal/api/face.go`), bukan langsung
+oleh dashboard atau ESP32. Layanan ini **stateless**: embedding tidak disimpan
+di sini, tetapi di MongoDB oleh Go.
+
+| Alur | Endpoint yang dipanggil Go | Yang dilakukan Go dengan hasilnya |
+|---|---|---|
+| Enrollment mahasiswa (halaman Mahasiswa, 1–6 foto) | `POST /register?student_id=student-<nim>` (field `images`) | cek tiap foto ada wajah, semua foto orang yang sama, wajah belum terdaftar di NIM lain → simpan semua embedding ke `face_templates.encodings` |
+| Scan absensi dari ESP32 | `POST /embed` (field `image`) | cosine similarity ke semua pose semua mahasiswa (ambang `FACE_SIM_THRESHOLD`, default 0.45) |
+| Status di dashboard | `GET /health` | `model_loaded`, `det_model`, `rec_model` |
+
+Pengaturan di `.env` backend Go:
+
+```env
+FACE_SERVICE_URL=http://127.0.0.1:8000
+FACE_SIM_THRESHOLD=0.45          # samakan dengan SIM_THRESHOLD layanan ini
+FACE_SERVICE_TIMEOUT_SECONDS=15
+```
+
+Catatan:
+- Jangan ubah nama field (`image`, `images`), parameter `student_id`, atau
+  pesan error `"No face detected ..."` (termasuk `image #N`) tanpa
+  menyesuaikan `internal/api/face.go`; Go memakai pesan itu untuk
+  menunjukkan foto mana yang gagal.
+- Layanan ini belum memiliki autentikasi dan memakai CORS `*`. Jalankan dengan
+  `--host 127.0.0.1` (default `main.py` adalah `0.0.0.0`) atau di jaringan
+  internal saja.
+- Mengganti model recognition (`/models/switch`) membuat embedding lama tidak
+  sebanding: semua mahasiswa harus di-enroll ulang.
+
+Detail integrasi: `docs/face-service.md` di root proyek.

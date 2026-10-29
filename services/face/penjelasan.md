@@ -13,11 +13,10 @@ Sistem ini merupakan layanan mikro (*microservice*) biometrik berbasis **FastAPI
 
 ```mermaid
 graph TD
-    Client[Klien / Aplikasi Eksternal] -->|HTTP Request| API[FastAPI Gateway]
+    Client[Backend Go / Klien Internal] -->|HTTP Request| API[FastAPI Gateway]
     API -->|Routing| Endpoints{Daftar Endpoint}
     
-    Endpoints -->|POST /detect| Pipe[FacePipeline Orchestrator]
-    Endpoints -->|POST /compare| Pipe
+    Endpoints -->|POST /register| Pipe[FacePipeline Orchestrator]
     Endpoints -->|POST /embed| Pipe
     Endpoints -->|GET /models, POST /switch| MM[ModelManager]
     
@@ -28,6 +27,11 @@ graph TD
     MM <-->|Sync / Download| HF[(Hugging Face Hub)]
     MM <-->|Local Cache| LocalStorage[(Direktori /models)]
 ```
+
+Layanan ini **stateless**: tidak menyimpan embedding dan tidak terhubung ke
+basis data. Penyimpanan template wajah (MongoDB) dan pencocokan identitas
+1:N dilakukan oleh **backend Go**, yang menjadi satu-satunya API publik untuk
+dashboard dan perangkat ESP32 (lihat bagian 3.3).
 
 ---
 
@@ -43,16 +47,20 @@ Sebelum API dapat melayani permintaan klien, sistem menjalankan mekanisme inisia
 
 ## 3. Alur Fungsional API
 
-### 3.1. Alur Deteksi Wajah (`POST /detect` dan `POST /detect/visualize`)
+### 3.1. Alur Registrasi Wajah Mahasiswa (`POST /register`)
 
-Endpoint ini digunakan untuk mendeteksi semua wajah manusia pada suatu citra masukan, menghasilkan koordinat *bounding box*, skor keyakinan (*confidence score*), dan vektor fitur (*embedding*) 512-D untuk setiap wajah.
+Endpoint ini dipakai saat **enrollment**: administrator mengunggah 1–6 foto
+seorang mahasiswa dengan pose berbeda (depan, kiri ~30°, kanan ~30°, atas,
+bawah, senyum), dan sistem mengembalikan satu vektor fitur 512-D untuk
+setiap foto.
 
 #### Tahapan Alur Komputasi:
 1. **Penerimaan Berkas (Request Handling):**
-   - Klien mengirimkan citra via *multipart/form-data* bersama parameter opsional (`return_aligned`, `conf_threshold`, `iou_threshold`).
+   - Klien mengirimkan 1–6 citra via *multipart/form-data* pada field `images`, beserta parameter query `student_id` (wajib), `return_aligned`, dan `conf_threshold` (opsional).
+   - Jumlah foto divalidasi: 0 foto atau lebih dari 6 foto menghasilkan HTTP `400 Bad Request`.
 2. **Dekoding Citra:**
-   - Byte stream dibaca dari memori dan didekode menjadi matriks array BGR menggunakan OpenCV (`cv2.imdecode`).
-   - Dilakukan validasi format citra. Jika citra rusak atau kosong, sistem mengembalikan kode status HTTP `400 Bad Request`.
+   - Setiap byte stream didekode menjadi matriks array BGR menggunakan OpenCV (`cv2.imdecode`).
+   - Jika citra rusak atau kosong, sistem mengembalikan kode status HTTP `400 Bad Request`.
 3. **Prapemrosesan Deteksi (Pre-processing YOLO):**
    - Citra masukan diubah ukurannya menggunakan teknik **Letterbox Resize** menjadi dimensi $640 \times 640$ piksel dengan mempertahankan *aspect ratio* (memberikan *padding* abu-abu pada sisa ruang).
    - Nilai piksel dikonversi dari BGR ke RGB, dinormalisasi ke rentang $[0.0, 1.0]$, dan ditransposisi menjadi format tensor `[1, 3, 640, 640]`.
@@ -61,110 +69,107 @@ Endpoint ini digunakan untuk mendeteksi semua wajah manusia pada suatu citra mas
    - Sistem mendekode kotak jangkar (*anchor boxes*), menerapkan fungsi sigmoid pada koordinat dan probabilitas objek.
    - Algoritma **Non-Maximum Suppression (NMS)** dieksekusi dengan ambang IoU (default 0.45) untuk mengeliminasi deteksi ganda/tumpang tindih.
    - Koordinat *bounding box* ditransformasikan kembali (*rescale*) ke dimensi citra asli dalam format $[x_1, y_1, x_2, y_2]$.
-5. **Penyelarasan Wajah (Face Alignment):**
-   - Untuk setiap wajah yang terdeteksi, modul `FaceAligner` memotong (*crop*) area wajah berdasarkan titik pusat dan dimensi *bounding box* dengan rasio margin $25\%$.
+   - Jika tidak ada wajah pada salah satu foto, proses dihentikan dengan HTTP `422 Unprocessable Entity` dan pesan `"No face detected in image #N ('<nama file>')"`.
+5. **Seleksi Wajah Utama:**
+   - Bila satu foto berisi lebih dari satu wajah, sistem memilih **wajah dengan confidence tertinggi**.
+6. **Penyelarasan Wajah (Face Alignment):**
+   - Modul `FaceAligner` memotong (*crop*) area wajah berdasarkan titik pusat dan dimensi *bounding box* dengan rasio margin $25\%$.
    - Dilakukan transformasi afina kanonikal (`cv2.warpAffine`) untuk memetakan proporsi wajah ke kanvas standar berukuran $112 \times 112$ piksel.
-6. **Ekstraksi Fitur (Feature Extraction ArcFace):**
+7. **Ekstraksi Fitur (Feature Extraction ArcFace):**
    - Citra wajah $112 \times 112$ dinormalisasi ke standar ArcFace:
      $$\text{Norm}(x) = \frac{x - 127.5}{128.0}$$
    - Model ArcFace ONNX mengekstraksi vektor representasi laten berdimensi 512.
    - Vektor dinormalisasi menggunakan norma $L_2$ Euclidean:
      $$\mathbf{e} = \frac{\mathbf{v}}{\|\mathbf{v}\|_2}$$
      sehingga panjang vektor bernilai tepat 1 ($\|\mathbf{e}\|_2 = 1.0$).
-7. **Penyusunan Respons:**
-   - Pada endpoint `/detect`: Mengembalikan format JSON berisi jumlah wajah (`num_faces`), daftar koordinat bounding box, confidence score, array 512 float embedding, waktu komputasi (`processing_time_ms`), serta Base64 gambar wajah terpotong jika parameter `return_aligned=true`.
-   - Pada endpoint `/detect/visualize`: Citra diberi anotasi kotak hijau dan teks skor confidence di atas setiap wajah, lalu dikirimkan kembali ke klien dalam format *binary stream* `image/jpeg`.
+8. **Penyusunan Respons:**
+   - Mengembalikan JSON berisi `student_id`, jumlah template (`num_templates`), daftar `templates` (per foto: `embedding` 512 float, `confidence`, dan `aligned_face_b64` bila `return_aligned=true`), serta waktu komputasi total (`processing_time_ms`).
+   - Embedding **tidak disimpan** oleh layanan ini; backend Go yang memvalidasi dan menyimpannya ke MongoDB (`face_templates.encodings`).
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Client
-    participant API as FastAPI Router (/detect)
+    actor Admin as Administrator (Dashboard)
+    participant Go as Backend Go
+    participant API as FastAPI Router (/register)
     participant Pipe as FacePipeline
-    participant Det as YOLO-FaceV2
-    participant Align as FaceAligner
-    participant Rec as ArcFace
-    
-    Client->>API: POST /detect (Image File + Params)
-    API->>API: Dekode bytes ke Citra BGR (OpenCV)
-    API->>Pipe: process_image(img_bgr, conf, iou)
-    Pipe->>Det: detect(img_bgr)
-    Note over Det: Letterbox (640x640) -> ONNX Run -> NMS
-    Det-->>Pipe: Daftar Bounding Boxes & Confidence
-    loop Untuk Setiap Wajah Terdeteksi
-        Pipe->>Align: align_by_bbox(img_bgr, bbox)
-        Align-->>Pipe: Aligned Crop (112x112)
-        Pipe->>Rec: extract_embedding(aligned_face)
-        Note over Rec: Normalisasi -> ONNX Run -> L2 Normalization
-        Rec-->>Pipe: 512-d Embedding
+    participant DB as MongoDB
+
+    Admin->>Go: Unggah 1–6 foto pose
+    Go->>API: POST /register?student_id=... (images[])
+    loop Untuk setiap foto
+        API->>API: Dekode bytes ke Citra BGR (OpenCV)
+        API->>Pipe: process_image(img_bgr, conf)
+        Note over Pipe: YOLO (Letterbox 640x640 -> ONNX -> NMS)<br/>-> Align 112x112 -> ArcFace -> L2
+        Pipe-->>API: Daftar wajah (bbox, confidence, embedding)
+        alt Tidak ada wajah
+            API-->>Go: HTTP 422 "No face detected in image #N"
+            Go-->>Admin: Pesan galat menyebut foto ke-N
+        else Wajah terdeteksi
+            API->>API: Pilih wajah dengan confidence tertinggi
+        end
     end
-    Pipe-->>API: Data Wajah Lengkap (BBox, Conf, Embedding)
-    API-->>Client: HTTP 200 OK (JSON Response)
+    API-->>Go: HTTP 200 (templates[].embedding 512-D)
+    Go->>Go: Cek konsistensi pose & duplikat NIM lain (cosine)
+    Go->>DB: Simpan encodings (1–6 vektor)
+    Go-->>Admin: Enrollment berhasil
 ```
 
 ---
 
-### 3.2. Alur Pencocokan/Verifikasi Dua Wajah (`POST /compare`)
+### 3.2. Alur Ekstraksi Embedding untuk Absensi (`POST /embed`)
 
-Endpoint ini memverifikasi kesamaan identitas antara dua foto wajah (*1-to-1 face verification*), misalnya untuk kebutuhan presensi biometrik atau verifikasi identitas pengguna (KYC).
+Endpoint ini dipakai saat **absensi**: kamera ESP32-CAM menyala ketika sensor
+ultrasonik mendeteksi orang, perangkat mengambil hingga 4 frame selama ±2
+detik dan mengirim semuanya ke backend Go, lalu Go meneruskan **setiap frame**
+ke `/embed`.
+1. Klien mengirimkan satu citra pada field `image` (opsional `conf_threshold`).
+2. Sistem menjalankan tahap 2–7 yang sama seperti bagian 3.1 dan memilih wajah dengan skor *confidence* tertinggi.
+3. Jika tidak ada wajah, sistem mengembalikan HTTP `422 Unprocessable Entity` (`"No face detected in the uploaded image"`).
+4. Sistem mengembalikan vektor embedding 512-D, nilai confidence, dan latensi pemrosesan (`processing_time_ms`).
 
-#### Tahapan Alur Komputasi:
-1. **Penerimaan Dua Berkas Citra:**
-   - Klien mengunggah `image1` dan `image2` melalui form data multipart, beserta nilai ambang kemiripan opsional (`sim_threshold`, default 0.45).
-2. **Deteksi dan Seleksi Wajah Utama:**
-   - Sistem memproses `image1` dan `image2` secara independen melalui `process_image()`.
-   - Jika pada salah satu citra tidak ditemukan wajah sama sekali, sistem menghentikan proses dan mengembalikan kode status HTTP `422 Unprocessable Entity` beserta pesan galat: `"No face detected in Image X"`.
-   - Apabila terdapat lebih dari satu wajah pada satu citra, sistem secara otomatis memilih **wajah dengan tingkat keyakinan (confidence) tertinggi** sebagai subjek perbandingan utama.
-3. **Kalkulasi Metrik Kemiripan Biometrik:**
-   Karena vektor embedding $\mathbf{e}_1$ dan $\mathbf{e}_2$ telah ternormalisasi $L_2$ ($\|\mathbf{e}\| = 1$), perhitungan metrik dilakukan dengan efisiensi tinggi:
-   - **Cosine Similarity:**
-     $$\text{Cosine Similarity} = \mathbf{e}_1 \cdot \mathbf{e}_2 = \sum_{i=1}^{512} e_{1,i} \cdot e_{2,i}$$
-     Rentang nilai berada pada interval $[-1.0, 1.0]$, di mana nilai mendekati $1.0$ mengindikasikan wajah yang identik.
-   - **Euclidean Distance:**
-     Dihitung secara langsung melalui hubungan analitis dengan kesamaan kosinus:
-     $$\text{Euclidean Distance} = \sqrt{\max(0.0, 2.0 - 2 \times \text{Cosine Similarity})}$$
-     Rentang nilai berada pada interval $[0.0, 2.0]$, di mana nilai mendekati $0.0$ mengindikasikan wajah yang identik.
-4. **Pengambilan Keputusan (Thresholding Match):**
-   - Sistem membandingkan nilai `similarity` dengan `threshold`:
-     $$\text{match} = \begin{cases} \text{true}, & \text{jika } \text{similarity} \ge \text{threshold} \\ \text{false}, & \text{jika } \text{similarity} < \text{threshold} \end{cases}$$
-5. **Penyusunan Respons:**
-   - Mengembalikan data JSON yang menyajikan skor kemiripan (`cosine_similarity`), jarak euklidian (`euclidean_distance`), batas ambang yang digunakan (`threshold`), status kecocokan boolean (`match`), skor keyakinan masing-masing wajah, dan waktu pemrosesan total dalam milidetik.
+---
+
+### 3.3. Pencocokan Identitas di Backend Go
+
+Pencocokan wajah (*1-to-N identification*) **tidak** dilakukan oleh layanan
+Python, melainkan oleh backend Go terhadap seluruh template di MongoDB:
+
+1. **Kalkulasi Kemiripan:** Karena vektor embedding $\mathbf{e}_1$ dan $\mathbf{e}_2$ telah ternormalisasi $L_2$ ($\|\mathbf{e}\| = 1$):
+   $$\text{Cosine Similarity} = \mathbf{e}_1 \cdot \mathbf{e}_2 = \sum_{i=1}^{512} e_{1,i} \cdot e_{2,i}$$
+   Rentang nilai berada pada interval $[-1.0, 1.0]$, di mana nilai mendekati $1.0$ mengindikasikan wajah yang identik.
+2. **Skor per Mahasiswa:** Setiap mahasiswa memiliki 1–6 vektor pose; skornya pada satu frame adalah kemiripan **tertinggi** di antara pose-pose tersebut:
+   $$\text{skor}(m) = \max_{k} \; \mathbf{e}_{\text{scan}} \cdot \mathbf{e}_{m,k}$$
+3. **Pengambilan Keputusan (Thresholding):** Mahasiswa dengan skor tertinggi dinyatakan cocok bila
+   $$\text{skor} \ge \text{threshold} \quad (\texttt{FACE\_SIM\_THRESHOLD}, \text{default } 0.45)$$
+   Frame yang memenuhi ambang dihitung sebagai satu suara untuk mahasiswa tersebut.
+4. **Konsensus Frame:** Mahasiswa dengan suara terbanyak dipilih. Bila wajah yang sama cocok di ≥ `SCAN_MIN_MATCH_FRAMES` frame (default 2), status langsung **Hadir** dan dicatat di kelas mahasiswa itu; cocok di 1 frame saja → **Perlu ditinjau**; ada wajah tetapi tidak ada yang cocok → **Ditolak** dengan tampilan layar *"Wajah tidak Terdaftar"*; tidak ada wajah → *"Wajah tidak terdeteksi"*. Konsensus ini bukan deteksi *liveness* (anti-spoof).
+5. **Validasi saat Registrasi:** Go memastikan semua foto registrasi adalah orang yang sama — kemiripan tiap foto dengan foto pertama **atau** dengan rata-rata foto lain harus ≥ `FACE_POSE_THRESHOLD` (default 0.30, lebih longgar karena pose miring wajar kurang mirip foto depan) — dan wajah belum terdaftar atas NIM lain (≥ `FACE_SIM_THRESHOLD`).
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Client
-    participant API as FastAPI Router (/compare)
-    participant Pipe as FacePipeline
-    participant Rec as Recognizer Math Engine
+    participant ESP as Perangkat ESP32
+    participant Go as Backend Go
+    participant API as FastAPI (/embed)
+    participant DB as MongoDB
 
-    Client->>API: POST /compare (Image 1, Image 2, Threshold)
-    API->>Pipe: compare_faces(img1, img2, sim_threshold)
-    Pipe->>Pipe: Ekstraksi wajah Image 1 -> Pilih Best Face
-    Pipe->>Pipe: Ekstraksi wajah Image 2 -> Pilih Best Face
-    alt Salah satu citra tidak ada wajah
-        Pipe-->>API: Error: No face detected
-        API-->>Client: HTTP 422 Unprocessable Entity
-    else Kedua wajah terdeteksi
-        Pipe->>Rec: compute_similarity(emb1, emb2)
-        Rec-->>Pipe: Cosine Similarity
-        Pipe->>Rec: compute_distance(emb1, emb2)
-        Rec-->>Pipe: Euclidean Distance
-        Pipe->>Pipe: Evaluasi: match = (similarity >= threshold)
-        Pipe-->>API: Hasil Perbandingan Lengkap
-        API-->>Client: HTTP 200 OK (JSON Match Result)
+    Note over ESP: Ultrasonik mendeteksi orang -> kamera ON<br/>-> ambil hingga 4 frame dalam ±2 detik -> kamera OFF
+    ESP->>Go: POST /api/v1/scans (1–4 frame + HMAC)
+    Go->>DB: Muat face_templates (semua pose)
+    loop Untuk setiap frame (berhenti bila 2 frame cocok)
+        Go->>API: POST /embed (image)
+        alt Tidak ada wajah
+            API-->>Go: HTTP 422 No face detected (frame dilewati)
+        else Wajah terdeteksi
+            API-->>Go: HTTP 200 (embedding 512-D)
+            Go->>Go: Cosine ke semua pose, skor >= ambang -> 1 suara
+        end
     end
+    Go->>Go: Konsensus: >= 2 suara -> Hadir, 0 suara -> Wajah tidak Terdaftar
+    Go->>DB: Simpan scan_events (kelas mahasiswa)
+    Go-->>ESP: result + message -> tampil di layar TFT
 ```
-
----
-
-### 3.3. Alur Ekstraksi Vektor Fitur Tunggal (`POST /embed`)
-
-Endpoint ini dirancang khusus untuk proses pendaftaran (*enrollment*) identitas ke dalam basis data vektor (*vector database*).
-1. Klien mengirimkan citra tunggal berisi wajah.
-2. Sistem mendeteksi wajah dengan skor *confidence* tertinggi pada citra tersebut.
-3. Citra wajah dipotong, disejajarkan ke ukuran $112 \times 112$, dan diekstrak menjadi vektor embedding berdimensi 512.
-4. Sistem mengembalikan vektor embedding mentah beserta nilai confidence dan latensi pemrosesan.
 
 ---
 
@@ -226,10 +231,8 @@ Endpoint ini berfungsi sebagai *readiness probe* dan *liveness probe* untuk infr
 | **GET** | `/models` | Menampilkan katalog model lokal & Hugging Face | `refresh_remote` (query boolean) | `application/json` |
 | **POST** | `/models/download` | Mengunduh bobot model dari Hugging Face Hub | `model_id`, `force` (JSON body) | `application/json` |
 | **POST** | `/models/switch` | Mengganti model aktif secara dinamis (*hot-switch*) | `det_model`, `rec_model` (JSON body) | `application/json` |
-| **POST** | `/detect` | Mendeteksi wajah dan menghasilkan bounding box + embedding | `image` (file), `return_aligned` | `application/json` |
-| **POST** | `/detect/visualize` | Mendeteksi wajah dan merender bounding box langsung pada citra | `image` (file), `conf_threshold` | `image/jpeg` |
-| **POST** | `/compare` | Membandingkan 2 citra wajah (*verification*) | `image1`, `image2` (file), `sim_threshold` | `application/json` |
-| **POST** | `/embed` | Mengekstraksi vektor 512-D wajah terbaik untuk registrasi | `image` (file), `conf_threshold` | `application/json` |
+| **POST** | `/register` | Registrasi mahasiswa: 1–6 foto pose → satu embedding 512-D per foto | `student_id` (query), `images` (file, 1–6), `return_aligned`, `conf_threshold` | `application/json` |
+| **POST** | `/embed` | Mengekstraksi vektor 512-D wajah terbaik untuk absensi | `image` (file), `conf_threshold` | `application/json` |
 
 ---
 
@@ -240,6 +243,7 @@ Dalam perancangan SRS, alur alternatif penanganan kondisi galat didefinisikan se
 | Kode HTTP | Nama Galat | Kondisi Terjadinya | Tindakan Pemulihan Sistem |
 | :--- | :--- | :--- | :--- |
 | **400 Bad Request** | `Empty image file` / `Cannot decode image` | File yang diunggah kosong, bukan gambar valid, atau korup. | Menghentikan eksekusi sebelum inferensi dan mengembalikan pesan detail format. |
+| **400 Bad Request** | `At least one image` / `Maximum of 6 registration images` | Jumlah foto pada `/register` 0 atau lebih dari 6. | Permintaan ditolak tanpa inferensi. |
 | **400 Bad Request** | `Model Switch/Download Error` | Model ID tidak ditemukan di repositori atau koneksi unduh terputus. | Pipeline tetap mempertahankan model lama yang sedang aktif. |
-| **422 Unprocessable Entity** | `No face detected` | Citra pada `/compare` atau `/embed` tidak memuat wajah yang memenuhi ambang batas deteksi. | Mengembalikan respons eksplisit bahwa subjek wajah tidak ditemukan. |
+| **422 Unprocessable Entity** | `No face detected` | Citra pada `/embed`, atau salah satu foto pada `/register` (`image #N`), tidak memuat wajah yang memenuhi ambang batas deteksi. | Mengembalikan respons eksplisit bahwa subjek wajah tidak ditemukan; backend Go menampilkan nomor foto yang gagal. |
 | **503 Service Unavailable** | `Models not initialized` | Permintaan masuk sebelum siklus *lifespan startup* selesai memuat model ke memori. | Klien disarankan melakukan *retry* dengan strategi *exponential backoff*. |

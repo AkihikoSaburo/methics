@@ -33,6 +33,7 @@ func NewPartials(server *api.Server, viewDir string) (*Partials, error) {
 		"initials":    initials,
 		"statusClass": statusClass,
 		"confidence":  formatConfidence,
+		"inc":         func(i int) int { return i + 1 },
 	}
 	templates, err := template.New("fragments").Funcs(funcs).ParseFiles(files...)
 	if err != nil {
@@ -194,13 +195,15 @@ func (p *Partials) laporan(w http.ResponseWriter, r *http.Request) {
 }
 
 type mahasiswaRow struct {
-	StudentNIM   string
-	StudentName  string
-	ClassID      string
-	ClassName    string
-	FaceEnrolled bool
-	FaceImageURL string
-	Status       string
+	StudentNIM    string
+	StudentName   string
+	ClassID       string
+	ClassName     string
+	FaceEnrolled  bool
+	FaceImageURL  string
+	FaceImageURLs []string
+	FaceTemplates int
+	Status        string
 }
 
 type mahasiswaFragmentData struct {
@@ -244,7 +247,8 @@ func (p *Partials) mahasiswaRoster(ctx context.Context, principal security.Princ
 		data.Rows = append(data.Rows, mahasiswaRow{
 			StudentNIM: entry.StudentNIM, StudentName: entry.StudentName,
 			ClassID: entry.ClassID, ClassName: entry.ClassName,
-			FaceEnrolled: entry.FaceEnrolled, FaceImageURL: entry.FaceImageURL, Status: entry.Status,
+			FaceEnrolled: entry.FaceEnrolled, FaceImageURL: entry.FaceImageURL,
+			FaceImageURLs: entry.FaceImageURLs, FaceTemplates: entry.FaceTemplates, Status: entry.Status,
 		})
 	}
 	if len(data.Rows) == 0 {
@@ -355,32 +359,12 @@ func (p *Partials) enrollFace(w http.ResponseWriter, r *http.Request) {
 	nim := strings.ToUpper(strings.TrimSpace(r.PathValue("nim")))
 
 	var notice, errMessage string
-	image, filename, err := api.ReadImagePart(w, r)
-	switch {
-	case err != nil:
+	if images, err := api.ReadEnrollImages(w, r); err != nil {
 		errMessage = err.Error()
-	default:
-		if result, err := p.server.EnrollFace(ctx, nim, image, filename); err != nil {
-			switch {
-			case errors.Is(err, api.ErrStudentNotFound):
-				errMessage = "Mahasiswa tidak ditemukan."
-			case errors.Is(err, api.ErrInvalidImage):
-				errMessage = "Gambar tidak dapat dibaca; unggah foto JPEG/PNG yang valid."
-			case errors.Is(err, api.ErrNoFace):
-				errMessage = "Tidak ada wajah yang terdeteksi pada foto. Gunakan foto wajah yang jelas dan menghadap kamera."
-			case errors.Is(err, api.ErrMultipleFaces):
-				errMessage = "Foto berisi lebih dari satu wajah. Gunakan foto yang hanya berisi wajah mahasiswa tersebut."
-			case errors.Is(err, api.ErrFaceAlreadyEnrolled):
-				conflict, _ := result["conflictNim"].(string)
-				errMessage = fmt.Sprintf("Wajah ini sudah terdaftar atas NIM %s; enrollment dibatalkan.", conflict)
-			case errors.Is(err, api.ErrFaceService):
-				errMessage = "Enrollment gagal; pastikan service Python dan model wajah aktif."
-			default:
-				errMessage = "Enrollment gagal."
-			}
-		} else {
-			notice = fmt.Sprintf("Template wajah untuk %s berhasil diproses.", nim)
-		}
+	} else if result, err := p.server.EnrollFace(ctx, nim, images); err != nil {
+		errMessage = api.EnrollErrorMessage(err, result)
+	} else {
+		notice = fmt.Sprintf("Template wajah untuk %s berhasil diproses dari %d foto.", nim, len(images))
 	}
 
 	data, err := p.mahasiswaRoster(ctx, principal, r.FormValue("q"), r.FormValue("class"), notice, errMessage)

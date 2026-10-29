@@ -118,33 +118,40 @@ yang lalu (diambil satu dokumen dengan `last_seen` terbaru).
 
 | Field | Tipe | Keterangan |
 | --- | --- | --- |
-| `student_id` | string | → `students._id`, **unik** (satu template per mahasiswa) |
-| `encoding` | array double | embedding ArcFace 512 dimensi (ternormalisasi L2) |
-| `dimension` | int | panjang `encoding` |
-| `detection_confidence` | double | confidence deteksi wajah saat enrollment |
+| `student_id` | string | → `students._id`, **unik** (satu dokumen per mahasiswa) |
+| `encodings` | array of array double | 1–6 embedding ArcFace 512 dimensi (ternormalisasi L2), satu per foto pose |
+| `template_count` | int | jumlah vektor di `encodings` |
+| `dimension` | int | panjang tiap vektor |
+| `detection_confidences` | array double | confidence deteksi wajah per foto |
 | `created_at` | date | enrollment pertama (UTC) |
 | `updated_at` | date | enrollment terakhir (UTC) |
-| `image_key` | string, opsional | kunci foto enrollment di bucket S3 (Garage); hanya ada bila penyimpanan foto aktif |
+| `image_keys` | array string, opsional | kunci semua foto enrollment di bucket S3 (Garage); hanya ada bila penyimpanan foto aktif |
+| `image_key` | string, opsional | kunci foto pertama (dipakai tombol **Lihat foto**) |
+| `encoding`, `detection_confidence` | lama | format sebelum 28 Okt 2026 (satu foto); tetap dibaca sebagai satu pose dan dihapus saat enrollment ulang |
 
-Ditulis oleh **Go** (`enrollEmbedding` di `internal/api/face.go`) dari
-embedding yang dikembalikan face service `POST /detect`; face service
+Ditulis oleh **Go** (`enrollEmbeddings` di `internal/api/face.go`) dari
+embedding yang dikembalikan face service `POST /register`; face service
 sendiri tidak mengakses MongoDB. Saat scan, Go memuat semua dokumen koleksi
-ini dan menghitung cosine similarity. Lihat `docs/face-service.md`.
+ini dan menghitung cosine similarity terhadap setiap pose (skor mahasiswa =
+pose terbaik). Lihat `docs/face-service.md`.
 
 ### `scan_events`
 
 | Field | Tipe | Keterangan |
 | --- | --- | --- |
-| `student_id` | string | kandidat dari face service; `""` bila tidak dikenali |
-| `class_id` | string | kelas yang dikirim perangkat |
+| `student_id` | string | mahasiswa yang cocok (suara frame terbanyak); `""` bila tidak dikenali |
+| `class_id` | string | kelas tetap perangkat, atau — bila perangkat mengirim `class_id` kosong — kelas mahasiswa yang cocok; `""` untuk wajah tidak dikenal pada perangkat kelas otomatis |
 | `device_id` | string | perangkat pengirim |
 | `scanned_at` | string | `captured_at` perangkat, diubah ke **RFC3339 UTC** |
-| `face_verified` | bool | face service menyatakan cocok dan ada `studentId` |
+| `face_verified` | bool | ada mahasiswa yang cocok (≥ 1 frame dengan skor ≥ `FACE_SIM_THRESHOLD`) |
 | `liveness_passed` | bool | klaim perangkat (bukan deteksi biologis) |
 | `confidence` | number | cosine similarity terbaik terhadap `face_templates` (0 bila tidak ada wajah) |
+| `frames_total` | int | jumlah frame yang dikirim perangkat (1–6) |
+| `frames_with_face` | int | frame yang diproses dan berisi wajah (Go berhenti lebih awal begitu cukup frame cocok) |
+| `frames_matched` | int | frame yang cocok dengan `student_id`; ≥ `SCAN_MIN_MATCH_FRAMES` → `Hadir` |
 | `status` | string | `Hadir` / `Perlu ditinjau` / `Ditolak` |
 | `review_reason` | string | alasan untuk status selain `Hadir` |
-| `image_key` | string, opsional | kunci foto capture di bucket S3; dihapus (`$unset`) saat foto melewati masa retensi |
+| `image_key` | string, opsional | kunci satu frame bukti (skor terbaik) di bucket S3; dihapus (`$unset`) saat foto melewati masa retensi |
 
 ## 3. Index
 
@@ -163,6 +170,7 @@ Dibuat oleh `migrate()`:
 | `scan_events` | `{status: 1}` | — |
 | `scan_events` | `{image_key: 1}` | sparse |
 | `face_templates` | `{image_key: 1}` | sparse |
+| `face_templates` | `{image_keys: 1}` | sparse, multikey |
 
 ## 4. Waktu dan "hari ini"
 
@@ -205,7 +213,7 @@ db.students.find({ nim: /^IK24/ })          // cek dulu
 `DELETE /api/v1/students/{nim}` menjalankan `DeleteStudent`
 (`internal/api/admin.go`):
 
-1. Mengumpulkan `image_key` dari `face_templates` dan `scan_events` mahasiswa
+1. Mengumpulkan `image_key`/`image_keys` dari `face_templates` dan `image_key` dari `scan_events` mahasiswa
    itu, lalu menghapus fotonya dari Garage (gagal hanya dicatat di log).
 2. Menghapus dokumen `scan_events`, `face_templates`, `class_students`, dan
    `students` milik mahasiswa itu (berurutan; tidak dalam transaksi).
@@ -233,8 +241,11 @@ db.classes.insertOne({ _id: "IK24-D", name: "Ilmu Komputer D" })
 // Mendaftarkan perangkat baru secara eksplisit
 db.devices.insertOne({ _id: "ESP32-GED-C1", name: "ESP32 Gedung C" })
 
-// Melihat template wajah (5 angka pertama embedding) dan kunci fotonya
-db.face_templates.find({}, { student_id: 1, dimension: 1, image_key: 1, encoding: { $slice: 5 } })
+// Melihat jumlah pose dan kunci foto tiap template (tanpa vektor 512-d)
+db.face_templates.find({}, { student_id: 1, template_count: 1, dimension: 1, image_keys: 1 })
+
+// Template format lama (satu foto) yang sebaiknya di-enroll ulang
+db.face_templates.find({ encoding: { $exists: true } }, { student_id: 1 })
 
 // Scan hari ini yang perlu ditinjau
 db.scan_events.find({ status: "Perlu ditinjau" }).sort({ scanned_at: -1 }).limit(20)

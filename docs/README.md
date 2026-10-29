@@ -22,6 +22,7 @@ mulai dari **[HANDOFF.md](../HANDOFF.md)**, lalu kembali ke sini untuk detail.
 cmd/server/main.go          entry point, routing, middleware chain, bootstrap akun
 internal/api/server.go      endpoint JSON + query ber-scope role + domain method
 internal/api/admin.go       hapus mahasiswa, buat & hapus akun dosen
+internal/api/scan.go        scan perangkat (multi-frame, HMAC, konsensus frame)
 internal/controller/        web.go (halaman), partials.go + admin_partials.go (fragment htmx), auth.go (login)
 internal/model/page.go      view model halaman
 internal/security/          session, principal, CSRF, rate limit, CSP, panic recovery
@@ -30,6 +31,7 @@ views/                      layouts/, pages/, partials/, fragments/, login.html
 static/css|js               aset; htmx + Lucide di-vendor lokal
 devices/esp32_scanner/      firmware ESP32 utama (sensor, layar, buzzer, scan, heartbeat)
 devices/esp32cam_uart/      firmware ESP32-CAM (foto lewat UART)
+devices/esp32cam_wifi/      firmware ESP32-CAM (mode uji Wi-Fi, pengganti UART)
 services/face/              face service Python (YOLO-FaceV2 + ArcFace, FastAPI)
 internal/api/face.go        klien face service + pencocokan cosine di Go
 internal/api/images.go      foto wajah: unggah, otorisasi & stream, retensi

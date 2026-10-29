@@ -128,9 +128,11 @@ func (db *Database) migrate(ctx context.Context) error {
 		return fmt.Errorf("index scan_events: %w", err)
 	}
 
-	_, err = db.Collection("face_templates").Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "image_key", Value: 1}},
-		Options: options.Index().SetSparse(true),
+	// image_key (foto pertama) dan image_keys (semua foto enrollment, multikey):
+	// pengecekan hak akses foto enrollment.
+	_, err = db.Collection("face_templates").Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "image_key", Value: 1}}, Options: options.Index().SetSparse(true)},
+		{Keys: bson.D{{Key: "image_keys", Value: 1}}, Options: options.Index().SetSparse(true)},
 	})
 	if err != nil {
 		return fmt.Errorf("index face_templates image_key: %w", err)

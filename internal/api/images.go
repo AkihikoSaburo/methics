@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"dash.algorithmics/internal/storage"
@@ -112,34 +113,69 @@ func (s *Server) deleteImage(ctx context.Context, key string) {
 	}
 }
 
-// storeEnrollmentImage menyimpan foto enrollment lalu mengganti image_key pada
-// template; foto lama dihapus agar tiap mahasiswa hanya punya satu foto.
-func (s *Server) storeEnrollmentImage(ctx context.Context, studentID string, image []byte) string {
+// enrollmentKeys mengembalikan semua kunci foto enrollment pada template:
+// image_keys (enrollment multi-foto) ditambah image_key lama bila berbeda.
+func enrollmentKeys(primary string, all []string) []string {
+	keys := append([]string(nil), all...)
+	if primary != "" && !slices.Contains(keys, primary) {
+		keys = append(keys, primary)
+	}
+	return keys
+}
+
+// storeEnrollmentImages menyimpan semua foto enrollment, mencatat kuncinya di
+// template (image_keys = semua foto, image_key = foto pertama untuk tombol
+// "Lihat foto"), lalu menghapus foto enrollment lama. Foto yang gagal
+// diunggah dilewati; bila semuanya gagal, foto lama dibiarkan.
+func (s *Server) storeEnrollmentImages(ctx context.Context, studentID string, images []EnrollImage) []string {
 	if s.images == nil {
-		return ""
+		return nil
 	}
 	var previous struct {
-		ImageKey string `bson:"image_key"`
+		ImageKey  string   `bson:"image_key"`
+		ImageKeys []string `bson:"image_keys"`
 	}
 	_ = s.db.Collection("face_templates").FindOne(ctx, bson.M{"student_id": studentID},
-		options.FindOne().SetProjection(bson.M{"image_key": 1})).Decode(&previous)
+		options.FindOne().SetProjection(bson.M{"image_key": 1, "image_keys": 1})).Decode(&previous)
 
-	ext, contentType := imageExtension(image)
-	key := s.uploadImage(ctx, enrollImageKey(studentID, time.Now(), ext), contentType, image)
-	if key == "" {
-		return ""
+	// Unggah paralel: tiap foto dibatasi 3 detik, jadi 6 foto tetap selesai
+	// dalam ±3 detik walaupun Garage lambat. Urutan kunci mengikuti urutan foto.
+	now := time.Now()
+	uploaded := make([]string, len(images))
+	var wg sync.WaitGroup
+	for i, image := range images {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ext, contentType := imageExtension(image.Data)
+			uploaded[i] = s.uploadImage(ctx, enrollImageKey(studentID, now, ext), contentType, image.Data)
+		}()
+	}
+	wg.Wait()
+	var keys []string
+	for _, key := range uploaded {
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
 	}
 	_, err := s.db.Collection("face_templates").UpdateOne(ctx, bson.M{"student_id": studentID},
-		bson.M{"$set": bson.M{"image_key": key}})
+		bson.M{"$set": bson.M{"image_key": keys[0], "image_keys": keys}})
 	if err != nil {
-		log.Printf("image storage: simpan image_key %s gagal: %v", key, err)
-		s.deleteImage(ctx, key)
-		return ""
+		log.Printf("image storage: simpan image_keys %s gagal: %v", studentID, err)
+		for _, key := range keys {
+			s.deleteImage(ctx, key)
+		}
+		return nil
 	}
-	if previous.ImageKey != "" && previous.ImageKey != key {
-		s.deleteImage(ctx, previous.ImageKey)
+	for _, old := range enrollmentKeys(previous.ImageKey, previous.ImageKeys) {
+		if !slices.Contains(keys, old) {
+			s.deleteImage(ctx, old)
+		}
 	}
-	return key
+	return keys
 }
 
 // ErrImageForbidden dan ErrImageNotFound dipakai serveImage.
@@ -165,7 +201,8 @@ func (s *Server) authorizeImage(ctx context.Context, user principal, key string)
 		var template struct {
 			StudentID string `bson:"student_id"`
 		}
-		if err := s.db.Collection("face_templates").FindOne(ctx, bson.M{"image_key": key}).Decode(&template); err != nil {
+		if err := s.db.Collection("face_templates").FindOne(ctx,
+			bson.M{"$or": bson.A{bson.M{"image_key": key}, bson.M{"image_keys": key}}}).Decode(&template); err != nil {
 			return ErrImageNotFound
 		}
 		var student struct {

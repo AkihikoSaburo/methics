@@ -37,8 +37,8 @@ API.
 | Foto wajah | `internal/api/images.go`, `internal/storage/s3.go` | unggah/stream/retensi foto di Garage (S3 SigV4, pustaka standar) |
 | Tampilan | `views/` | `layouts/base.html`, `pages/*`, `fragments/*` |
 | Aset statis | `static/` | `css/`, `js/app.js`, `js/lib/ui.js`, vendor lokal |
-| Face service | `services/face/` | Python (stateless): `/health`, `/detect` → embedding ArcFace 512-d; dipanggil oleh `internal/api/face.go` |
-| Firmware | `devices/` | `esp32_scanner` (ESP32 utama → `/api/v1/scans`, `/devices/ping`), `esp32cam_uart` (kamera via UART), sketch uji |
+| Face service | `services/face/` | Python (stateless): `/health`, `/embed` (1 foto) dan `/register` (1–6 foto) → embedding ArcFace 512-d; dipanggil oleh `internal/api/face.go` |
+| Firmware | `devices/` | `esp32_scanner` (ESP32 utama → `/api/v1/scans`, `/devices/ping`), `esp32cam_uart` (kamera via UART), `esp32cam_wifi` (kamera mode uji Wi-Fi), sketch uji |
 
 Vendor frontend di-host lokal dan versi-terpin: htmx 2.0.11, Lucide 1.59.0,
 dengan `htmx.config.allowEval = false`.
@@ -63,10 +63,11 @@ DOM); ikon Lucide disegarkan setelah swap fragment.
 ### Perangkat (ESP32 + ESP32-CAM) — scan
 
 ```text
-HC-SR04 → ESP32 ──UART "CAP"──► ESP32-CAM ──JPEG + CRC32──► ESP32 (tanpa Wi-Fi di kamera)
-ESP32 ──POST /api/v1/scans (bearer DEVICE_TOKEN + HMAC + timestamp)──► Go
-                                                                       ├── Python /detect → embedding
-                                                                       ├── Go: cosine vs MongoDB face_templates
+HC-SR04 → ESP32 ──UART "ON", "CAP"×4 (±2 s), "OFF"──► ESP32-CAM (stream) ──JPEG + CRC32──► ESP32
+ESP32 ──POST /api/v1/scans (1–6 frame, bearer DEVICE_TOKEN + HMAC + timestamp)──► Go (scan.go)
+                                                                       ├── Python /embed per frame → embedding
+                                                                       ├── Go: cosine vs semua pose; ≥ 2 frame cocok → Hadir
+                                                                       ├── kelas: CLASS_ID perangkat, atau kelas mahasiswa (kosong)
                                                                        ├── Garage: scans/... (opsional, maks 3 s)
                                                                        ├── MongoDB: scan_events (+ image_key)
                                                                        └── MongoDB: devices.last_seen
@@ -84,9 +85,11 @@ Dashboard menganggap perangkat online bila `last_seen` < 2 menit.
 ### Enrollment wajah (admin)
 
 ```text
-Admin ──POST /partials/mahasiswa/{nim}/face-template (multipart)──► Go
-                                                                   ├── Python /detect → Go simpan embedding → MongoDB: face_templates
-                                                                   └── Garage: enroll/... (opsional; foto lama dihapus)
+Admin ──POST /partials/mahasiswa/{nim}/face-template (multipart, 1–6 foto pose)──► Go
+                                                                   ├── Python /register → embedding per foto
+                                                                   ├── Go: cek tiap foto ada wajah, satu orang, belum terdaftar di NIM lain
+                                                                   ├── MongoDB: face_templates.encodings (1–6 vektor)
+                                                                   └── Garage: enroll/... per foto (opsional; foto lama dihapus)
 ```
 
 ### Administrasi (administrator)
@@ -131,11 +134,13 @@ HMAC ada di `API.md`.
   aplikasi mobile resmi), `/api/v1` sudah menjadi jalur JSON yang stabil —
   pemisahan bisa dilakukan saat itu, dengan alasan konkret, bukan sekarang.
 
-### ADR-2 — Inference wajah di Python, penyimpanan & pencocokan di Go (Diterima, direvisi 26 Okt 2026)
+### ADR-2 — Inference wajah di Python, penyimpanan & pencocokan di Go (Diterima, direvisi 28 Okt 2026)
 
 - **Keputusan**: model deteksi & embedding wajah tinggal di `services/face`
-  (Python, ONNX). Go memvalidasi perangkat/role, memanggil `POST /detect`,
-  menyimpan embedding, dan mencocokkannya.
+  (Python, ONNX). Go memvalidasi perangkat/role, memanggil `POST /embed`
+  (scan) dan `POST /register` (enrollment 1–6 pose), menyimpan embedding, dan
+  mencocokkannya. Revisi 28 Okt: `/detect` dihapus dari Python; satu
+  mahasiswa kini punya beberapa embedding pose dan skornya adalah pose terbaik.
 - **Konsekuensi**: service Python tidak pernah diekspos ke jaringan publik;
   Go mengirim `FACE_SERVICE_TOKEN` sebagai Bearer (belum diperiksa oleh
   `api.py`).

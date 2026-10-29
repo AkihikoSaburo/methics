@@ -29,14 +29,15 @@
                 {{.StudentNIM}}</span></span></div>
         </td>
         <td>{{.ClassName}} ({{.ClassID}})</td>
-        <td>{{if .FaceEnrolled}}Template aktif{{else}}Belum dienrollment{{end}}</td>
+        <td>{{if .FaceEnrolled}}Template aktif ({{.FaceTemplates}} pose){{else}}Belum dienrollment{{end}}</td>
         <td>{{.Status}}</td>
         <td>
           <div class="row-actions">
-          {{if and (eq $.Role "administrator") (not .FaceEnrolled)}}
-          <label class="button face-enroll-button">
-            <i data-lucide="scan-face"></i>Enroll wajah
-            <input type="file" name="image" accept="image/jpeg,image/png" hidden
+          {{if eq $.Role "administrator"}}
+          <label class="button face-enroll-button"
+            title="Pilih 1–6 foto wajah dengan pose berbeda: depan, kiri, kanan, atas, bawah, senyum">
+            <i data-lucide="scan-face"></i>{{if .FaceEnrolled}}Enroll ulang{{else}}Enroll wajah{{end}}
+            <input type="file" name="images" accept="image/jpeg,image/png" multiple hidden
               hx-post="/partials/mahasiswa/{{.StudentNIM}}/face-template" hx-encoding="multipart/form-data"
               hx-include="#studentFilters" hx-target="#rosterRegion" hx-swap="innerHTML" hx-trigger="change">
           </label>
@@ -44,6 +45,9 @@
           {{if .FaceImageURL}}
           <a class="button" href="{{.FaceImageURL}}" target="_blank" rel="noopener"
             title="Foto enrollment {{.StudentName}}"><i data-lucide="image"></i>Lihat foto</a>
+          {{if gt (len .FaceImageURLs) 1}}<span class="photo-links" aria-label="Foto pose lainnya">
+            {{range $i, $url := .FaceImageURLs}}{{if $i}}<a href="{{$url}}" target="_blank" rel="noopener"
+              title="Foto pose ke-{{inc $i}}">{{inc $i}}</a>{{end}}{{end}}</span>{{end}}
           {{end}}
           {{if eq $.Role "administrator"}}
           <button class="button danger icon-only" type="button" title="Hapus mahasiswa" aria-label="Hapus {{.StudentName}}"

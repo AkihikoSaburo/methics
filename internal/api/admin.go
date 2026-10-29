@@ -45,11 +45,12 @@ func (s *Server) DeleteStudent(ctx context.Context, nim string) (string, error) 
 	// Kumpulkan kunci foto lebih dulu, lalu hapus fotonya dari Garage.
 	var keys []string
 	var template struct {
-		ImageKey string `bson:"image_key"`
+		ImageKey  string   `bson:"image_key"`
+		ImageKeys []string `bson:"image_keys"`
 	}
 	if s.db.Collection("face_templates").FindOne(ctx, bson.M{"student_id": student.ID},
-		options.FindOne().SetProjection(bson.M{"image_key": 1})).Decode(&template) == nil && template.ImageKey != "" {
-		keys = append(keys, template.ImageKey)
+		options.FindOne().SetProjection(bson.M{"image_key": 1, "image_keys": 1})).Decode(&template) == nil {
+		keys = append(keys, enrollmentKeys(template.ImageKey, template.ImageKeys)...)
 	}
 	cursor, err := s.db.Collection("scan_events").Find(ctx,
 		bson.M{"student_id": student.ID, "image_key": bson.M{"$exists": true, "$ne": ""}},
