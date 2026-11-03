@@ -7,7 +7,7 @@ huggingface_hub
 # FastAPI server
 fastapi
 uvicorn[standard]
-python-multipartS
+python-multipart
 
 # Optional GPU support:
 # Jika memiliki GPU NVIDIA dan CUDA toolkit yang sesuai:
