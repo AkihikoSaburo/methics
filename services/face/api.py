@@ -1,7 +1,7 @@
 """
 FastAPI Face Recognition API
 =============================
-REST API endpoints for YOLO-FaceV2 face detection and ArcFace face recognition.
+REST API endpoints for SCRFD face detection and ArcFace face recognition.
 Integrated with Hugging Face Hub for real-time model cataloging & on-demand downloads.
 Designed as a microservice backend for an attendance system.
 
@@ -104,7 +104,7 @@ class HealthResponse(BaseModel):
 
 
 class DownloadModelRequest(BaseModel):
-    model_id: str = Field(..., description="Model ID to download from Hugging Face (e.g. face_detection/yolo-facev2m.onnx)")
+    model_id: str = Field(..., description="Model ID to download from Hugging Face (e.g. face_detection/scrfd_10g.onnx)")
     force: bool = Field(False, description="Force re-download even if already downloaded")
 
 

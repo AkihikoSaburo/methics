@@ -16,12 +16,12 @@ class Settings:
     models_config_file: str = os.getenv("MODELS_CONFIG_FILE", "models_config.json")
 
     # Model Identifiers or Paths
-    det_model_path: str = os.getenv("DET_MODEL_PATH", "face_detection/yolo-facev2s.onnx")
+    det_model_path: str = os.getenv("DET_MODEL_PATH", "face_detection/scrfd_10g.onnx")
     rec_model_path: str = os.getenv("REC_MODEL_PATH", "face_recognition/arcface_r50_fp16.onnx")
 
     # Detection & Matching Thresholds
-    conf_threshold: float = float(os.getenv("CONF_THRESHOLD", "0.35"))
-    iou_threshold: float = float(os.getenv("IOU_THRESHOLD", "0.45"))
+    conf_threshold: float = float(os.getenv("CONF_THRESHOLD", "0.50"))
+    iou_threshold: float = float(os.getenv("IOU_THRESHOLD", "0.40"))
     sim_threshold: float = float(os.getenv("SIM_THRESHOLD", "0.45"))
 
     # Server Settings

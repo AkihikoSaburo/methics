@@ -69,7 +69,7 @@ class ModelManager:
             "version": "1.0",
             "hf_repo_id": DEFAULT_HF_REPO,
             "defaults": {
-                "face_detection": "face_detection/yolo-facev2s.onnx",
+                "face_detection": "face_detection/scrfd_10g.onnx",
                 "face_recognition": "face_recognition/arcface_r50_fp16.onnx"
             },
             "models": {}
@@ -78,7 +78,7 @@ class ModelManager:
     def get_defaults(self) -> Dict[str, str]:
         """Return the default model relative paths for detection and recognition."""
         return self.config_data.get("defaults", {
-            "face_detection": "face_detection/yolo-facev2s.onnx",
+            "face_detection": "face_detection/scrfd_10g.onnx",
             "face_recognition": "face_recognition/arcface_r50_fp16.onnx"
         })
 
@@ -138,7 +138,7 @@ class ModelManager:
 
         for rel_path in sorted(list(known_models)):
             parts = rel_path.split("/")
-            category = parts[0] if len(parts) > 1 else ("face_detection" if "yolo" in rel_path.lower() else "face_recognition")
+            category = parts[0] if len(parts) > 1 else ("face_detection" if "scrfd" in rel_path.lower() or "det" in rel_path.lower() else "face_recognition")
             filename = parts[-1]
 
             local_file = self.models_dir / rel_path
@@ -151,8 +151,8 @@ class ModelManager:
                 "id": rel_path,
                 "filename": filename,
                 "category": category,
-                "name": cfg.get("name", filename.replace(".onnx", "").replace("-", " ").title()),
-                "architecture": cfg.get("architecture", "yolo-facev2" if category == "face_detection" else "insightface"),
+                "name": cfg.get("name", filename.replace(".onnx", "").replace("-", " ").replace("_", " ").title()),
+                "architecture": cfg.get("architecture", "scrfd" if category == "face_detection" else "insightface"),
                 "downloaded": is_downloaded,
                 "size_mb": file_size_mb,
                 "is_default": (self.get_defaults().get(category) == rel_path),
@@ -166,12 +166,12 @@ class ModelManager:
 
     def resolve_model_id(self, model_identifier: str, category: Optional[str] = None) -> str:
         """
-        Normalize user inputs into standard repo relative path (e.g. 'face_detection/yolo-facev2s.onnx').
+        Normalize user inputs into standard repo relative path (e.g. 'face_detection/scrfd_10g.onnx').
 
         Examples:
-            'yolo-facev2s' -> 'face_detection/yolo-facev2s.onnx'
-            'yolo-facev2s.onnx' -> 'face_detection/yolo-facev2s.onnx'
-            'face_detection/yolo-facev2s.onnx' -> 'face_detection/yolo-facev2s.onnx'
+            'SCRFD_10G' -> 'face_detection/scrfd_10g.onnx'
+            'scrfd_10g.onnx' -> 'face_detection/scrfd_10g.onnx'
+            'face_detection/SCRFD_10G.onnx' -> 'face_detection/scrfd_10g.onnx'
         """
         # If absolute or existing path, leave as-is
         if os.path.isabs(model_identifier) or os.path.exists(model_identifier):
@@ -182,18 +182,32 @@ class ModelManager:
         if not clean_id.endswith(".onnx"):
             clean_id = f"{clean_id}.onnx"
 
-        # If already formatted with folder
-        if "/" in clean_id:
+        # Check existing local relative path first
+        candidate_local = self.models_dir / clean_id
+        if candidate_local.exists():
             return clean_id
 
-        # Infer category if not provided
-        if not category:
-            if "yolo" in clean_id.lower() or "det" in clean_id.lower():
-                category = "face_detection"
-            else:
-                category = "face_recognition"
+        # If already formatted with folder
+        if "/" in clean_id:
+            resolved = clean_id
+        else:
+            # Infer category if not provided
+            if not category:
+                if "scrfd" in clean_id.lower() or "det" in clean_id.lower():
+                    category = "face_detection"
+                elif "arcface" in clean_id.lower() or "rec" in clean_id.lower():
+                    category = "face_recognition"
+                else:
+                    category = "face_recognition"
+            resolved = f"{category}/{clean_id}"
 
-        return f"{category}/{clean_id}"
+        # Match against known configured models / defaults case-insensitively
+        known_models = set(self.config_data.get("models", {}).keys()) | set(self.get_defaults().values())
+        for known in known_models:
+            if resolved.lower() == known.lower() or Path(resolved).name.lower() == Path(known).name.lower():
+                return known
+
+        return resolved
 
     def ensure_model(
         self,
@@ -216,7 +230,7 @@ class ModelManager:
         if os.path.exists(model_identifier) and os.path.isfile(model_identifier):
             return os.path.abspath(model_identifier)
 
-        # Case 2: Resolve to repo relative path (e.g. face_detection/yolo-facev2s.onnx)
+        # Case 2: Resolve to repo relative path (e.g. face_detection/SCRFD_10G.onnx)
         rel_path = self.resolve_model_id(model_identifier, category=category)
         target_path = self.models_dir / rel_path
 
@@ -255,15 +269,16 @@ class ModelManager:
         if configured:
             return configured
 
-        # Fallback profile
-        is_det = "face_detection" in rel_path or "yolo" in rel_path.lower()
+        # Fallback profile for detection models (SCRFD)
+        is_det = "face_detection" in rel_path or "scrfd" in rel_path.lower() or "det" in rel_path.lower()
         if is_det:
             return {
                 "name": Path(rel_path).stem.title(),
-                "architecture": "yolo-facev2",
+                "architecture": "scrfd",
                 "input_size": 640,
-                "conf_threshold": 0.35,
-                "iou_threshold": 0.45
+                "conf_threshold": 0.5,
+                "iou_threshold": 0.4,
+                "output_landmarks": True
             }
         else:
             return {
