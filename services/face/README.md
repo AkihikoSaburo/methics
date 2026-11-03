@@ -1,9 +1,9 @@
-# Face Detection (YOLO-FaceV2) & Face Recognition (ArcFace) Pipeline
+# Face Detection (SCRFD) & Face Recognition (ArcFace) Pipeline
 
 Pipeline pengenalan wajah lengkap berbasis Python dan ONNX Runtime yang terintegrasi dengan **Hugging Face Hub** ([AkihikoSaburo/methics](https://huggingface.co/AkihikoSaburo/methics)):
-1. **Face Detection**: `yolo-facev2s.onnx` (cepat) & `yolo-facev2m.onnx` (akurasi tinggi).
-2. **Face Alignment**: Melakukan transformasi affine / similarity alignment ke ukuran standar `(112, 112)` atau dimensi kustom sebelum ekstraksi fitur.
-3. **Face Recognition**: `arcface_r50_fp16.onnx` (ResNet-50 ArcFace) untuk menghasilkan feature embedding 512 dimensi ter-normalisasi L2. Mendukung berbagai model turunan InsightFace dan model kustom.
+1. **Face Detection**: `scrfd_10g.onnx` (InsightFace SCRFD 10G dengan 5-point facial landmarks).
+2. **Face Alignment**: Melakukan transformasi kesamaan (similarity transformation via Umeyama/affine) 5-point landmarks ke ruang koordinat kanonikal ArcFace `(112, 112)`.
+3. **Face Recognition**: `arcface_r50_fp16.onnx` (ResNet-50 ArcFace) untuk menghasilkan feature embedding 512 dimensi ter-normalisasi L2.
 4. **Hugging Face Model Manager**: Mengunduh model secara on-demand, caching lokal otomatis, dan listing model langsung dari repo Hugging Face secara real-time.
 5. **REST API**: Semua fungsi diakses melalui endpoint FastAPI (tanpa webcam/GUI).
 
@@ -31,19 +31,18 @@ FaceRecognition/
 ├── models_config.json          # Konfigurasi model, default, metadata & threshold
 ├── models/                     # Cache lokal model ONNX (auto-download dari Hugging Face)
 │   ├── face_detection/
-│   │   ├── yolo-facev2s.onnx
-│   │   └── yolo-facev2m.onnx
+│   │   └── scrfd_10g.onnx
 │   └── face_recognition/
 │       └── arcface_r50_fp16.onnx
 ├── src/
 │   ├── __init__.py             # Re-export API package
 │   ├── config.py               # Pengaturan konfigurasi & environment variable
 │   ├── model_manager.py        # Hugging Face Hub downloader, caching & model catalog
-│   ├── detector.py             # YOLOFaceDetector ONNX inference
-│   ├── aligner.py              # FaceAligner canonical ArcFace 112x112
-│   ├── recognizer.py           # FaceRecognizer (InsightFace/ArcFace & custom norm)
+│   ├── scrfd_detector.py       # SCRFDDetector ONNX inference dengan 5 landmarks
+│   ├── aligner.py              # FaceAligner canonical ArcFace 112x112 (5-pts similarity transform)
+│   ├── recognizer.py           # FaceRecognizer (ArcFace 512-d L2 normalized embedding)
 │   ├── pipeline.py             # FacePipeline orchestrator & singleton
-│   └── utils.py                # Letterbox, NMS, sigmoid utils
+│   └── utils.py                # Reference landmarks, NMS utils
 ├── main.py                     # CLI entrypoint — API launcher & model management
 ├── api.py                      # FastAPI REST API service
 ├── Dockerfile                  # Multi-stage production container build
@@ -87,9 +86,6 @@ python main.py --host 127.0.0.1 --port 9000
 # Development mode (auto-reload)
 python main.py --reload
 
-# Bersama backend Go di satu PC (disarankan: hanya localhost)
-python main.py --host 127.0.0.1 --port 8000
-
 # Atau langsung via uvicorn
 uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 ```
@@ -126,38 +122,3 @@ curl -X POST "http://localhost:8000/register?student_id=12345678" \
   -F "images=@bawah.jpg" \
   -F "images=@senyum.jpg"
 ```
-
----
-
-## 6. Integrasi dengan Backend Go
-
-Layanan ini dipanggil oleh backend Go (`internal/api/face.go`), bukan langsung
-oleh dashboard atau ESP32. Layanan ini **stateless**: embedding tidak disimpan
-di sini, tetapi di MongoDB oleh Go.
-
-| Alur | Endpoint yang dipanggil Go | Yang dilakukan Go dengan hasilnya |
-|---|---|---|
-| Enrollment mahasiswa (halaman Mahasiswa, 1–6 foto) | `POST /register?student_id=student-<nim>` (field `images`) | cek tiap foto ada wajah, semua foto orang yang sama, wajah belum terdaftar di NIM lain → simpan semua embedding ke `face_templates.encodings` |
-| Scan absensi dari ESP32 | `POST /embed` (field `image`) | cosine similarity ke semua pose semua mahasiswa (ambang `FACE_SIM_THRESHOLD`, default 0.45) |
-| Status di dashboard | `GET /health` | `model_loaded`, `det_model`, `rec_model` |
-
-Pengaturan di `.env` backend Go:
-
-```env
-FACE_SERVICE_URL=http://127.0.0.1:8000
-FACE_SIM_THRESHOLD=0.45          # samakan dengan SIM_THRESHOLD layanan ini
-FACE_SERVICE_TIMEOUT_SECONDS=15
-```
-
-Catatan:
-- Jangan ubah nama field (`image`, `images`), parameter `student_id`, atau
-  pesan error `"No face detected ..."` (termasuk `image #N`) tanpa
-  menyesuaikan `internal/api/face.go`; Go memakai pesan itu untuk
-  menunjukkan foto mana yang gagal.
-- Layanan ini belum memiliki autentikasi dan memakai CORS `*`. Jalankan dengan
-  `--host 127.0.0.1` (default `main.py` adalah `0.0.0.0`) atau di jaringan
-  internal saja.
-- Mengganti model recognition (`/models/switch`) membuat embedding lama tidak
-  sebanding: semua mahasiswa harus di-enroll ulang.
-
-Detail integrasi: `docs/face-service.md` di root proyek.

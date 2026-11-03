@@ -12,7 +12,6 @@ import onnxruntime as ort
 
 logger = logging.getLogger(__name__)
 
-
 class FaceRecognizer:
     """
     ONNX Feature Extractor for Face Recognition models.

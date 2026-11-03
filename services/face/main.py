@@ -1,6 +1,6 @@
 """
-Face Detection (YOLO-FaceV2) & Face Recognition (ArcFace) — API Launcher
-=========================================================================
+Face Detection (SCRFD) & Face Recognition (ArcFace) — API Launcher
+===================================================================
 Starts the FastAPI server for face detection and recognition.
 All functionality is exposed via REST API endpoints.
 
@@ -8,7 +8,7 @@ Run:
     python main.py
     python main.py --host 0.0.0.0 --port 8000
     python main.py --list-models
-    python main.py --download-model face_detection/yolo-facev2m.onnx
+    python main.py --download-model face_detection/scrfd_10g.onnx
 """
 
 import argparse
@@ -64,7 +64,7 @@ def handle_download_model(model_id: str) -> None:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Face Recognition API Server — YOLO-FaceV2 & ArcFace.",
+        description="Face Recognition API Server — SCRFD & ArcFace.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
@@ -78,7 +78,7 @@ Examples:
      python main.py --list-models
 
   3. Download a model manually:
-     python main.py --download-model face_detection/yolo-facev2m.onnx
+     python main.py --download-model face_detection/scrfd_10g.onnx
 
   4. Start with auto-reload for development:
      python main.py --reload
@@ -93,7 +93,7 @@ Examples:
         "--download-model",
         type=str,
         metavar="MODEL_ID",
-        help="Download a specific model from Hugging Face Hub (e.g. face_detection/yolo-facev2m.onnx)."
+        help="Download a specific model from Hugging Face Hub (e.g. face_detection/scrfd_10g.onnx)."
     )
     parser.add_argument(
         "--host",

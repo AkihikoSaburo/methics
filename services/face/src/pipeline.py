@@ -1,5 +1,6 @@
 """
 Integrated Face Detection and Recognition Pipeline.
+Uses SCRFD face detector (with 5-point landmarks) and ArcFace recognizer.
 """
 
 import logging
@@ -7,7 +8,7 @@ import threading
 from typing import List, Dict, Any, Optional
 import numpy as np
 
-from .detector import YOLOFaceDetector
+from .scrfd_detector import SCRFDDetector
 from .aligner import FaceAligner
 from .recognizer import FaceRecognizer, ArcFaceRecognizer
 from .config import settings
@@ -18,8 +19,12 @@ logger = logging.getLogger(__name__)
 
 class FacePipeline:
     """
-    High-level orchestrator connecting YOLO Face Detection,
-    Face Alignment, and Feature Recognition.
+    High-level orchestrator connecting SCRFD Face Detection,
+    Face Alignment (5-point landmark similarity transform),
+    and ArcFace Feature Recognition.
+
+    SCRFD outputs 5-point facial landmarks which are used for precise
+    similarity-transform alignment into ArcFace 112x112 canonical space.
     Auto-downloads models from Hugging Face if not available locally.
     """
 
@@ -39,10 +44,12 @@ class FacePipeline:
 
         self.conf_threshold = conf_threshold if conf_threshold is not None else det_cfg.get("conf_threshold", settings.conf_threshold)
         self.iou_threshold = iou_threshold if iou_threshold is not None else det_cfg.get("iou_threshold", settings.iou_threshold)
+        input_size = int(det_cfg.get("input_size", 640))
 
-        logger.info(f"Initializing YOLO Face Detector from: {self.det_model_path}")
-        self.detector = YOLOFaceDetector(
+        logger.info(f"Initializing SCRFD Face Detector from: {self.det_model_path}")
+        self.detector = SCRFDDetector(
             self.det_model_path,
+            input_size=input_size,
             conf_threshold=self.conf_threshold,
             iou_threshold=self.iou_threshold
         )
@@ -80,24 +87,35 @@ class FacePipeline:
     ) -> List[Dict[str, Any]]:
         """
         Detect, align, and extract face embeddings for all faces in image.
+
+        Uses SCRFD 5-point landmarks for similarity-transform alignment
+        into ArcFace 112x112 canonical coordinate space.
+        Falls back to bbox-based alignment if landmarks are unavailable.
         """
-        boxes, scores = self.detector.detect(
+        boxes, scores, landmarks = self.detector.detect(
             img_bgr,
             conf_threshold=conf_threshold,
             iou_threshold=iou_threshold
         )
+
         results = []
 
-        for box, score in zip(boxes, scores):
-            aligned_face = self.aligner.align(img_bgr, bbox=box)
+        for i, (box, score) in enumerate(zip(boxes, scores)):
+            # Prefer landmark-based alignment, fallback to bbox
+            lmk = landmarks[i] if landmarks is not None and len(landmarks) > i else None
+            aligned_face = self.aligner.align(img_bgr, bbox=box, landmarks=lmk)
             embedding = self.recognizer.extract_embedding(aligned_face)
 
-            results.append({
+            result_entry: Dict[str, Any] = {
                 "bbox": box.tolist(),
                 "confidence": float(score),
                 "aligned_face": aligned_face,
                 "embedding": embedding
-            })
+            }
+            if lmk is not None:
+                result_entry["landmarks"] = lmk.tolist()
+
+            results.append(result_entry)
 
         return results
 
